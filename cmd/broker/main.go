@@ -37,6 +37,7 @@ func main() {
 
 	upstream := proxy.New(cfg.OllamaURL)
 	sched := queue.New()
+	sched.SetMaxWaiters(cfg.MaxWaiters)
 	detector := detect.New(detect.ProcLister)
 	unloader := ollama.New(cfg.OllamaURL)
 	ctrl := yield.New(detector, unloader, cfg.DetectInterval)
