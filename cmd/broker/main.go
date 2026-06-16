@@ -18,6 +18,7 @@ import (
 	"github.com/preston-bernstein/ollama-resource-broker/internal/admin"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/detect"
+	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
@@ -32,7 +33,8 @@ func main() {
 	upstream := proxy.New(cfg.OllamaURL)
 	sched := queue.New()
 	detector := detect.New(detect.ProcLister)
-	ctrl := yield.New(detector, cfg.DetectInterval)
+	unloader := ollama.New(cfg.OllamaURL)
+	ctrl := yield.New(detector, unloader, cfg.DetectInterval)
 
 	// The detection loop is tied to the process lifetime.
 	ctx, cancel := context.WithCancel(context.Background())
