@@ -1,5 +1,7 @@
 // Package yield tracks whether the broker should yield the GPU to gaming/Plex.
-// Effective state combines a manual override with automatic detection.
+// Effective state combines a manual override with automatic detection. On a
+// transition into yielding it cancels in-flight inference (via a serve context)
+// and forces the upstream to unload models from VRAM.
 package yield
 
 import (
@@ -51,24 +53,43 @@ type Detector interface {
 	Detect() (reason string, contended bool)
 }
 
+// Unloader frees GPU memory on the upstream. Optional (may be nil).
+type Unloader interface {
+	Unload(ctx context.Context) error
+}
+
 // Controller holds the effective yield state, refreshed by a polling loop.
 type Controller struct {
 	det      Detector
+	unloader Unloader
 	interval time.Duration
 
-	mu            sync.RWMutex
+	mu            sync.Mutex
 	mode          Mode
 	autoContended bool
 	autoReason    string
+	effective     bool
+
+	// serveCtx is alive while NOT yielding; cancelled the instant yielding
+	// begins so in-flight upstream calls abort. A fresh one is made when
+	// serving resumes.
+	serveCtx    context.Context
+	serveCancel context.CancelFunc
 }
 
-// New returns a Controller in ModeAuto.
-func New(det Detector, interval time.Duration) *Controller {
-	return &Controller{det: det, interval: interval}
+// New returns a Controller in ModeAuto, not yielding.
+func New(det Detector, unloader Unloader, interval time.Duration) *Controller {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Controller{
+		det:         det,
+		unloader:    unloader,
+		interval:    interval,
+		serveCtx:    ctx,
+		serveCancel: cancel,
+	}
 }
 
-// Run polls the detector until ctx is cancelled. It refreshes once immediately
-// so state is valid before the first tick.
+// Run polls the detector until ctx is cancelled, refreshing once immediately.
 func (c *Controller) Run(ctx context.Context) {
 	c.refresh()
 	t := time.NewTicker(c.interval)
@@ -86,30 +107,51 @@ func (c *Controller) Run(ctx context.Context) {
 func (c *Controller) refresh() {
 	reason, contended := c.det.Detect()
 	c.mu.Lock()
-	prev, prevReason := c.autoContended, c.autoReason
 	c.autoContended, c.autoReason = contended, reason
+	c.applyLocked()
 	c.mu.Unlock()
-	if contended != prev || (contended && reason != prevReason) {
-		if contended {
-			log.Printf("yield: contention detected (%s)", reason)
-		} else {
-			log.Print("yield: contention cleared")
-		}
-	}
 }
 
 // SetMode applies an operator override.
 func (c *Controller) SetMode(m Mode) {
 	c.mu.Lock()
 	c.mode = m
+	c.applyLocked()
 	c.mu.Unlock()
 	log.Printf("yield: mode set to %s", m)
 }
 
-// Yielding reports the effective state and a human reason.
-func (c *Controller) Yielding() (bool, string) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+// applyLocked recomputes the effective state and acts on a transition. Caller
+// holds c.mu.
+func (c *Controller) applyLocked() {
+	eff, reason := c.computeLocked()
+	if eff == c.effective {
+		return
+	}
+	c.effective = eff
+	if eff {
+		log.Printf("yield: START (%s) — cancelling in-flight, unloading VRAM", reason)
+		c.serveCancel() // abort in-flight inference
+		if c.unloader != nil {
+			go c.doUnload()
+		}
+	} else {
+		log.Print("yield: STOP — resuming service")
+		c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
+	}
+}
+
+func (c *Controller) doUnload() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.unloader.Unload(ctx); err != nil {
+		log.Printf("yield: VRAM unload error: %v", err)
+	} else {
+		log.Print("yield: VRAM unload requested")
+	}
+}
+
+func (c *Controller) computeLocked() (bool, string) {
 	switch c.mode {
 	case ModeForceYield:
 		return true, "manual"
@@ -118,6 +160,21 @@ func (c *Controller) Yielding() (bool, string) {
 	default:
 		return c.autoContended, c.autoReason
 	}
+}
+
+// Yielding reports the effective state and a human reason.
+func (c *Controller) Yielding() (bool, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.computeLocked()
+}
+
+// ServeContext returns the context that is cancelled when yielding begins.
+// Gated requests derive their upstream context from it so they abort on yield.
+func (c *Controller) ServeContext() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.serveCtx
 }
 
 // State is a snapshot for the control/status endpoints.
@@ -130,9 +187,8 @@ type State struct {
 
 // Snapshot returns the current state.
 func (c *Controller) Snapshot() State {
-	yielding, reason := c.Yielding()
-	c.mu.RLock()
-	mode, autoReason := c.mode, c.autoReason
-	c.mu.RUnlock()
-	return State{Mode: mode.String(), Yielding: yielding, Reason: reason, AutoReason: autoReason}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	yielding, reason := c.computeLocked()
+	return State{Mode: c.mode.String(), Yielding: yielding, Reason: reason, AutoReason: c.autoReason}
 }

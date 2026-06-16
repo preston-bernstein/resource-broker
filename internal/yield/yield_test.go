@@ -27,7 +27,7 @@ func (f *fakeDet) Detect() (string, bool) {
 
 func TestModeOverrides(t *testing.T) {
 	d := &fakeDet{}
-	c := New(d, time.Hour)
+	c := New(d, nil, time.Hour)
 
 	// Auto follows detection.
 	d.set("gaming-steam", true)
@@ -58,7 +58,7 @@ func TestModeOverrides(t *testing.T) {
 
 func TestRunPolls(t *testing.T) {
 	d := &fakeDet{}
-	c := New(d, 5*time.Millisecond)
+	c := New(d, nil, 5*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go c.Run(ctx)
@@ -70,6 +70,60 @@ func TestRunPolls(t *testing.T) {
 	d.set("", false)
 	if !eventually(t, func() bool { y, _ := c.Yielding(); return !y }) {
 		t.Fatal("controller did not clear contention from poll loop")
+	}
+}
+
+type fakeUnloader struct {
+	mu     sync.Mutex
+	called int
+}
+
+func (f *fakeUnloader) Unload(context.Context) error {
+	f.mu.Lock()
+	f.called++
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeUnloader) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.called
+}
+
+func TestYieldTransitionCancelsServeAndUnloads(t *testing.T) {
+	d := &fakeDet{}
+	u := &fakeUnloader{}
+	c := New(d, u, time.Hour)
+
+	serve := c.ServeContext()
+	select {
+	case <-serve.Done():
+		t.Fatal("serve context cancelled before yielding")
+	default:
+	}
+
+	// Transition into yielding.
+	d.set("gaming-steam", true)
+	c.refresh()
+
+	select {
+	case <-serve.Done():
+	case <-time.After(time.Second):
+		t.Fatal("serve context not cancelled on yield start")
+	}
+	if !eventually(t, func() bool { return u.calls() == 1 }) {
+		t.Fatalf("unloader called %d times, want 1", u.calls())
+	}
+
+	// Resuming gives a fresh, live serve context.
+	d.set("", false)
+	c.refresh()
+	fresh := c.ServeContext()
+	select {
+	case <-fresh.Done():
+		t.Fatal("fresh serve context already cancelled")
+	default:
 	}
 }
 
