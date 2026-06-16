@@ -17,7 +17,7 @@ The Broker's response to contention: stop/admit no inference work and let gaming
 _Avoid_: Throttle, Pause, Preempt (preempt is the act on one job; yield is the whole-Broker state)
 
 **Preemption**:
-Interrupting an in-flight inference job when contention appears, returning it to the front of the queue to resume once contention clears.
+Interrupting a running, lower-priority request so a higher-priority claimant gets the GPU. Two triggers: gaming/Plex contention preempts all inference; an interactive request preempts a running batch request. A preempted request returns 503 and its caller retries (batch via PENDING). Priority order: gaming/Plex > interactive > batch.
 _Avoid_: Kill, Cancel
 
 **Queue**:
@@ -25,7 +25,7 @@ Ordered set of pending inference requests. Preempted (interrupted) work outranks
 _Avoid_: Backlog, Buffer
 
 **Fronting Proxy**:
-The Broker's HTTP entry point: it speaks Ollama's own API on its own port, applies queue/yield/priority, then forwards to real Ollama. Callers (internal-monitor-app, LightRAG, internal-scraper-service) repoint their Ollama host at the Broker and need no other change. Distinct from the legacy CLI batch-job wrapper, which only governs commands explicitly run through it.
+The Broker's HTTP entry point: it speaks Ollama's own API on its own port, applies queue/yield/priority, then forwards to real Ollama. Callers (internal-monitor-app, LightRAG, internal-scraper-service) repoint their Ollama host at the Broker and need no other change. The superseded Bash CLI wrapper in `legacy/` is reference/history only — it shares no state with the Broker and must not be run alongside it.
 _Avoid_: Gateway, Reverse Proxy (generic), Shim
 
 **Consumer**:
