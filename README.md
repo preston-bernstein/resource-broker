@@ -25,9 +25,10 @@ glossary.
   consumers retry (e.g. fashion-monitor's PENDING replay). Nothing persists, so
   it is reboot-safe.
 - **Observable** — Prometheus `/metrics`, JSON logs, `/status`, and per-request
-  signals: `X-Broker-Wait-Ms` (header) and `X-Broker-Status`
-  (`served`/`preempted` as an HTTP **trailer**, since the outcome isn't known
-  until the streamed response ends; `deferred` is a header on the 503 path).
+  signals: `X-Broker-Wait-Ms` header; `X-Broker-Status` as a header
+  (`served`, or `deferred` on a 503) plus an authoritative **trailer** on
+  streamed responses that carries the true final outcome (`served`/`preempted`),
+  since mid-stream preemption isn't known when headers are sent.
 
 ## Build & run
 
@@ -47,6 +48,7 @@ OLLAMA_URL=http://127.0.0.1:11434 ./bin/ollama-broker
 | `BROKER_INTERACTIVE_WAIT` | `30s` | Interactive slot wait budget |
 | `BROKER_BATCH_WAIT` | `5s` | Batch slot wait budget |
 | `BROKER_DETECT_INTERVAL` | `3s` | Contention re-check period |
+| `BROKER_MAX_WAITERS` | `256` | Max queued requests per class before fast 503 |
 
 ### Control plane
 
