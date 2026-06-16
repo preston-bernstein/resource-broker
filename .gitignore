@@ -1,5 +1,6 @@
 *.zip
 .DS_Store
+docs/BUILD-PLAN.md
 queue/
 *.log
 *.job
