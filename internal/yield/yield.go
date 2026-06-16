@@ -108,36 +108,48 @@ func (c *Controller) refresh() {
 	reason, contended := c.det.Detect()
 	c.mu.Lock()
 	c.autoContended, c.autoReason = contended, reason
-	c.applyLocked()
+	event, r := c.applyLocked()
 	c.mu.Unlock()
+	logTransition(event, r)
 }
 
 // SetMode applies an operator override.
 func (c *Controller) SetMode(m Mode) {
 	c.mu.Lock()
 	c.mode = m
-	c.applyLocked()
+	event, r := c.applyLocked()
 	c.mu.Unlock()
 	slog.Info("yield mode", "mode", m.String())
+	logTransition(event, r)
 }
 
-// applyLocked recomputes the effective state and acts on a transition. Caller
-// holds c.mu.
-func (c *Controller) applyLocked() {
-	eff, reason := c.computeLocked()
+// applyLocked recomputes the effective state and acts on a transition, doing
+// only the non-blocking work (serve-context swap, unload spawn) under the lock
+// and returning the transition so the caller can log it after unlocking.
+// Caller holds c.mu.
+func (c *Controller) applyLocked() (event, reason string) {
+	eff, r := c.computeLocked()
 	if eff == c.effective {
-		return
+		return "", ""
 	}
 	c.effective = eff
 	if eff {
-		slog.Info("yield start", "reason", reason, "action", "cancel in-flight + unload VRAM")
 		c.serveCancel() // abort in-flight inference
 		if c.unloader != nil {
 			go c.doUnload()
 		}
-	} else {
+		return "start", r
+	}
+	c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
+	return "stop", ""
+}
+
+func logTransition(event, reason string) {
+	switch event {
+	case "start":
+		slog.Info("yield start", "reason", reason, "action", "cancel in-flight + unload VRAM")
+	case "stop":
 		slog.Info("yield stop", "action", "resume service")
-		c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
 	}
 }
 
