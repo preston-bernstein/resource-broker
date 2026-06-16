@@ -42,8 +42,8 @@ func main() {
 	go ctrl.Run(ctx)
 
 	servers := []*http.Server{
-		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, ctrl, upstream)),
-		newServer(cfg.BatchAddr, sched.Gate(queue.Batch, ctrl, upstream)),
+		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, ctrl, upstream)),
+		newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, upstream)),
 		newServer(cfg.ControlAddr, admin.Mux(ctrl)),
 	}
 
