@@ -22,8 +22,10 @@ type StatsProvider interface {
 	Stats() queue.Stats
 }
 
-// Mux builds the control-plane handler.
-func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler) http.Handler {
+// Mux builds the control-plane handler. jobs is the durable Job API surface
+// (may be nil if disabled); jobStatus, if non-nil, contributes a "jobs" section
+// to /status.
+func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +34,11 @@ func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler) http
 	})
 
 	mux.Handle("/metrics", metricsHandler)
+
+	if jobs != nil {
+		mux.Handle("/jobs", jobs)
+		mux.Handle("/jobs/", jobs)
+	}
 
 	// GET  /control -> current state
 	// POST /control {"mode":"auto|yield|serve"} -> set override, return state
@@ -62,14 +69,20 @@ func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler) http
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		st := stats.Stats()
-		writeJSON(w, http.StatusOK, map[string]any{
+		out := map[string]any{
 			"yield": ctrl.Snapshot(),
 			"queue": map[string]any{
-				"busy":        st.Busy,
-				"interactive": st.Interactive,
-				"batch":       st.Batch,
+				"busy":         st.Busy,
+				"inflight":     st.Inflight,
+				"max_inflight": st.MaxInflight,
+				"interactive":  st.Interactive,
+				"batch":        st.Batch,
 			},
-		})
+		}
+		if jobStatus != nil {
+			out["jobs"] = jobStatus()
+		}
+		writeJSON(w, http.StatusOK, out)
 	})
 
 	return mux

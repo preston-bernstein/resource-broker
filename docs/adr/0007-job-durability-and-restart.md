@@ -1,6 +1,6 @@
 # Job durability, restart, and delivery semantics
 
-**Status: accepted (design grill 2026-06-16). Code not yet written.** Companion to ADR-0006.
+**Status: accepted (design grill 2026-06-16); implemented 2026-06-16 in `internal/job/`.** Companion to ADR-0006. Implementation note: `attempts` increments at the point of restart-recovery and on a genuine run error (both capped by `max_attempts`); a clean preempt (gaming/interactive) or explicit cancel never burns an attempt, so preemption under heavy gaming can't drive a healthy Job to FAILED.
 
 Resilience is the point of the Job path, so:
 

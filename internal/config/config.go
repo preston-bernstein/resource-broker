@@ -27,6 +27,21 @@ type Config struct {
 	DetectInterval time.Duration
 	// MaxWaiters caps queued requests per class before fast-failing with 503.
 	MaxWaiters int
+	// MaxInflight caps concurrent requests reaching Ollama (ADR-0004).
+	MaxInflight int
+	// BatchQuantum is the min-run window before interactive may preempt a Job.
+	BatchQuantum time.Duration
+
+	// JobDBPath is the SQLite file backing the durable Job queue (ADR-0007).
+	JobDBPath string
+	// JobMaxAttempts caps re-runs of a Job before it is FAILED.
+	JobMaxAttempts int
+	// JobPruneInterval is how often terminal Jobs are swept.
+	JobPruneInterval time.Duration
+	// JobFetchedGrace is how long a fetched result is retained before pruning.
+	JobFetchedGrace time.Duration
+	// JobHardCap is the maximum age of any terminal Job before pruning.
+	JobHardCap time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -56,16 +71,47 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	mi, err := getint("BROKER_MAX_INFLIGHT", 1)
+	if err != nil {
+		return nil, err
+	}
+	bq, err := getdur("BROKER_BATCH_QUANTUM", 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	jma, err := getint("BROKER_JOB_MAX_ATTEMPTS", 3)
+	if err != nil {
+		return nil, err
+	}
+	jpi, err := getdur("BROKER_JOB_PRUNE_INTERVAL", 10*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	jfg, err := getdur("BROKER_JOB_FETCHED_GRACE", time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	jhc, err := getdur("BROKER_JOB_HARD_CAP", 7*24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Config{
-		InteractiveAddr: getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
-		BatchAddr:       getenv("BROKER_BATCH_ADDR", ":11436"),
-		OllamaURL:       u,
-		InteractiveWait: iw,
-		BatchWait:       bw,
-		ControlAddr:     getenv("BROKER_CONTROL_ADDR", ":11437"),
-		DetectInterval:  di,
-		MaxWaiters:      mw,
+		InteractiveAddr:  getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
+		BatchAddr:        getenv("BROKER_BATCH_ADDR", ":11436"),
+		OllamaURL:        u,
+		InteractiveWait:  iw,
+		BatchWait:        bw,
+		ControlAddr:      getenv("BROKER_CONTROL_ADDR", ":11437"),
+		DetectInterval:   di,
+		MaxWaiters:       mw,
+		MaxInflight:      mi,
+		BatchQuantum:     bq,
+		JobDBPath:        getenv("BROKER_JOB_DB", "broker-jobs.db"),
+		JobMaxAttempts:   jma,
+		JobPruneInterval: jpi,
+		JobFetchedGrace:  jfg,
+		JobHardCap:       jhc,
 	}, nil
 }
 

@@ -1,6 +1,6 @@
 # Durable Job system (design)
 
-**Status:** Designed (grill 2026-06-16), **not implemented**. Decisions: ADR-0006, ADR-0007. Supersedes ADR-0002 for long batch. Glossary: `Job`, `Queue`, `Position`, `Synchronous request` in CONTEXT.md.
+**Status:** **Implemented** (2026-06-16) in `internal/job/` (store, service, worker, SSE, HTTP API) and wired in `cmd/broker`. Decisions: ADR-0006, ADR-0007. Supersedes ADR-0002 for long batch. Glossary: `Job`, `Queue`, `Position`, `Synchronous request` in CONTEXT.md.
 
 Adds a durable, observable, restart-surviving queue for long batch inference, alongside the existing synchronous proxy. Two modes, one scheduler.
 
@@ -38,12 +38,14 @@ restart: any RUNNING -> QUEUED@front, attempts++ ; attempts>max -> FAILED
 
 ## Implementation outline (follow-up milestones)
 
-- **J1** SQLite store + schema + recovery sweep (RUNNING→QUEUED@front, attempts cap).
-- **J2** `POST /jobs` (idempotency) + worker loop pulling QUEUED through the existing scheduler/yield gate; result persistence.
-- **J3** `GET /jobs/{id}` + `/result` (retain-until-fetched) + `/jobs` list with source/owner filters.
-- **J4** Position computation + live progress (Ollama eval_count) + `/events` SSE.
-- **J5** Cancel; preemption→requeue-front wired to ADR-0004 quantum; gaming pause.
-- **J6** Metrics (queue depth, job states, wait/run histograms) + Grafana; internal-monitor-app adapter (submit + poll, surface position/status on the per-profile health page).
-- **J7** Prune sweep + soak.
+- **J1** ✅ SQLite store + schema + recovery sweep (RUNNING→QUEUED@front, attempts cap) — `internal/job/sqlite.go`.
+- **J2** ✅ `POST /jobs` (idempotency) + worker loop pulling QUEUED through the existing scheduler/yield gate; result persistence — `service.go`, `worker.go`.
+- **J3** ✅ `GET /jobs/{id}` + `/result` (retain-until-fetched) + `/jobs` list with source/owner filters — `api.go`.
+- **J4** ✅ Position computation + live progress (token count / Ollama eval_count) + `/events` SSE — `events.go`, `api.go`.
+- **J5** ✅ Cancel; preemption→requeue-front wired to ADR-0004 quantum; gaming pause — `worker.go` monitor.
+- **J6** ✅ Metrics (queue depth, job states by state, run-time sum/count, terminal-outcome counters) in `/metrics` and `/status`. Grafana panels + the internal-monitor-app adapter (submit + poll, surface position/status on the per-profile health page) live in those repos — **not in this repo**.
+- **J7** ✅ Prune sweep (retain-until-fetched grace + hard cap, startup + periodic). Multi-day soak is an operational step, run at cutover (BUILD-PLAN M7).
+
+The worker acquires the GPU slot **before** claiming, so a Job only becomes `RUNNING` once it actually holds the GPU — never while merely queued behind a sync request.
 
 Open/roadmap: Broker-native dashboard (data plane only for now); per-owner quotas; numeric job priorities within batch.
