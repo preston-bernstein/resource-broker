@@ -6,7 +6,7 @@ package yield
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -118,7 +118,7 @@ func (c *Controller) SetMode(m Mode) {
 	c.mode = m
 	c.applyLocked()
 	c.mu.Unlock()
-	log.Printf("yield: mode set to %s", m)
+	slog.Info("yield mode", "mode", m.String())
 }
 
 // applyLocked recomputes the effective state and acts on a transition. Caller
@@ -130,13 +130,13 @@ func (c *Controller) applyLocked() {
 	}
 	c.effective = eff
 	if eff {
-		log.Printf("yield: START (%s) — cancelling in-flight, unloading VRAM", reason)
+		slog.Info("yield start", "reason", reason, "action", "cancel in-flight + unload VRAM")
 		c.serveCancel() // abort in-flight inference
 		if c.unloader != nil {
 			go c.doUnload()
 		}
 	} else {
-		log.Print("yield: STOP — resuming service")
+		slog.Info("yield stop", "action", "resume service")
 		c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
 	}
 }
@@ -145,9 +145,9 @@ func (c *Controller) doUnload() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.unloader.Unload(ctx); err != nil {
-		log.Printf("yield: VRAM unload error: %v", err)
+		slog.Warn("vram unload failed", "err", err)
 	} else {
-		log.Print("yield: VRAM unload requested")
+		slog.Info("vram unload requested")
 	}
 }
 
