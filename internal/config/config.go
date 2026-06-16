@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -24,6 +25,8 @@ type Config struct {
 	ControlAddr string
 	// DetectInterval is how often process detection re-evaluates contention.
 	DetectInterval time.Duration
+	// MaxWaiters caps queued requests per class before fast-failing with 503.
+	MaxWaiters int
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -49,6 +52,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	mw, err := getint("BROKER_MAX_WAITERS", 256)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Config{
 		InteractiveAddr: getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
@@ -58,6 +65,7 @@ func Load() (*Config, error) {
 		BatchWait:       bw,
 		ControlAddr:     getenv("BROKER_CONTROL_ADDR", ":11437"),
 		DetectInterval:  di,
+		MaxWaiters:      mw,
 	}, nil
 }
 
@@ -66,6 +74,21 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func getint(key string, def int) (int, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("%s must be >= 1, got %d", key, n)
+	}
+	return n, nil
 }
 
 func getdur(key string, def time.Duration) (time.Duration, error) {

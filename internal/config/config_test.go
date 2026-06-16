@@ -12,6 +12,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("BROKER_BATCH_ADDR", "")
 	t.Setenv("BROKER_INTERACTIVE_WAIT", "")
 	t.Setenv("BROKER_BATCH_WAIT", "")
+	t.Setenv("BROKER_MAX_WAITERS", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -31,6 +32,17 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.BatchWait != 5*time.Second {
 		t.Errorf("BatchWait = %v", cfg.BatchWait)
+	}
+	if cfg.MaxWaiters != 256 {
+		t.Errorf("MaxWaiters = %d", cfg.MaxWaiters)
+	}
+}
+
+func TestLoadInvalidMaxWaiters(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_MAX_WAITERS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for MaxWaiters < 1")
 	}
 }
 

@@ -1,11 +1,13 @@
 // Package admin exposes the broker's control plane: manual yield override,
-// status, and health — on a listener separate from the proxied Ollama ports.
+// status, metrics, and health — on a listener separate from the proxied
+// Ollama ports.
 package admin
 
 import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
 )
 
@@ -15,14 +17,21 @@ type Controller interface {
 	Snapshot() yield.State
 }
 
+// StatsProvider exposes live scheduler occupancy.
+type StatsProvider interface {
+	Stats() queue.Stats
+}
+
 // Mux builds the control-plane handler.
-func Mux(ctrl Controller) http.Handler {
+func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("ok\n"))
 	})
+
+	mux.Handle("/metrics", metricsHandler)
 
 	// GET  /control -> current state
 	// POST /control {"mode":"auto|yield|serve"} -> set override, return state
@@ -52,7 +61,15 @@ func Mux(ctrl Controller) http.Handler {
 	})
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, ctrl.Snapshot())
+		st := stats.Stats()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"yield": ctrl.Snapshot(),
+			"queue": map[string]any{
+				"busy":        st.Busy,
+				"interactive": st.Interactive,
+				"batch":       st.Batch,
+			},
+		})
 	})
 
 	return mux

@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -34,7 +36,7 @@ func (c *Client) LoadedModels(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer drainClose(resp)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("ollama /api/ps: status %d", resp.StatusCode)
 	}
@@ -81,15 +83,22 @@ func (c *Client) unloadOne(ctx context.Context, model string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer drainClose(resp)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unload %s: status %d", model, resp.StatusCode)
 	}
 	return nil
 }
 
+// drainClose reads any remaining body and closes it so the keep-alive
+// connection can be reused instead of leaking.
+func drainClose(resp *http.Response) {
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
 func (c *Client) url(path string) string {
 	u := *c.base
-	u.Path = path
+	u.Path = strings.TrimRight(u.Path, "/") + path
 	return u.String()
 }
