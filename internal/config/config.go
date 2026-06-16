@@ -20,6 +20,10 @@ type Config struct {
 	InteractiveWait time.Duration
 	// BatchWait is the queue wait budget for batch requests.
 	BatchWait time.Duration
+	// ControlAddr is the listen address for the admin/control plane.
+	ControlAddr string
+	// DetectInterval is how often process detection re-evaluates contention.
+	DetectInterval time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -41,6 +45,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	di, err := getdur("BROKER_DETECT_INTERVAL", 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Config{
 		InteractiveAddr: getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
@@ -48,6 +56,8 @@ func Load() (*Config, error) {
 		OllamaURL:       u,
 		InteractiveWait: iw,
 		BatchWait:       bw,
+		ControlAddr:     getenv("BROKER_CONTROL_ADDR", ":11437"),
+		DetectInterval:  di,
 	}, nil
 }
 
