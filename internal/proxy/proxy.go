@@ -3,6 +3,9 @@
 package proxy
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -17,9 +20,21 @@ func New(target *url.URL) http.Handler {
 		FlushInterval: -1,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
-			// Preserve the original Host-independent client semantics; Ollama
-			// does not require a specific Host header, so set it to the target.
+			// Ollama does not require a specific Host header; match the target.
 			r.Out.Host = target.Host
+		},
+		// Cancelling the upstream context is normal and expected (the broker
+		// aborts in-flight calls when yielding, and clients disconnect). Treat
+		// cancellation as a quiet debug event; log only genuine upstream errors
+		// — and via slog, so it stays in the structured JSON stream rather than
+		// the default stderr log line.
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, context.Canceled) {
+				slog.Debug("upstream cancelled", "path", r.URL.Path)
+				return
+			}
+			slog.Warn("upstream error", "path", r.URL.Path, "err", err)
+			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
 	return rp

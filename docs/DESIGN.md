@@ -35,7 +35,7 @@ consumer → Broker listener (interactive :PORT_I | batch :PORT_B)
 
 ## Consumer integration
 
-- **internal-monitor-app**: point pipeline `ollama_host` at the batch port. `PENDING` already handles 503. Record `X-Broker-Status` in `integration_events`.
+- **internal-monitor-app**: point pipeline `ollama_host` at the batch port. `PENDING` already handles 503. Record `X-Broker-Status` in `integration_events` (header on a 503/`deferred`; HTTP trailer on a streamed `served`/`preempted` response).
 - **internal-scraper-service vision**: batch port; retry on 503.
 - **LightRAG / open-webui chat**: interactive port.
 - **embeddings** (LightRAG indexing): batch port.
