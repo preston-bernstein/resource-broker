@@ -19,6 +19,7 @@ import (
 	"github.com/preston-bernstein/ollama-resource-broker/internal/admin"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/detect"
+	"github.com/preston-bernstein/ollama-resource-broker/internal/job"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/metrics"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
@@ -38,30 +39,67 @@ func main() {
 	upstream := proxy.New(cfg.OllamaURL)
 	sched := queue.New()
 	sched.SetMaxWaiters(cfg.MaxWaiters)
+	sched.SetMaxInflight(cfg.MaxInflight)
 	detector := detect.New(detect.ProcLister)
-	unloader := ollama.New(cfg.OllamaURL)
-	ctrl := yield.New(detector, unloader, cfg.DetectInterval)
+	oc := ollama.New(cfg.OllamaURL)
+	ctrl := yield.New(detector, oc, cfg.DetectInterval)
 	reg := metrics.New()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go ctrl.Run(ctx)
 
+	// Durable Job system (ADR-0006/0007): SQLite-backed queue + worker, sharing
+	// the scheduler and yield gate with the synchronous proxy.
+	store, err := job.OpenSQLite(cfg.JobDBPath)
+	if err != nil {
+		slog.Error("open job store", "err", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+	jobSvc := job.NewService(store, cfg.JobMaxAttempts)
+	jobSvc.SetRecorder(reg)
+	if err := jobSvc.Recover(ctx); err != nil {
+		slog.Error("job recovery", "err", err)
+		os.Exit(1)
+	}
+	worker := job.NewWorker(jobSvc, sched, ctrl, genAdapter{oc}, cfg.BatchQuantum, 0)
+	go worker.Run(ctx)
+	go jobSvc.RunPrune(ctx, cfg.JobPruneInterval, cfg.JobFetchedGrace, cfg.JobHardCap)
+
+	jobCounts := func() job.Counts {
+		c, err := jobSvc.Counts(context.Background())
+		if err != nil {
+			slog.Warn("job counts", "err", err)
+		}
+		return c
+	}
+
 	metricsHandler := reg.Handler(func() metrics.Gauges {
 		st := sched.Stats()
 		yielding, _ := ctrl.Yielding()
+		c := jobCounts()
 		return metrics.Gauges{
-			Yielding:    yielding,
-			Busy:        st.Busy,
-			Interactive: st.Interactive,
-			Batch:       st.Batch,
+			Yielding:     yielding,
+			Busy:         st.Busy,
+			Inflight:     st.Inflight,
+			MaxInflight:  st.MaxInflight,
+			Interactive:  st.Interactive,
+			Batch:        st.Batch,
+			JobQueued:    c.Queued,
+			JobRunning:   c.Running,
+			JobSucceeded: c.Succeeded,
+			JobFailed:    c.Failed,
+			JobCanceled:  c.Canceled,
 		}
 	})
+
+	jobStatus := func() any { return jobCounts() }
 
 	servers := []*http.Server{
 		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, ctrl, reg, upstream)),
 		newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, upstream)),
-		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler)),
+		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler, jobSvc.Routes(), jobStatus)),
 	}
 
 	var wg sync.WaitGroup
@@ -97,6 +135,14 @@ func main() {
 		}
 	}
 	wg.Wait()
+}
+
+// genAdapter bridges the Ollama client to the Job worker's Generator interface.
+type genAdapter struct{ c *ollama.Client }
+
+func (g genAdapter) Generate(ctx context.Context, model, prompt string, opts map[string]any, onTokens func(int)) (string, error) {
+	out, _, err := g.c.Generate(ctx, ollama.GenerateRequest{Model: model, Prompt: prompt, Options: opts}, onTokens)
+	return out, err
 }
 
 func newServer(addr string, h http.Handler) *http.Server {

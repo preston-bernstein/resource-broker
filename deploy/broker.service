@@ -18,7 +18,13 @@ Environment=BROKER_INTERACTIVE_WAIT=30s
 Environment=BROKER_BATCH_WAIT=5s
 Environment=BROKER_DETECT_INTERVAL=3s
 
-# The broker only reads /proc and talks HTTP to localhost; no privileges needed.
+# Durable Job queue (ADR-0006/0007). StateDirectory creates and owns
+# /var/lib/ollama-broker, which stays writable under ProtectSystem=strict.
+Environment=BROKER_JOB_DB=/var/lib/ollama-broker/jobs.db
+StateDirectory=ollama-broker
+
+# The broker reads /proc, talks HTTP to localhost, and writes its Job DB; no
+# privileges needed.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

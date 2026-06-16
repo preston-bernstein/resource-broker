@@ -6,3 +6,7 @@ queue/
 *.job
 /tmp/
 bin/
+# Durable Job store (SQLite + WAL/SHM sidecars)
+*.db
+*.db-wal
+*.db-shm

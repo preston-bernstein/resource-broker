@@ -28,7 +28,7 @@ func (fakeStats) Stats() queue.Stats { return queue.Stats{Busy: true, Interactiv
 func newMux(c Controller) http.Handler {
 	return Mux(c, fakeStats{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "metrics")
-	}))
+	}), nil, nil)
 }
 
 func TestHealthz(t *testing.T) {
