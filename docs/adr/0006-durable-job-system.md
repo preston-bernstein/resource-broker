@@ -1,6 +1,6 @@
 # Durable async Job system for long batch work (hybrid with the sync proxy)
 
-**Status: accepted (design grill 2026-06-16). Supersedes ADR-0002 for long batch. Code not yet written — large follow-up.**
+**Status: accepted (design grill 2026-06-16); implemented 2026-06-16 in `internal/job/`. Supersedes ADR-0002 for long batch.**
 
 With many services sharing one GPU, the stateless "wait-or-503-and-retry" model (ADR-0002) is no longer enough: long, resilience-critical batch workloads need to **queue durably, report their position in line and live status, and survive a restart**. So the Broker grows a second front door.
 

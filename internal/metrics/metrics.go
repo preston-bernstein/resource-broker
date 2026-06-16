@@ -17,11 +17,27 @@ type Registry struct {
 	counts    map[string]int64 // key: class|outcome
 	waitSumMs float64
 	waitCount int64
+
+	jobCounts   map[string]int64 // key: job outcome
+	jobRunSumMs float64
+	jobRunCount int64
 }
 
 // New returns an empty Registry.
 func New() *Registry {
-	return &Registry{counts: make(map[string]int64)}
+	return &Registry{counts: make(map[string]int64), jobCounts: make(map[string]int64)}
+}
+
+// RecordJob tallies one terminal Job outcome ("succeeded", "failed",
+// "canceled", "preempted", "retried") and, for a completed run, its duration.
+func (r *Registry) RecordJob(outcome string, run time.Duration) {
+	r.mu.Lock()
+	r.jobCounts[outcome]++
+	if outcome == "succeeded" || outcome == "failed" {
+		r.jobRunSumMs += float64(run) / float64(time.Millisecond)
+		r.jobRunCount++
+	}
+	r.mu.Unlock()
 }
 
 // Record tallies one request outcome ("served", "deferred", "preempted") for a
@@ -40,8 +56,17 @@ func (r *Registry) Record(class, outcome string, wait time.Duration) {
 type Gauges struct {
 	Yielding    bool
 	Busy        bool
+	Inflight    int
+	MaxInflight int
 	Interactive int
 	Batch       int
+
+	// Durable Job counts by state (ADR-0006).
+	JobQueued    int
+	JobRunning   int
+	JobSucceeded int
+	JobFailed    int
+	JobCanceled  int
 }
 
 // Handler renders /metrics. gauges is sampled on each scrape.
@@ -67,6 +92,16 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 		fmt.Fprintf(w, "broker_requests_total{class=%q,outcome=%q} %d\n", class, outcome, r.counts[k])
 	}
 	sumMs, count := r.waitSumMs, r.waitCount
+	jobKeys := make([]string, 0, len(r.jobCounts))
+	for k := range r.jobCounts {
+		jobKeys = append(jobKeys, k)
+	}
+	sort.Strings(jobKeys)
+	jobCountsCopy := make(map[string]int64, len(r.jobCounts))
+	for k, v := range r.jobCounts {
+		jobCountsCopy[k] = v
+	}
+	jobRunSumMs, jobRunCount := r.jobRunSumMs, r.jobRunCount
 	r.mu.Unlock()
 
 	fmt.Fprint(w, "# HELP broker_wait_seconds_sum Total time served requests waited for the GPU slot.\n")
@@ -82,10 +117,36 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 	fmt.Fprint(w, "# HELP broker_busy Whether the single GPU slot is in use.\n")
 	fmt.Fprint(w, "# TYPE broker_busy gauge\n")
 	fmt.Fprintf(w, "broker_busy %d\n", b2i(g.Busy))
+	fmt.Fprint(w, "# HELP broker_inflight In-flight requests reaching Ollama.\n")
+	fmt.Fprint(w, "# TYPE broker_inflight gauge\n")
+	fmt.Fprintf(w, "broker_inflight %d\n", g.Inflight)
+	fmt.Fprint(w, "# HELP broker_max_inflight Configured concurrency limit.\n")
+	fmt.Fprint(w, "# TYPE broker_max_inflight gauge\n")
+	fmt.Fprintf(w, "broker_max_inflight %d\n", g.MaxInflight)
 	fmt.Fprint(w, "# HELP broker_queue_depth Waiters per class.\n")
 	fmt.Fprint(w, "# TYPE broker_queue_depth gauge\n")
 	fmt.Fprintf(w, "broker_queue_depth{class=\"interactive\"} %d\n", g.Interactive)
 	fmt.Fprintf(w, "broker_queue_depth{class=\"batch\"} %d\n", g.Batch)
+
+	fmt.Fprint(w, "# HELP broker_jobs Durable Jobs by state.\n")
+	fmt.Fprint(w, "# TYPE broker_jobs gauge\n")
+	fmt.Fprintf(w, "broker_jobs{state=\"queued\"} %d\n", g.JobQueued)
+	fmt.Fprintf(w, "broker_jobs{state=\"running\"} %d\n", g.JobRunning)
+	fmt.Fprintf(w, "broker_jobs{state=\"succeeded\"} %d\n", g.JobSucceeded)
+	fmt.Fprintf(w, "broker_jobs{state=\"failed\"} %d\n", g.JobFailed)
+	fmt.Fprintf(w, "broker_jobs{state=\"canceled\"} %d\n", g.JobCanceled)
+
+	fmt.Fprint(w, "# HELP broker_job_outcomes_total Terminal Job outcomes.\n")
+	fmt.Fprint(w, "# TYPE broker_job_outcomes_total counter\n")
+	for _, k := range jobKeys {
+		fmt.Fprintf(w, "broker_job_outcomes_total{outcome=%q} %d\n", k, jobCountsCopy[k])
+	}
+	fmt.Fprint(w, "# HELP broker_job_run_seconds_sum Total time Jobs spent running to completion.\n")
+	fmt.Fprint(w, "# TYPE broker_job_run_seconds_sum counter\n")
+	fmt.Fprintf(w, "broker_job_run_seconds_sum %g\n", jobRunSumMs/1000.0)
+	fmt.Fprint(w, "# HELP broker_job_run_seconds_count Number of completed Job runs.\n")
+	fmt.Fprint(w, "# TYPE broker_job_run_seconds_count counter\n")
+	fmt.Fprintf(w, "broker_job_run_seconds_count %d\n", jobRunCount)
 }
 
 func splitKey(k string) (class, outcome string) {
