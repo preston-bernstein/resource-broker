@@ -24,8 +24,10 @@ glossary.
 - **Stateless** — a request waits at most a per-class budget, then `503`;
   consumers retry (e.g. fashion-monitor's PENDING replay). Nothing persists, so
   it is reboot-safe.
-- **Observable** — Prometheus `/metrics`, JSON logs, `X-Broker-*` response
-  headers, and `/status`.
+- **Observable** — Prometheus `/metrics`, JSON logs, `/status`, and per-request
+  signals: `X-Broker-Wait-Ms` (header) and `X-Broker-Status`
+  (`served`/`preempted` as an HTTP **trailer**, since the outcome isn't known
+  until the streamed response ends; `deferred` is a header on the 503 path).
 
 ## Build & run
 
