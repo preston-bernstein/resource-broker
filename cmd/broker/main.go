@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -63,24 +64,29 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
+	errCh := make(chan error, len(servers))
 	for _, srv := range servers {
 		wg.Add(1)
 		go func(srv *http.Server) {
 			defer wg.Done()
 			slog.Info("listening", "addr", srv.Addr)
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("listen", "addr", srv.Addr, "err", err)
-				os.Exit(1)
+				errCh <- fmt.Errorf("listen %s: %w", srv.Addr, err)
 			}
 		}(srv)
 	}
 	slog.Info("broker up", "upstream", cfg.OllamaURL.String(), "detect_interval", cfg.DetectInterval.String())
 
+	// Shut down on either an OS signal or a fatal listener error — both paths
+	// run the same graceful shutdown so nothing is hard-killed mid-flight.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-
-	slog.Info("shutting down")
+	select {
+	case <-stop:
+		slog.Info("shutting down")
+	case err := <-errCh:
+		slog.Error("server failed, shutting down", "err", err)
+	}
 	cancel()
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
@@ -97,6 +103,9 @@ func newServer(addr string, h http.Handler) *http.Server {
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Route net/http's own error lines (e.g. superfluous WriteHeader) into
+		// the structured JSON stream instead of raw stderr.
+		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
 		// No WriteTimeout: inference streams can run for minutes.
 	}
 }

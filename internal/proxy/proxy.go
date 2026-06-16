@@ -29,8 +29,14 @@ func New(target *url.URL) http.Handler {
 		// — and via slog, so it stays in the structured JSON stream rather than
 		// the default stderr log line.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// ErrorHandler fires only before the response header is written. If
+			// the upstream was cancelled (yield/disconnect) before any bytes,
+			// send 503 so the client gets a clear status instead of an empty
+			// 200. (Mid-stream cancellation never reaches here.) Server-level
+			// "superfluous WriteHeader" noise is routed to slog via Server.ErrorLog.
 			if errors.Is(err, context.Canceled) {
 				slog.Debug("upstream cancelled", "path", r.URL.Path)
+				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
 			slog.Warn("upstream error", "path", r.URL.Path, "err", err)
