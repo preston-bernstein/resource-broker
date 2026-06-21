@@ -5,9 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=ollama-broker
+Group=ollama-broker
 ExecStart=/usr/local/bin/ollama-broker
 Restart=always
-RestartSec=2
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 # Upstream Ollama and listener ports (defaults shown).
 Environment=OLLAMA_URL=http://127.0.0.1:11434
