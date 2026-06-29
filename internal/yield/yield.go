@@ -58,10 +58,19 @@ type Unloader interface {
 	Unload(ctx context.Context) error
 }
 
+// GPUManager is an optional external GPU consumer (e.g. Tdarr) that the broker
+// pauses when gaming/Plex takes the GPU and resumes when contention clears.
+// Priority: gaming/Plex > Ollama inference > GPUManager background work.
+type GPUManager interface {
+	PauseGPU(ctx context.Context) error
+	ResumeGPU(ctx context.Context) error
+}
+
 // Controller holds the effective yield state, refreshed by a polling loop.
 type Controller struct {
 	det      Detector
 	unloader Unloader
+	gpuMgr   GPUManager // optional; nil = disabled
 	interval time.Duration
 
 	mu            sync.Mutex
@@ -87,6 +96,14 @@ func New(det Detector, unloader Unloader, interval time.Duration) *Controller {
 		serveCtx:    ctx,
 		serveCancel: cancel,
 	}
+}
+
+// SetGPUManager registers an external GPU consumer to pause/resume alongside
+// gaming-yield transitions. Safe to call before Run.
+func (c *Controller) SetGPUManager(m GPUManager) {
+	c.mu.Lock()
+	c.gpuMgr = m
+	c.mu.Unlock()
 }
 
 // Run polls the detector until ctx is cancelled, refreshing once immediately.
@@ -133,14 +150,21 @@ func (c *Controller) applyLocked() (event, reason string) {
 		return "", ""
 	}
 	c.effective = eff
+	mgr := c.gpuMgr
 	if eff {
 		c.serveCancel() // abort in-flight inference
 		if c.unloader != nil {
 			go c.doUnload()
 		}
+		if mgr != nil {
+			go c.pauseGPUMgr(mgr)
+		}
 		return "start", r
 	}
 	c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
+	if mgr != nil {
+		go c.resumeGPUMgr(mgr)
+	}
 	return "stop", ""
 }
 
@@ -161,6 +185,18 @@ func (c *Controller) doUnload() {
 	} else {
 		slog.Info("vram unload requested")
 	}
+}
+
+func (c *Controller) pauseGPUMgr(m GPUManager) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = m.PauseGPU(ctx)
+}
+
+func (c *Controller) resumeGPUMgr(m GPUManager) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = m.ResumeGPU(ctx)
 }
 
 func (c *Controller) computeLocked() (bool, string) {

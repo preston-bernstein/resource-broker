@@ -6,8 +6,10 @@ package admin
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
+	"github.com/preston-bernstein/ollama-resource-broker/internal/schedule"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
 )
 
@@ -22,10 +24,19 @@ type StatsProvider interface {
 	Stats() queue.Stats
 }
 
+// TdarrStatus is an optional snapshot of Tdarr GPU worker state included in /status.
+type TdarrStatus struct {
+	GPUWorkers int  `json:"gpu_workers"`
+	Managed    bool `json:"managed"`
+}
+
+// TdarrStatusFn returns the current Tdarr GPU worker count (nil = disabled).
+type TdarrStatusFn func() *TdarrStatus
+
 // Mux builds the control-plane handler. jobs is the durable Job API surface
 // (may be nil if disabled); jobStatus, if non-nil, contributes a "jobs" section
-// to /status.
-func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any) http.Handler {
+// to /status; tdarrStatus, if non-nil, contributes a "tdarr" section.
+func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -78,9 +89,15 @@ func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs
 				"interactive":  st.Interactive,
 				"batch":        st.Batch,
 			},
+			"schedule": schedule.TakeSnapshot(time.Now()),
 		}
 		if jobStatus != nil {
 			out["jobs"] = jobStatus()
+		}
+		if tdarrStatus != nil {
+			if ts := tdarrStatus(); ts != nil {
+				out["tdarr"] = ts
+			}
 		}
 		writeJSON(w, http.StatusOK, out)
 	})

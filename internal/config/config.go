@@ -42,6 +42,12 @@ type Config struct {
 	JobFetchedGrace time.Duration
 	// JobHardCap is the maximum age of any terminal Job before pruning.
 	JobHardCap time.Duration
+
+	// TdarrURL is the Tdarr server base URL (e.g. "http://localhost:8265").
+	// Empty string disables Tdarr cooperative GPU management.
+	TdarrURL string
+	// TdarrNodeID is the Tdarr node _id whose GPU workers the broker manages.
+	TdarrNodeID string
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -112,6 +118,8 @@ func Load() (*Config, error) {
 		JobPruneInterval: jpi,
 		JobFetchedGrace:  jfg,
 		JobHardCap:       jhc,
+		TdarrURL:         getenv("BROKER_TDARR_URL", ""),
+		TdarrNodeID:      getenv("BROKER_TDARR_NODE_ID", ""),
 	}, nil
 }
 
