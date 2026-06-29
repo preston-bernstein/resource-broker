@@ -20,18 +20,24 @@ import (
 
 // Client talks to a running Tdarr server.
 type Client struct {
-	baseURL string
-	nodeID  string
-	http    *http.Client
+	baseURL    string
+	nodeID     string
+	gpuWorkers int // number of GPU workers to restore on ResumeGPU
+	http       *http.Client
 }
 
 // New returns a Client for the Tdarr server at baseURL managing the given node.
 // baseURL is e.g. "http://localhost:8265"; nodeID is the Tdarr node _id.
-func New(baseURL, nodeID string) *Client {
+// gpuWorkers is how many transcodegpu workers to restore when ResumeGPU is called.
+func New(baseURL, nodeID string, gpuWorkers int) *Client {
+	if gpuWorkers < 1 {
+		gpuWorkers = 1
+	}
 	return &Client{
-		baseURL: baseURL,
-		nodeID:  nodeID,
-		http:    &http.Client{Timeout: 5 * time.Second},
+		baseURL:    baseURL,
+		nodeID:     nodeID,
+		gpuWorkers: gpuWorkers,
+		http:       &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -47,9 +53,9 @@ func (c *Client) PauseGPU(ctx context.Context) error {
 	return err
 }
 
-// ResumeGPU restores transcodegpu to 1 on the managed node.
+// ResumeGPU restores transcodegpu to the configured worker count on the managed node.
 func (c *Client) ResumeGPU(ctx context.Context) error {
-	err := c.setWorkers(ctx, workerLimits{TranscodeCPU: 1, TranscodeGPU: 1})
+	err := c.setWorkers(ctx, workerLimits{TranscodeCPU: 1, TranscodeGPU: c.gpuWorkers})
 	if err != nil {
 		slog.Warn("tdarr: resume GPU failed", "err", err)
 	} else {
