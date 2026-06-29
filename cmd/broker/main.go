@@ -24,6 +24,8 @@ import (
 	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
+	"github.com/preston-bernstein/ollama-resource-broker/internal/schedule"
+	"github.com/preston-bernstein/ollama-resource-broker/internal/tdarr"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
 )
 
@@ -48,6 +50,25 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go ctrl.Run(ctx)
+
+	// Tdarr cooperative GPU management: pause GPU transcoding when gaming/Plex
+	// takes the GPU (via yield controller), and during the estate-scraper window.
+	// Lowest priority consumer: gaming/Plex > Ollama inference > Tdarr.
+	var tdarrClient *tdarr.Client
+	var tdarrStatusFn admin.TdarrStatusFn
+	if cfg.TdarrURL != "" && cfg.TdarrNodeID != "" {
+		tdarrClient = tdarr.New(cfg.TdarrURL, cfg.TdarrNodeID)
+		ctrl.SetGPUManager(tdarrClient)
+		go runTdarrSchedule(ctx, tdarrClient)
+		tdarrStatusFn = func() *admin.TdarrStatus {
+			gpu, err := tdarrClient.WorkerLimits(context.Background())
+			if err != nil {
+				return &admin.TdarrStatus{Managed: true, GPUWorkers: -1}
+			}
+			return &admin.TdarrStatus{Managed: true, GPUWorkers: gpu}
+		}
+		slog.Info("tdarr integration enabled", "url", cfg.TdarrURL, "node", cfg.TdarrNodeID)
+	}
 
 	// Durable Job system (ADR-0006/0007): SQLite-backed queue + worker, sharing
 	// the scheduler and yield gate with the synchronous proxy.
@@ -99,7 +120,7 @@ func main() {
 	servers := []*http.Server{
 		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, ctrl, reg, upstream)),
 		newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, upstream)),
-		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler, jobSvc.Routes(), jobStatus)),
+		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn)),
 	}
 
 	var wg sync.WaitGroup
@@ -135,6 +156,34 @@ func main() {
 		}
 	}
 	wg.Wait()
+}
+
+// runTdarrSchedule pauses Tdarr GPU workers during the estate-scraper window
+// (Fri 02:00–07:00) and resumes them outside it. This is the schedule-based
+// coordination path; the yield-controller path handles gaming/Plex contention.
+func runTdarrSchedule(ctx context.Context, tc *tdarr.Client) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	var paused bool
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			shouldPause := !schedule.SafeForBackgroundGPU(now)
+			if shouldPause && !paused {
+				if err := tc.PauseGPU(ctx); err == nil {
+					paused = true
+					slog.Info("tdarr schedule pause: estate-scraper window active")
+				}
+			} else if !shouldPause && paused {
+				if err := tc.ResumeGPU(ctx); err == nil {
+					paused = false
+					slog.Info("tdarr schedule resume: estate-scraper window ended")
+				}
+			}
+		}
+	}
 }
 
 // genAdapter bridges the Ollama client to the Job worker's Generator interface.
