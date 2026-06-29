@@ -48,6 +48,8 @@ type Config struct {
 	TdarrURL string
 	// TdarrNodeID is the Tdarr node _id whose GPU workers the broker manages.
 	TdarrNodeID string
+	// TdarrGPUWorkers is how many transcodegpu workers to restore after yielding.
+	TdarrGPUWorkers int
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -101,6 +103,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	tgw, err := getint("BROKER_TDARR_GPU_WORKERS", 1)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Config{
 		InteractiveAddr:  getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
@@ -120,6 +126,7 @@ func Load() (*Config, error) {
 		JobHardCap:       jhc,
 		TdarrURL:         getenv("BROKER_TDARR_URL", ""),
 		TdarrNodeID:      getenv("BROKER_TDARR_NODE_ID", ""),
+		TdarrGPUWorkers:  tgw,
 	}, nil
 }
 

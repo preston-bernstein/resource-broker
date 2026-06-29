@@ -57,7 +57,7 @@ func main() {
 	var tdarrClient *tdarr.Client
 	var tdarrStatusFn admin.TdarrStatusFn
 	if cfg.TdarrURL != "" && cfg.TdarrNodeID != "" {
-		tdarrClient = tdarr.New(cfg.TdarrURL, cfg.TdarrNodeID)
+		tdarrClient = tdarr.New(cfg.TdarrURL, cfg.TdarrNodeID, cfg.TdarrGPUWorkers)
 		ctrl.SetGPUManager(tdarrClient)
 		go runTdarrSchedule(ctx, tdarrClient)
 		tdarrStatusFn = func() *admin.TdarrStatus {
