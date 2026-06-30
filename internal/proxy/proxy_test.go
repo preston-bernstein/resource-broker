@@ -98,6 +98,44 @@ func TestForwardsRequest(t *testing.T) {
 	}
 }
 
+// TestEmbedRewritesEmbeddingsPath checks the embed lane maps the OpenAI
+// /embeddings (and /v1/embeddings) route to Infinity's /embeddings_image while
+// passing the body through and leaving other paths (e.g. /health) untouched.
+func TestEmbedRewritesEmbeddingsPath(t *testing.T) {
+	var gotPath, gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	front := httptest.NewServer(NewEmbed(target))
+	defer front.Close()
+
+	cases := []struct{ in, want string }{
+		{"/embeddings", "/embeddings_image"},
+		{"/v1/embeddings", "/embeddings_image"},
+		{"/health", "/health"},
+		{"/models", "/models"},
+	}
+	for _, c := range cases {
+		resp, err := http.Post(front.URL+c.in, "application/json", strings.NewReader(`{"input":["x"]}`))
+		if err != nil {
+			t.Fatalf("post %s: %v", c.in, err)
+		}
+		resp.Body.Close()
+		if gotPath != c.want {
+			t.Errorf("%s -> upstream path %q, want %q", c.in, gotPath, c.want)
+		}
+		if c.in == "/embeddings" && gotBody != `{"input":["x"]}` {
+			t.Errorf("body not passed through: %q", gotBody)
+		}
+	}
+}
+
 func readLineWithin(br *bufio.Reader, d time.Duration) (string, error) {
 	type res struct {
 		s   string

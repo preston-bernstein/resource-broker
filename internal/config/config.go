@@ -17,6 +17,13 @@ type Config struct {
 	BatchAddr string
 	// OllamaURL is the upstream real Ollama base URL.
 	OllamaURL *url.URL
+	// InfinityURL is the upstream Infinity image-embedding base URL. Empty
+	// disables the embed lane entirely.
+	InfinityURL *url.URL
+	// EmbedAddr is the listen address for the image-embedding lane (fronts
+	// Infinity, gated by yield but on its own scheduler so CPU embedding does
+	// not share the GPU concurrency slot).
+	EmbedAddr string
 	// InteractiveWait is the queue wait budget for interactive requests.
 	InteractiveWait time.Duration
 	// BatchWait is the queue wait budget for batch requests.
@@ -61,6 +68,20 @@ func Load() (*Config, error) {
 	}
 	if u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("OLLAMA_URL %q must include scheme and host", rawURL)
+	}
+
+	// INFINITY_URL is optional; when set it must be a valid absolute URL. Empty
+	// leaves InfinityURL nil and the embed lane is not started.
+	var infinityURL *url.URL
+	if raw := getenv("INFINITY_URL", ""); raw != "" {
+		iu, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid INFINITY_URL %q: %w", raw, err)
+		}
+		if iu.Scheme == "" || iu.Host == "" {
+			return nil, fmt.Errorf("INFINITY_URL %q must include scheme and host", raw)
+		}
+		infinityURL = iu
 	}
 
 	iw, err := getdur("BROKER_INTERACTIVE_WAIT", 30*time.Second)
@@ -111,7 +132,9 @@ func Load() (*Config, error) {
 	return &Config{
 		InteractiveAddr:  getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
 		BatchAddr:        getenv("BROKER_BATCH_ADDR", ":11436"),
+		EmbedAddr:        getenv("BROKER_EMBED_ADDR", ":11438"),
 		OllamaURL:        u,
+		InfinityURL:      infinityURL,
 		InteractiveWait:  iw,
 		BatchWait:        bw,
 		ControlAddr:      getenv("BROKER_CONTROL_ADDR", ":11437"),

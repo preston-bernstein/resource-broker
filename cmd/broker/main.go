@@ -123,6 +123,22 @@ func main() {
 		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn)),
 	}
 
+	// Image-embedding lane (optional): fronts an Infinity SigLIP server on CPU
+	// for the estate-scraper durable corpus. It shares the yield controller —
+	// so it backs off the moment gaming/Plex is detected, exactly like Ollama —
+	// but runs on its OWN scheduler: CPU embedding and GPU inference use
+	// different hardware, so they must not contend for the single GPU slot.
+	// Disabled (lane not started) when INFINITY_URL is unset.
+	if cfg.InfinityURL != nil {
+		embedSched := queue.New()
+		embedSched.SetMaxWaiters(cfg.MaxWaiters)
+		embedSched.SetMaxInflight(1) // Infinity saturates all CPU cores per request
+		embedUpstream := proxy.NewEmbed(cfg.InfinityURL)
+		servers = append(servers, newServer(cfg.EmbedAddr,
+			embedSched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, embedUpstream)))
+		slog.Info("embed lane enabled", "addr", cfg.EmbedAddr, "upstream", cfg.InfinityURL.String())
+	}
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(servers))
 	for _, srv := range servers {
