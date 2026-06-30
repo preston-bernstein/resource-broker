@@ -52,9 +52,11 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Upstream Ollama |
+| `INFINITY_URL` | _(unset)_ | Upstream Infinity image-embedding server. Unset disables the embed lane (ADR-0008) |
 | `BROKER_INTERACTIVE_ADDR` | `:11435` | Interactive (high-priority) port |
 | `BROKER_BATCH_ADDR` | `:11436` | Batch (low-priority) port |
 | `BROKER_CONTROL_ADDR` | `:11437` | Control plane (`/control`,`/status`,`/metrics`,`/healthz`) |
+| `BROKER_EMBED_ADDR` | `:11438` | Image-embedding lane (fronts Infinity; only listens when `INFINITY_URL` set) |
 | `BROKER_INTERACTIVE_WAIT` | `30s` | Interactive slot wait budget |
 | `BROKER_BATCH_WAIT` | `5s` | Batch slot wait budget |
 | `BROKER_DETECT_INTERVAL` | `3s` | Contention re-check period |
@@ -107,7 +109,8 @@ synchronous work:
 | Consumer | Path |
 | --- | --- |
 | open-webui / LightRAG chat | interactive `:11435` |
-| internal-scraper-service vision (short), embeddings | batch `:11436` |
+| internal-scraper-service vision (short) | batch `:11436` |
+| internal-scraper-service image embeddings (SigLIP/Infinity) | embed `:11438` → `/embeddings` (ADR-0008) |
 | internal-monitor-app scoring, long vision runs | Job API `POST :11437/jobs` |
 
 ## Deploy

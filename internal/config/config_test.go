@@ -36,6 +36,36 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MaxWaiters != 256 {
 		t.Errorf("MaxWaiters = %d", cfg.MaxWaiters)
 	}
+	if cfg.EmbedAddr != ":11438" {
+		t.Errorf("EmbedAddr = %q", cfg.EmbedAddr)
+	}
+	if cfg.InfinityURL != nil {
+		t.Errorf("InfinityURL = %v, want nil when INFINITY_URL unset", cfg.InfinityURL)
+	}
+}
+
+func TestLoadInfinityURL(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("INFINITY_URL", "http://127.0.0.1:7997")
+	t.Setenv("BROKER_EMBED_ADDR", ":9999")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.InfinityURL == nil || cfg.InfinityURL.Host != "127.0.0.1:7997" {
+		t.Errorf("InfinityURL = %v, want host 127.0.0.1:7997", cfg.InfinityURL)
+	}
+	if cfg.EmbedAddr != ":9999" {
+		t.Errorf("EmbedAddr = %q", cfg.EmbedAddr)
+	}
+}
+
+func TestLoadInvalidInfinityURL(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("INFINITY_URL", "not-a-url")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for INFINITY_URL without scheme/host")
+	}
 }
 
 func TestLoadInvalidMaxWaiters(t *testing.T) {
