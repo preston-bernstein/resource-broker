@@ -40,6 +40,10 @@ _Avoid_: Gateway, Reverse Proxy (generic), Shim
 Inference handled live through the Fronting Proxy — admitted (or 503'd) immediately, streamed back, never persisted. Used for all interactive work and short batch calls. The counterpart to a Job; the choice of mode is independent of priority Class.
 _Avoid_: Sync call, Passthrough
 
+**Embed lane**:
+An optional second upstream (ADR-0008): an Infinity SigLIP server fronted on its own port (`:11438`) for the internal-scraper-service image corpus. Runs on CPU, so it has its own scheduler (no shared GPU slot) but shares the Yield controller — it backs off on Contention like everything else. Presents an OpenAI `/embeddings` face and rewrites to Infinity's `/embeddings_image`. Started only when `INFINITY_URL` is set.
+_Avoid_: Embedding proxy, CPU broker
+
 **Consumer**:
 Any service that sends inference requests through the Broker — internal-monitor-app pipeline, LightRAG (RAG + embeddings), internal-scraper-service vision, ad-hoc CLI jobs.
 _Avoid_: Client, Caller, User
