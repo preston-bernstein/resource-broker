@@ -19,7 +19,11 @@ Environment=BROKER_INTERACTIVE_ADDR=:11435
 Environment=BROKER_BATCH_ADDR=:11436
 Environment=BROKER_CONTROL_ADDR=:11437
 Environment=BROKER_INTERACTIVE_WAIT=30s
-Environment=BROKER_BATCH_WAIT=5s
+# Batch is non-real-time (embeddings, enrichment, RAG entity-extraction). It must
+# WAIT for the GPU under contention, not fast-fail: a 5s budget makes bulk RAG
+# ingestion error out ("GPU busy: wait budget exceeded") whenever an interactive
+# generation is mid-flight. 300s lets batch work queue patiently behind interactive.
+Environment=BROKER_BATCH_WAIT=300s
 Environment=BROKER_DETECT_INTERVAL=3s
 
 # Image-embedding lane (optional): fronts the Infinity SigLIP CPU server for the
