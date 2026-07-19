@@ -4,8 +4,11 @@
 package admin
 
 import (
+	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
@@ -36,7 +39,15 @@ type TdarrStatusFn func() *TdarrStatus
 // Mux builds the control-plane handler. jobs is the durable Job API surface
 // (may be nil if disabled); jobStatus, if non-nil, contributes a "jobs" section
 // to /status; tdarrStatus, if non-nil, contributes a "tdarr" section.
-func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn) http.Handler {
+//
+// controlToken gates POST /control (ADR-0005): GET /metrics, /healthz,
+// /status, and GET /control stay open to any LAN caller (Grafana must scrape
+// /metrics, and that data is low-sensitivity). POST /control mutates broker
+// state, so it is gated: if controlToken is non-empty, the request must carry
+// a matching "Authorization: Bearer <token>" header; if controlToken is
+// empty, mutations are accepted only from a loopback remote address. Either
+// way, an unauthorized POST /control gets 401.
+func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn, controlToken string) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +69,11 @@ func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, ctrl.Snapshot())
 		case http.MethodPost:
+			if !authorized(r, controlToken) {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="control"`)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 			var body struct {
 				Mode string `json:"mode"`
 			}
@@ -103,6 +119,34 @@ func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs
 	})
 
 	return mux
+}
+
+// authorized implements ADR-0005's POST /control gate: with a configured
+// token, only a matching "Authorization: Bearer <token>" header passes;
+// without one, only a loopback remote address passes (zero-config-safe
+// default so SSH-local control keeps working untouched).
+func authorized(r *http.Request, controlToken string) bool {
+	if controlToken == "" {
+		return isLoopback(r.RemoteAddr)
+	}
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, prefix) {
+		return false
+	}
+	got := strings.TrimPrefix(auth, prefix)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(controlToken)) == 1
+}
+
+// isLoopback reports whether remoteAddr (host:port, as seen on http.Request)
+// is a loopback address.
+func isLoopback(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
