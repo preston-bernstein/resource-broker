@@ -1,0 +1,5 @@
+# Control plane: open reads, gated mutations
+
+**Status: accepted (audit 2026-06-16). Code change pending.**
+
+The control listener was unauthenticated and bound to all interfaces, so any LAN device could `POST /control {"mode":"serve"}` — silently defeating the broker's entire purpose (games stutter, no yield) — or `{"mode":"yield"}` for a trivial inference DoS. We split read from mutate: `GET /metrics`, `/healthz`, `/status` stay open (Grafana on the NAS must scrape `/metrics` across the LAN, and the data is low-sensitivity), while `POST /control` requires a bearer token (`BROKER_CONTROL_TOKEN`); if the token is unset, mutations are accepted only from loopback. This is a zero-config-safe default — SSH-local control and Grafana scraping both keep working untouched, and remote mode changes require the secret. We rejected trusting the LAN (inconsistent with the rest of the home-lab's posture) and full token auth on every endpoint (breaks Grafana scrape without extra config for no real gain on read-only data). Transport stays plaintext HTTP on the trusted LAN; the token is a capability check, not confidentiality.

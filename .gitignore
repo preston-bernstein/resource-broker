@@ -1,7 +1,13 @@
 *.zip
 .DS_Store
 docs/BUILD-PLAN.md
-queue/
+# Root-level local runtime/spool dir only (not internal/queue, the Go package)
+/queue/
 *.log
 *.job
 /tmp/
+bin/
+# Durable Job store (SQLite + WAL/SHM sidecars)
+*.db
+*.db-wal
+*.db-shm

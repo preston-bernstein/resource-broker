@@ -1,0 +1,50 @@
+[Unit]
+Description=Ollama Resource Broker (HTTP-fronting GPU arbiter)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ollama-broker
+Group=ollama-broker
+ExecStart=/usr/local/bin/ollama-broker
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Upstream Ollama and listener ports (defaults shown).
+Environment=OLLAMA_URL=http://127.0.0.1:11434
+Environment=BROKER_INTERACTIVE_ADDR=:11435
+Environment=BROKER_BATCH_ADDR=:11436
+Environment=BROKER_CONTROL_ADDR=:11437
+Environment=BROKER_INTERACTIVE_WAIT=30s
+# Batch is non-real-time (embeddings, enrichment, RAG entity-extraction). It must
+# WAIT for the GPU under contention, not fast-fail: a 5s budget makes bulk RAG
+# ingestion error out ("GPU busy: wait budget exceeded") whenever an interactive
+# generation is mid-flight. 300s lets batch work queue patiently behind interactive.
+Environment=BROKER_BATCH_WAIT=300s
+Environment=BROKER_DETECT_INTERVAL=3s
+
+# Image-embedding lane (optional): fronts the Infinity SigLIP CPU server for the
+# estate-scraper durable corpus, gated by the same yield controller but on its
+# own scheduler (CPU embed must not share the GPU slot). The lane rewrites the
+# OpenAI /embeddings route to Infinity's /embeddings_image. Unset INFINITY_URL
+# to disable the lane.
+Environment=INFINITY_URL=http://127.0.0.1:7997
+Environment=BROKER_EMBED_ADDR=:11438
+
+# Durable Job queue (ADR-0006/0007). StateDirectory creates and owns
+# /var/lib/ollama-broker, which stays writable under ProtectSystem=strict.
+Environment=BROKER_JOB_DB=/var/lib/ollama-broker/jobs.db
+StateDirectory=ollama-broker
+
+# The broker reads /proc, talks HTTP to localhost, and writes its Job DB; no
+# privileges needed.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
