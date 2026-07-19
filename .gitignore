@@ -11,3 +11,12 @@ bin/
 *.db
 *.db-wal
 *.db-shm
+
+# Go build/test artifacts
+vendor/
+*.exe
+*.exe~
+*.test
+*.out
+coverage.txt
+coverage.html
