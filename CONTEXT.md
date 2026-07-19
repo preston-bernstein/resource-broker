@@ -17,16 +17,32 @@ The Broker's response to contention: stop/admit no inference work and let gaming
 _Avoid_: Throttle, Pause, Preempt (preempt is the act on one job; yield is the whole-Broker state)
 
 **Preemption**:
-Interrupting an in-flight inference job when contention appears, returning it to the front of the queue to resume once contention clears.
+Interrupting a running, lower-priority request so a higher-priority claimant gets the GPU. Two triggers: gaming/Plex contention preempts all inference; an interactive request preempts a running batch request. A preempted request returns 503 and its caller retries (batch via PENDING). Priority order: gaming/Plex > interactive > batch.
 _Avoid_: Kill, Cancel
 
+**Job**:
+A durable unit of long-running batch inference work submitted to the Broker, identified by an id, with a lifecycle (queued → running → succeeded | failed | canceled) and observable status — Position while queued, live progress (tokens, elapsed) while running. Survives Broker restart. Carries a `source` (submitting consumer) and optional `owner` (e.g. a profile id) so status views can be scoped. Distinct from a Synchronous request, which streams through the Fronting Proxy and is not persisted.
+_Avoid_: Task, Request
+
 **Queue**:
-Ordered set of pending inference requests. Preempted (interrupted) work outranks newly arrived work. Drained in priority order when the Broker is not yielding.
+The durable, ordered line of Jobs awaiting the GPU. Drained in priority order when the Broker is not yielding; paused as a whole while the Broker yields to gaming. A preempted Job returns to the front.
 _Avoid_: Backlog, Buffer
 
+**Position**:
+A Job's 1-based place among the batch Jobs that will run before it — deterministic within the batch line. Reported while a Job is queued; pairs with a clearly-soft ETA, never a hard wait guarantee (interactive bursts and gaming move the line unpredictably).
+_Avoid_: Rank, Slot, Place
+
 **Fronting Proxy**:
-The Broker's HTTP entry point: it speaks Ollama's own API on its own port, applies queue/yield/priority, then forwards to real Ollama. Callers (internal-monitor-app, LightRAG, internal-scraper-service) repoint their Ollama host at the Broker and need no other change. Distinct from the legacy CLI batch-job wrapper, which only governs commands explicitly run through it.
+The Broker's synchronous HTTP entry point: it speaks Ollama's own API, applies yield/priority, then forwards to real Ollama, streaming the response live. Serves every interactive request and short/cheap batch calls (e.g. embeddings) — callers repoint their Ollama host and need no other change. Long-running batch work uses the Job path instead. The superseded Bash CLI wrapper in `legacy/` is reference/history only — it shares no state with the Broker and must not be run alongside it.
 _Avoid_: Gateway, Reverse Proxy (generic), Shim
+
+**Synchronous request**:
+Inference handled live through the Fronting Proxy — admitted (or 503'd) immediately, streamed back, never persisted. Used for all interactive work and short batch calls. The counterpart to a Job; the choice of mode is independent of priority Class.
+_Avoid_: Sync call, Passthrough
+
+**Embed lane**:
+An optional second upstream (ADR-0008): an Infinity SigLIP server fronted on its own port (`:11438`) for the internal-scraper-service image corpus. Runs on CPU, so it has its own scheduler (no shared GPU slot) but shares the Yield controller — it backs off on Contention like everything else. Presents an OpenAI `/embeddings` face and rewrites to Infinity's `/embeddings_image`. Started only when `INFINITY_URL` is set.
+_Avoid_: Embedding proxy, CPU broker
 
 **Consumer**:
 Any service that sends inference requests through the Broker — internal-monitor-app pipeline, LightRAG (RAG + embeddings), internal-scraper-service vision, ad-hoc CLI jobs.

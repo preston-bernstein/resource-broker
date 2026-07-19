@@ -31,11 +31,11 @@ consumer → Broker listener (interactive :PORT_I | batch :PORT_B)
 
 - Yield trigger: process-name detection (Plex Transcoder, Steam `SteamLaunch AppId=`, Lutris, Heroic, Wine/Proton) — ported from `resource-manager-v3.sh` — plus a manual override (file or `POST /control`).
 - Wait budgets: interactive ~30s, batch ~5s (tunable).
-- Streaming: Ollama NDJSON relayed transparently; truncation marker on preemption.
+- Streaming: Ollama NDJSON relayed transparently. On preemption the stream is cut with no in-band marker; a consumer detects it via the `X-Broker-Status: preempted` trailer, the `preempted` metric, or the absence of Ollama's terminal `{"done":true}`. (An injected in-band marker was rejected — cancelling mid-line would corrupt the NDJSON.)
 
 ## Consumer integration
 
-- **internal-monitor-app**: point pipeline `ollama_host` at the batch port. `PENDING` already handles 503. Record `X-Broker-Status` in `integration_events`.
+- **internal-monitor-app**: point pipeline `ollama_host` at the batch port. `PENDING` already handles 503. Record `X-Broker-Status` in `integration_events` — header (`served`, or `deferred` on a 503); for streamed calls the authoritative final outcome (`served`/`preempted`) is in the response trailer `X-Broker-Status`.
 - **internal-scraper-service vision**: batch port; retry on 503.
 - **LightRAG / open-webui chat**: interactive port.
 - **embeddings** (LightRAG indexing): batch port.
@@ -44,6 +44,6 @@ consumer → Broker listener (interactive :PORT_I | batch :PORT_B)
 
 - **Hybrid graded yield** — run inference concurrently with light games (RimWorld), full-yield heavy games (Cyberpunk); needs hysteresis + non-circular GPU-% detection (the V1/V2 failure mode).
 - **Presence/Home Assistant** yield signal.
-- **CLI durable queue** — keep the legacy file-based fire-and-forget job path (separate from HTTP).
+- **CLI durable queue** — a fire-and-forget CLI job path would have to share the Broker's yield state. Not built. The Bash V3 in `legacy/` is reference-only and must **not** be run alongside the Broker (two uncoordinated GPU arbiters).
 - **Web UI** — Tier-3 dashboard (Grafana covers it for now).
 - **Numeric per-request priority** — only if two classes prove too coarse.
