@@ -120,7 +120,7 @@ func main() {
 	servers := []*http.Server{
 		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, ctrl, reg, upstream)),
 		newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, upstream)),
-		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn)),
+		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, cfg.ControlToken)),
 	}
 
 	// Image-embedding lane (optional): fronts an Infinity SigLIP server on CPU

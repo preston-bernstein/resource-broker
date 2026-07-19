@@ -30,6 +30,10 @@ type Config struct {
 	BatchWait time.Duration
 	// ControlAddr is the listen address for the admin/control plane.
 	ControlAddr string
+	// ControlToken gates POST /control (ADR-0005). Empty means mutations are
+	// accepted only from loopback; set means a matching "Bearer <token>"
+	// Authorization header is required regardless of source.
+	ControlToken string
 	// DetectInterval is how often process detection re-evaluates contention.
 	DetectInterval time.Duration
 	// MaxWaiters caps queued requests per class before fast-failing with 503.
@@ -138,6 +142,7 @@ func Load() (*Config, error) {
 		InteractiveWait:  iw,
 		BatchWait:        bw,
 		ControlAddr:      getenv("BROKER_CONTROL_ADDR", ":11437"),
+		ControlToken:     getenv("BROKER_CONTROL_TOKEN", ""),
 		DetectInterval:   di,
 		MaxWaiters:       mw,
 		MaxInflight:      mi,
