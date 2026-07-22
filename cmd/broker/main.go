@@ -42,14 +42,25 @@ func main() {
 	sched := queue.New()
 	sched.SetMaxWaiters(cfg.MaxWaiters)
 	sched.SetMaxInflight(cfg.MaxInflight)
+	sched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
 	detector := detect.New(detect.ProcLister)
 	oc := ollama.New(cfg.OllamaURL)
 	ctrl := yield.New(detector, oc, cfg.DetectInterval)
+	// yieldingFn adapts ctrl.Yielding()'s (bool, string) signature to the
+	// plain closure RunParkDrain expects (ADR-0009's Core redesign: the park
+	// drain loop is a plain ticker poll, not a yield.Controller broadcast).
+	// Shared by sched and embedSched below — both watch the same ctrl.
+	yieldingFn := func() bool {
+		y, _ := ctrl.Yielding()
+		return y
+	}
 	reg := metrics.New()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	sched.SetShutdownContext(ctx)
 	go ctrl.Run(ctx)
+	go sched.RunParkDrain(ctx, yieldingFn)
 
 	// Tdarr cooperative GPU management: pause GPU transcoding when gaming/Plex
 	// takes the GPU (via yield controller), and during the internal-scraper-service window.
@@ -107,6 +118,7 @@ func main() {
 			MaxInflight:  st.MaxInflight,
 			Interactive:  st.Interactive,
 			Batch:        st.Batch,
+			Parked:       st.Parked,
 			JobQueued:    c.Queued,
 			JobRunning:   c.Running,
 			JobSucceeded: c.Succeeded,
@@ -133,6 +145,9 @@ func main() {
 		embedSched := queue.New()
 		embedSched.SetMaxWaiters(cfg.MaxWaiters)
 		embedSched.SetMaxInflight(1) // Infinity saturates all CPU cores per request
+		embedSched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
+		embedSched.SetShutdownContext(ctx)
+		go embedSched.RunParkDrain(ctx, yieldingFn)
 		embedUpstream := proxy.NewEmbed(cfg.InfinityURL)
 		servers = append(servers, newServer(cfg.EmbedAddr,
 			embedSched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, embedUpstream)))
