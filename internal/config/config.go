@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strconv"
@@ -61,6 +62,20 @@ type Config struct {
 	TdarrNodeID string
 	// TdarrGPUWorkers is how many transcodegpu workers to restore after yielding.
 	TdarrGPUWorkers int
+
+	// ParkHold is the max duration a Batch request may sit parked during a
+	// GPU yield before it is released as an expiry (ADR-0009, NFR-1/NFR-2).
+	// Must stay comfortably under LightRAG's 1200s EMBEDDING_TIMEOUT.
+	ParkHold time.Duration
+	// ParkMaxQueue is the hard ceiling on parked Batch requests. 0 is a
+	// MEANINGFUL, deliberate value: parking is disabled outright (the
+	// documented kill-switch — a Batch request arriving during yield then
+	// takes the same immediate-deferRequest path Interactive always has).
+	ParkMaxQueue int
+	// ParkDrainBurst caps how many parked requests are released per 1s
+	// drain-ticker interval, so a full park queue drains gently rather than
+	// presenting Ollama with a burst larger than it would tolerate.
+	ParkDrainBurst int
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -133,6 +148,18 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// Park config is intentionally non-fatal to load: a bad park var must
+	// never keep the Broker from starting (parking is a resilience feature
+	// layered on top of the core proxy, not core config like OLLAMA_URL).
+	// Invalid values are logged via slog and fall back to the default,
+	// rather than failing Load() like getdur/getint above.
+	ph := getdurWarn("BROKER_PARK_HOLD", 600*time.Second)
+	// BROKER_PARK_MAX_QUEUE=0 is the documented kill-switch (parking
+	// disabled) — getintMin permits 0 and only rejects (warns+defaults on)
+	// values below min, unlike getint which rejects anything < 1.
+	pmq := getintMin("BROKER_PARK_MAX_QUEUE", 32, 0)
+	pdb := getintMin("BROKER_PARK_DRAIN_BURST", 8, 1)
+
 	return &Config{
 		InteractiveAddr:  getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
 		BatchAddr:        getenv("BROKER_BATCH_ADDR", ":11436"),
@@ -155,6 +182,9 @@ func Load() (*Config, error) {
 		TdarrURL:         getenv("BROKER_TDARR_URL", ""),
 		TdarrNodeID:      getenv("BROKER_TDARR_NODE_ID", ""),
 		TdarrGPUWorkers:  tgw,
+		ParkHold:         ph,
+		ParkMaxQueue:     pmq,
+		ParkDrainBurst:   pdb,
 	}, nil
 }
 
@@ -190,4 +220,48 @@ func getdur(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
 	}
 	return d, nil
+}
+
+// getdurWarn parses a duration env var like getdur, but never fails Load():
+// an unparseable value or a value <= 0 is logged via slog and replaced with
+// def, rather than surfacing an error. Used for park config, which must
+// never keep the Broker from starting (see the ParkHold/ParkMaxQueue/
+// ParkDrainBurst loading comment in Load()).
+func getdurWarn(key string, def time.Duration) time.Duration {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("config: invalid duration, using default", "key", key, "value", v, "default", def)
+		return def
+	}
+	if d <= 0 {
+		slog.Warn("config: duration must be positive, using default", "key", key, "value", d, "default", def)
+		return def
+	}
+	return d
+}
+
+// getintMin parses an int env var, warning and falling back to def rather
+// than failing Load(), if the value is unparseable or below min. Unlike
+// getint (which rejects anything < 1), min is caller-supplied so 0 can be a
+// permitted, meaningful value — e.g. BROKER_PARK_MAX_QUEUE=0, the documented
+// parking kill-switch.
+func getintMin(key string, def, min int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		slog.Warn("config: invalid int, using default", "key", key, "value", v, "default", def)
+		return def
+	}
+	if n < min {
+		slog.Warn("config: value below minimum, using default", "key", key, "value", n, "min", min, "default", def)
+		return def
+	}
+	return n
 }
