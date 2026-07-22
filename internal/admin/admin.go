@@ -104,6 +104,7 @@ func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs
 				"max_inflight": st.MaxInflight,
 				"interactive":  st.Interactive,
 				"batch":        st.Batch,
+				"parked":       st.Parked,
 			},
 			"schedule": schedule.TakeSnapshot(time.Now()),
 		}

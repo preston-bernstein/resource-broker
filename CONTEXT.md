@@ -28,6 +28,14 @@ _Avoid_: Task, Request
 The durable, ordered line of Jobs awaiting the GPU. Drained in priority order when the Broker is not yielding; paused as a whole while the Broker yields to gaming. A preempted Job returns to the front.
 _Avoid_: Backlog, Buffer
 
+**Park** / **Parked request**:
+An in-memory holding state for Batch synchronous requests that arrive while the Broker is yielding. A parked request waits for yield to end, then is released in FIFO order for admission to the GPU slot. Distinct from Queue: a parked request is not a Job (not durable), and parking is optional (disabled by default via `BROKER_PARK_MAX_QUEUE=0`). Hard ceilings apply: max queue depth, max hold time per request, fail-fast on graceful shutdown.
+_Avoid_: Hold, Buffer, Suspend, Queue
+
+**Drain burst**:
+The paced release of a batch of parked requests when the Broker transitions from yielding to serving. The broker releases `BROKER_PARK_DRAIN_BURST` parked requests per polling tick (1 second), so a large burst is released gradually over multiple ticks (not all at once), reducing startup load and spreading requests across the GPU.
+_Avoid_: Flush, Replay-all, Burst (alone)
+
 **Position**:
 A Job's 1-based place among the batch Jobs that will run before it — deterministic within the batch line. Reported while a Job is queued; pairs with a clearly-soft ETA, never a hard wait guarantee (interactive bursts and gaming move the line unpredictably).
 _Avoid_: Rank, Slot, Place

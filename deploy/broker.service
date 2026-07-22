@@ -26,6 +26,13 @@ Environment=BROKER_INTERACTIVE_WAIT=30s
 Environment=BROKER_BATCH_WAIT=300s
 Environment=BROKER_DETECT_INTERVAL=3s
 
+# Request parking during yield (optional): batch requests exceeding wait budget park here
+# instead of failing immediately. Defaults hold for 600s, queue ceiling 32, release 8/1s tick.
+# If parking misbehaves, set BROKER_PARK_MAX_QUEUE=0 and restart (kill-switch, no code change).
+Environment=BROKER_PARK_HOLD=600s
+Environment=BROKER_PARK_MAX_QUEUE=32
+Environment=BROKER_PARK_DRAIN_BURST=8
+
 # Image-embedding lane (optional): fronts the Infinity SigLIP CPU server for the
 # estate-scraper durable corpus, gated by the same yield controller but on its
 # own scheduler (CPU embed must not share the GPU slot). The lane rewrites the

@@ -63,11 +63,17 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | `BROKER_MAX_WAITERS` | `256` | Max queued requests per class before fast 503 |
 | `BROKER_MAX_INFLIGHT` | `1` | Max concurrent requests reaching Ollama (ADR-0004) |
 | `BROKER_BATCH_QUANTUM` | `10s` | Min-run window before interactive may preempt a Job |
+| `BROKER_PARK_HOLD` | `600s` | Max time a Batch request may stay parked during yield (ADR-0009) |
+| `BROKER_PARK_MAX_QUEUE` | `32` | Max parked Batch requests; 0 disables parking (ADR-0009, kill-switch) |
+| `BROKER_PARK_DRAIN_BURST` | `8` | Parked requests released per 1s drain tick (ADR-0009) |
 | `BROKER_JOB_DB` | `broker-jobs.db` | SQLite file for the durable Job queue |
 | `BROKER_JOB_MAX_ATTEMPTS` | `3` | Re-runs before a Job is FAILED |
 | `BROKER_JOB_PRUNE_INTERVAL` | `10m` | Terminal-Job sweep period |
 | `BROKER_JOB_FETCHED_GRACE` | `1h` | Retain a fetched result this long before pruning |
 | `BROKER_JOB_HARD_CAP` | `168h` | Max age of any terminal Job before pruning |
+
+Park-expiry alerting: `rate(broker_requests_total{outcome="expired"}[5m]) > 0` — a parked
+request aging out means yields are outlasting `BROKER_PARK_HOLD`; see ADR-0009.
 
 ### Control plane
 
