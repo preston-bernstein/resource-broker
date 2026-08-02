@@ -5,9 +5,11 @@
 package detect
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -45,20 +47,43 @@ var rules = []rule{
 	}},
 }
 
+// ErrorRecorder tallies detection failures for observability (the
+// broker_detect_errors_total counter). Optional; a nil ErrorRecorder just
+// skips the metric — the WARN log line below still fires either way.
+type ErrorRecorder interface {
+	IncDetectError()
+}
+
 // Detector reports contention from a process Lister.
 type Detector struct {
 	list Lister
+	errs ErrorRecorder // optional; nil = metric recording disabled
 }
 
 // New returns a Detector backed by list.
 func New(list Lister) *Detector { return &Detector{list: list} }
 
+// SetErrorRecorder registers where Detect() reports listing failures. Safe to
+// call before Detect() is first invoked; not safe to call concurrently with
+// Detect() (matches the SetGPUManager/SetPlexChecker convention elsewhere in
+// this repo — configure once at startup, then run).
+func (d *Detector) SetErrorRecorder(r ErrorRecorder) { d.errs = r }
+
 // Detect returns a contention reason and true if any high-priority process is
-// running. On a listing error it returns ("", false) — fail open, never block
-// inference because we couldn't read /proc.
+// running. On a listing error it returns ("", false) — fail OPEN, never block
+// inference because we couldn't read /proc — but that fail-open is not
+// allowed to be silent: a WARN log line and the broker_detect_errors_total
+// counter both fire, because a Detector that can never report contention
+// (e.g. a systemd hardening addition like ProtectProc=/hidepid= taking away
+// /proc visibility from the ollama-broker user) is otherwise indistinguishable
+// from an idle machine — see the 2026-08-01 fleet observability audit.
 func (d *Detector) Detect() (string, bool) {
 	procs, err := d.list()
 	if err != nil {
+		slog.Warn("detect: process list failed, failing open (reporting no contention)", "err", err)
+		if d.errs != nil {
+			d.errs.IncDetectError()
+		}
 		return "", false
 	}
 	for _, r := range rules {
@@ -71,12 +96,23 @@ func (d *Detector) Detect() (string, bool) {
 	return "", false
 }
 
+// goos is runtime.GOOS, indirected so tests can simulate a non-Linux host
+// without needing to actually run on one.
+var goos = runtime.GOOS
+
 // ProcLister reads /proc and returns running processes. Linux-only; on other
-// platforms it returns no processes (detection effectively disabled).
+// platforms it returns (nil, nil) — detection is disabled by design there,
+// which is NOT the failure Detect() needs to hear about. A real read failure
+// on Linux (e.g. /proc made unreadable by a hardening change) is a different
+// story and is returned as an error so Detect() logs and counts it instead of
+// silently behaving like an idle machine.
 func ProcLister() ([]Process, error) {
+	if goos != "linux" {
+		return nil, nil // not Linux / no procfs: detection intentionally disabled
+	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil, nil // not Linux / no procfs: behave as "no contention"
+		return nil, err // real failure on a platform where /proc should exist
 	}
 	var procs []Process
 	for _, e := range entries {

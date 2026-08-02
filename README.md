@@ -32,10 +32,16 @@ glossary.
   (default 1) caps requests reaching Ollama; a running Job is protected for
   `BROKER_BATCH_QUANTUM` before an interactive request may preempt it.
 - **Observable** — Prometheus `/metrics`, JSON logs, `/status`, and per-request
-  signals: `X-Broker-Wait-Ms` header; `X-Broker-Status` as a header
-  (`served`, or `deferred` on a 503) plus an authoritative **trailer** on
-  streamed responses that carries the true final outcome (`served`/`preempted`),
-  since mid-stream preemption isn't known when headers are sent.
+  signals: `X-Broker-Request-Id` correlating one request end to end through
+  admission, the access log, and the response (ADR-0011); `X-Broker-Wait-Ms`
+  header; `X-Broker-Status` as a header (`served`, or `deferred` on a 503)
+  plus an authoritative **trailer** on streamed responses that carries the
+  true final outcome (`served`/`preempted`), since mid-stream preemption
+  isn't known when headers are sent.
+- **A real `/healthz`** (ADR-0010) — checks Ollama reachability, the durable
+  Job store, and that the contention-detection loop is still polling, not
+  just that the process is up. Returns `503` with the failed dependency
+  named when any of the three is broken.
 
 ## Build & run
 
@@ -75,11 +81,17 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 Park-expiry alerting: `rate(broker_requests_total{outcome="expired"}[5m]) > 0` — a parked
 request aging out means yields are outlasting `BROKER_PARK_HOLD`; see ADR-0009.
 
+Detection-blind alerting: `rate(broker_detect_errors_total[10m]) > 0` — a nonzero rate means
+contention detection is failing open (can't read `/proc`, or lost process visibility to a
+hardening change) and the yield feature may be silently doing nothing; see
+`internal/detect/detect.go`'s `Detect()`.
+
 ### Control plane
 
 ```sh
 curl localhost:11437/status                              # yield + queue state
 curl localhost:11437/metrics                             # Prometheus
+curl localhost:11437/healthz                             # readiness: Ollama + job store + detector loop (ADR-0010)
 curl -XPOST localhost:11437/control -d '{"mode":"yield"}' # force yield | serve | auto
 ```
 

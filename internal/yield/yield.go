@@ -7,6 +7,7 @@ package yield
 import (
 	"context"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 )
@@ -78,6 +79,7 @@ type Controller struct {
 	autoContended bool
 	autoReason    string
 	effective     bool
+	lastPoll      time.Time // set by refresh(); zero until Run's first tick
 
 	// serveCtx is alive while NOT yielding; cancelled the instant yielding
 	// begins so in-flight upstream calls abort. A fresh one is made when
@@ -125,9 +127,24 @@ func (c *Controller) refresh() {
 	reason, contended := c.det.Detect()
 	c.mu.Lock()
 	c.autoContended, c.autoReason = contended, reason
+	c.lastPoll = time.Now()
 	event, r := c.applyLocked()
 	c.mu.Unlock()
 	logTransition(event, r)
+}
+
+// PollAge reports how long it has been since the detector loop last actually
+// ran (Run's first refresh, or its most recent tick). Zero time.Duration
+// forever means Run was never started at all. /healthz uses this to catch a
+// wedged or never-started detection loop — a dependency failure the process
+// being "up" says nothing about (see internal/admin's health check).
+func (c *Controller) PollAge() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastPoll.IsZero() {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Since(c.lastPoll)
 }
 
 // SetMode applies an operator override.
@@ -168,12 +185,19 @@ func (c *Controller) applyLocked() (event, reason string) {
 	return "stop", ""
 }
 
+// logTransition logs at WARN, not INFO: this is the single most
+// operationally significant state change the broker has — every game
+// stutter or ingest stall investigation starts by grepping for it (see
+// broker-diagnostics-and-tooling's grep recipe) — and at INFO it was
+// indistinguishable from the high-volume per-request access log
+// (internal/queue/gate.go), which drowns it out (2026-08-01 audit,
+// "log-levels" finding).
 func logTransition(event, reason string) {
 	switch event {
 	case "start":
-		slog.Info("yield start", "reason", reason, "action", "cancel in-flight + unload VRAM")
+		slog.Warn("yield start", "reason", reason, "action", "cancel in-flight + unload VRAM")
 	case "stop":
-		slog.Info("yield stop", "action", "resume service")
+		slog.Warn("yield stop", "action", "resume service")
 	}
 }
 

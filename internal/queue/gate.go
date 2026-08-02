@@ -2,11 +2,31 @@ package queue
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 )
+
+// newRequestID mints an 8-byte hex correlation id for one Synchronous
+// request (see CONTEXT.md's Synchronous request entry) end to end through
+// admission, the access log, and the response — the same role a Job's id
+// already plays on the durable path (internal/job/worker.go), which had one
+// and the synchronous path did not (2026-08-01 audit, "correlation"
+// finding). crypto/rand costs nothing at Synchronous-request volume and
+// avoids any shared-PRNG state across goroutines.
+func newRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is essentially unheard-of on any real OS; if it
+		// ever happens, still return something usable rather than a request
+		// with no id at all — a zero id is a visible placeholder, not silent.
+		return "00000000"
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // Admission decides whether inference may run at all right now. When yielding
 // (gaming/Plex active or manual override), requests are refused before they
@@ -48,10 +68,18 @@ func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Rec
 		var waited time.Duration
 		wasParked := false
 
+		// reqID correlates admission, the access log, and the response for one
+		// Synchronous request end to end — the thing a consumer needed to
+		// answer "which request got 503'd" and previously had no way to do
+		// (2026-08-01 audit, "correlation" finding; the durable Job path has
+		// always had this via j.ID, see internal/job/worker.go).
+		reqID := newRequestID()
+		w.Header().Set("X-Broker-Request-Id", reqID)
+
 		for {
 			if yielding, reason := adm.Yielding(); yielding {
 				if class != Batch || !s.parkEnabled() { // FR-10 + kill-switch/never-configured
-					deferRequest(w, rec, cls, "deferred", "deferred", "yielding GPU: "+reason, wait, time.Since(start))
+					deferRequest(w, r, rec, reqID, cls, "deferred", "deferred", "yielding GPU: "+reason, wait, time.Since(start))
 					return
 				}
 				t0 := time.Now()
@@ -61,16 +89,16 @@ func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Rec
 					parkWait += time.Since(t0)
 					continue // FR-6/FR-7: re-enter admission from the top
 				case parkExpired:
-					deferRequest(w, rec, cls, "deferred", "expired", "park hold exceeded", wait, time.Since(start))
+					deferRequest(w, r, rec, reqID, cls, "deferred", "expired", "park hold exceeded", wait, time.Since(start))
 					return
 				case parkRejected:
-					deferRequest(w, rec, cls, "deferred", "park_rejected", "park queue full", wait, 0)
+					deferRequest(w, r, rec, reqID, cls, "deferred", "park_rejected", "park queue full", wait, 0)
 					return
 				case parkCanceled:
 					record(rec, cls, "canceled", time.Since(start)) // FR-8: no response write, client is gone
 					return
 				case parkShutdown:
-					deferRequest(w, rec, cls, "crash_failed", "crash_failed", "broker shutting down", wait, time.Since(start))
+					deferRequest(w, r, rec, reqID, cls, "crash_failed", "crash_failed", "broker shutting down", wait, time.Since(start))
 					return
 				}
 			}
@@ -80,14 +108,14 @@ func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Rec
 			acancel()
 			waited = time.Since(start)
 			if err != nil {
-				deferRequest(w, rec, cls, "deferred", "deferred", "GPU busy: wait budget exceeded", wait, waited)
+				deferRequest(w, r, rec, reqID, cls, "deferred", "deferred", "GPU busy: wait budget exceeded", wait, waited)
 				return
 			}
 
 			if yielding, _ := adm.Yielding(); yielding {
 				s.Release() // never hold the slot through a park (NFR-3's spirit)
 				if class != Batch || !s.parkEnabled() {
-					deferRequest(w, rec, cls, "deferred", "deferred", "yielding GPU", wait, waited)
+					deferRequest(w, r, rec, reqID, cls, "deferred", "deferred", "yielding GPU", wait, waited)
 					return
 				}
 				continue // FR-2: park instead of the old immediate deferRequest
@@ -132,7 +160,8 @@ func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Rec
 			recordPark(rec, parkWait)
 		}
 		record(rec, cls, outcome, waited)
-		slog.Info("request", "class", cls, "outcome", outcome, "wait_ms", waited.Milliseconds())
+		slog.Info("request", "req_id", reqID, "class", cls, "outcome", outcome,
+			"path", r.URL.Path, "method", r.Method, "wait_ms", waited.Milliseconds())
 	})
 }
 
@@ -140,7 +169,7 @@ func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Rec
 // status is the X-Broker-Status header value; outcome is the metrics tag.
 // They differ for "expired" (status "deferred") and "crash_failed" (status
 // and outcome both "crash_failed") — see the API contract in ADR-0009.
-func deferRequest(w http.ResponseWriter, rec Recorder, class, status, outcome, reason string, retryAfter, waited time.Duration) {
+func deferRequest(w http.ResponseWriter, r *http.Request, rec Recorder, reqID, class, status, outcome, reason string, retryAfter, waited time.Duration) {
 	secs := int(retryAfter.Round(time.Second) / time.Second)
 	if secs < 1 {
 		secs = 1
@@ -149,7 +178,8 @@ func deferRequest(w http.ResponseWriter, rec Recorder, class, status, outcome, r
 	w.Header().Set("X-Broker-Status", status)
 	http.Error(w, "broker: "+reason, http.StatusServiceUnavailable)
 	record(rec, class, outcome, waited)
-	slog.Info("request", "class", class, "outcome", outcome, "reason", reason, "wait_ms", waited.Milliseconds())
+	slog.Info("request", "req_id", reqID, "class", class, "outcome", outcome, "reason", reason,
+		"path", r.URL.Path, "method", r.Method, "wait_ms", waited.Milliseconds())
 }
 
 func record(rec Recorder, class, outcome string, wait time.Duration) {
