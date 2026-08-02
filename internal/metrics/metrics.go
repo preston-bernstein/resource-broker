@@ -24,11 +24,24 @@ type Registry struct {
 	jobCounts   map[string]int64 // key: job outcome
 	jobRunSumMs float64
 	jobRunCount int64
+
+	detectErrors int64 // internal/detect.Detector fail-open count (2026-08-01 audit)
 }
 
 // New returns an empty Registry.
 func New() *Registry {
 	return &Registry{counts: make(map[string]int64), jobCounts: make(map[string]int64)}
+}
+
+// IncDetectError tallies one contention-detection failure (implements
+// detect.ErrorRecorder). Every increment corresponds to a poll that failed
+// open — see internal/detect/detect.go's Detect(). A nonzero rate here means
+// the yield feature may be silently blind; alert on
+// rate(broker_detect_errors_total[10m]) > 0.
+func (r *Registry) IncDetectError() {
+	r.mu.Lock()
+	r.detectErrors++
+	r.mu.Unlock()
 }
 
 // RecordJob tallies one terminal Job outcome ("succeeded", "failed",
@@ -118,6 +131,7 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 		jobCountsCopy[k] = v
 	}
 	jobRunSumMs, jobRunCount := r.jobRunSumMs, r.jobRunCount
+	detectErrors := r.detectErrors
 	r.mu.Unlock()
 
 	fmt.Fprint(w, "# HELP broker_wait_seconds_sum Total time served requests waited for the GPU slot.\n")
@@ -126,6 +140,10 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 	fmt.Fprint(w, "# HELP broker_wait_seconds_count Number of served requests.\n")
 	fmt.Fprint(w, "# TYPE broker_wait_seconds_count counter\n")
 	fmt.Fprintf(w, "broker_wait_seconds_count %d\n", count)
+
+	fmt.Fprint(w, "# HELP broker_detect_errors_total Contention-detection polls that failed and reported no contention (fail-open). Nonzero means the yield feature may be blind.\n")
+	fmt.Fprint(w, "# TYPE broker_detect_errors_total counter\n")
+	fmt.Fprintf(w, "broker_detect_errors_total %d\n", detectErrors)
 
 	fmt.Fprint(w, "# HELP broker_yielding Whether the broker is currently yielding the GPU.\n")
 	fmt.Fprint(w, "# TYPE broker_yielding gauge\n")

@@ -4,6 +4,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"net"
@@ -15,6 +16,14 @@ import (
 	"github.com/preston-bernstein/ollama-resource-broker/internal/schedule"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
 )
+
+// HealthCheck reports whether the broker can actually do its job right now —
+// not just whether the process is up. A non-nil error names the failed
+// dependency (Ollama upstream, the job store, the detector loop) and becomes
+// the /healthz response body. See ADR-0010: before this, /healthz was a
+// hardcoded "ok" that could never fail, the same class of defect as a
+// watchdog whose probe always returns success.
+type HealthCheck func(ctx context.Context) error
 
 // Controller is the yield control surface the admin API drives.
 type Controller interface {
@@ -38,7 +47,9 @@ type TdarrStatusFn func() *TdarrStatus
 
 // Mux builds the control-plane handler. jobs is the durable Job API surface
 // (may be nil if disabled); jobStatus, if non-nil, contributes a "jobs" section
-// to /status; tdarrStatus, if non-nil, contributes a "tdarr" section.
+// to /status; tdarrStatus, if non-nil, contributes a "tdarr" section. health,
+// if non-nil, backs /healthz with a real readiness check (ADR-0010); nil
+// preserves the old always-200 behavior (used by tests that don't care).
 //
 // controlToken gates POST /control (ADR-0005): GET /metrics, /healthz,
 // /status, and GET /control stay open to any LAN caller (Grafana must scrape
@@ -47,12 +58,27 @@ type TdarrStatusFn func() *TdarrStatus
 // a matching "Authorization: Bearer <token>" header; if controlToken is
 // empty, mutations are accepted only from a loopback remote address. Either
 // way, an unauthorized POST /control gets 401.
-func Mux(ctrl Controller, stats StatsProvider, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn, controlToken string) http.Handler {
+func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn, controlToken string) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte("ok\n"))
+		if health == nil {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("ok\n"))
+			return
+		}
+		// Bounded independently of any caller timeout: a hung dependency check
+		// must not hang the health probe itself past a few seconds.
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if err := health(ctx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"status": "unhealthy",
+				"error":  err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	mux.Handle("/metrics", metricsHandler)

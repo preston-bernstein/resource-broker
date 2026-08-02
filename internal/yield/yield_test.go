@@ -127,6 +127,23 @@ func TestYieldTransitionCancelsServeAndUnloads(t *testing.T) {
 	}
 }
 
+// TestPollAge proves the /healthz staleness signal: before Run/refresh ever
+// happens PollAge is "infinite" (never polled — a wedged or never-started
+// detection loop), and after a refresh it drops to a small, real duration.
+func TestPollAge(t *testing.T) {
+	d := &fakeDet{}
+	c := New(d, nil, time.Hour)
+
+	if age := c.PollAge(); age < 24*time.Hour {
+		t.Fatalf("PollAge before any refresh = %v, want a very large sentinel", age)
+	}
+
+	c.refresh()
+	if age := c.PollAge(); age < 0 || age > time.Second {
+		t.Fatalf("PollAge just after refresh = %v, want ~0", age)
+	}
+}
+
 func TestParseMode(t *testing.T) {
 	for in, want := range map[string]Mode{"auto": ModeAuto, "yield": ModeForceYield, "serve": ModeForceServe} {
 		if m, ok := ParseMode(in); !ok || m != want {

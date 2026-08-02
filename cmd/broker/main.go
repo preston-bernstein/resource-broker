@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,8 +30,32 @@ import (
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
 )
 
+// newLogger builds the process-default structured logger, aligned to
+// internal-infra CONVENTIONS.md §18's canonical log-line shape: schema_version,
+// ts (RFC3339 UTC — slog's own "time" key renamed, not left as-is), a
+// lowercase level string, and a service identity field so this repo's JSON
+// lines join the same Loki convention as the rest of the fleet. This does
+// NOT retrofit the contract's "event" field onto the ~44 existing slog call
+// sites in this repo — that is a larger, separate follow-up; see the
+// 2026-08-01 fleet observability audit.
+func newLogger() *slog.Logger {
+	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			switch a.Key {
+			case slog.TimeKey:
+				a.Key = "ts"
+				a.Value = slog.TimeValue(a.Value.Time().UTC())
+			case slog.LevelKey:
+				a.Value = slog.StringValue(strings.ToLower(a.Value.String()))
+			}
+			return a
+		},
+	})
+	return slog.New(h).With("schema_version", 1, "service", "ollama-resource-broker")
+}
+
 func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	slog.SetDefault(newLogger())
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -55,6 +80,10 @@ func main() {
 		return y
 	}
 	reg := metrics.New()
+	// Contention detection failing open (couldn't read /proc) must not be
+	// silent — see internal/detect/detect.go's Detect() and the
+	// broker_detect_errors_total counter (2026-08-01 audit fix).
+	detector.SetErrorRecorder(reg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -129,10 +158,31 @@ func main() {
 
 	jobStatus := func() any { return jobCounts() }
 
+	// healthCheck backs /healthz with the three things "the process is up"
+	// says nothing about (ADR-0010): can we reach Ollama, can we read the
+	// durable job store, and is the contention-detection loop still actually
+	// polling. Any one failing means the broker cannot do its job even though
+	// systemd shows it active — the exact clamd-shaped defect the
+	// 2026-08-01 audit flagged against the old hardcoded "ok".
+	const detectStaleFactor = 3 // see ADR-0010: >3 missed polls is a stalled loop, not a slow one
+	healthCheck := func(ctx context.Context) error {
+		if _, err := oc.LoadedModels(ctx); err != nil {
+			return fmt.Errorf("ollama upstream unreachable: %w", err)
+		}
+		if _, err := store.HasQueued(ctx); err != nil {
+			return fmt.Errorf("job store unreadable: %w", err)
+		}
+		if maxAge := detectStaleFactor * cfg.DetectInterval; ctrl.PollAge() > maxAge {
+			return fmt.Errorf("contention detector stalled: no poll in over %s (want under %s)",
+				ctrl.PollAge().Round(time.Second), maxAge)
+		}
+		return nil
+	}
+
 	servers := []*http.Server{
 		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, ctrl, reg, upstream)),
 		newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, upstream)),
-		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, cfg.ControlToken)),
+		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, cfg.ControlToken)),
 	}
 
 	// Image-embedding lane (optional): fronts an Infinity SigLIP server on CPU
