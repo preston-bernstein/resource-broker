@@ -3,13 +3,119 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
+	"time"
 )
+
+// transport is shared by both proxies. It sets an explicit IdleConnTimeout
+// (rather than relying on http.DefaultTransport's 90s default) so a pooled
+// outbound connection to Ollama/Infinity is proactively recycled well before
+// it can go stale and fail on reuse — see the IdleTimeout comment on
+// newServer in cmd/broker/main.go for the failure this defends against on
+// the inbound side; this is the same class of fix for the outbound hop.
+//
+// retryTransport wraps it: a bulk LightRAG embedding run against a shared,
+// busy desktop host (also running unrelated automation — Tdarr, Kalshi
+// trading bots, periodic timers) occasionally sees a request die mid-flight
+// for reasons entirely outside this proxy's control (observed 2026-07-15: a
+// burst of unrelated `systemctl daemon-reload` calls from another service on
+// the box coincided with an in-flight /api/embed call failing with "server
+// disconnected without sending a response"). LightRAG has no retry at its
+// storage-flush layer — a single such failure halts its entire pipeline and
+// cascades hundreds of in-flight documents to FAILED. /api/embed (and
+// /api/generate as used here) are idempotent for our purposes, so retrying a
+// connection-level failure once, transparently, before any response bytes
+// reach the client, is safe and removes an entire class of upstream-fragile
+// cascading failure without LightRAG (or any other consumer) ever knowing.
+var transport http.RoundTripper = &retryTransport{
+	base: &http.Transport{
+		IdleConnTimeout: 60 * time.Second,
+	},
+	retries: 2,
+	backoff: 500 * time.Millisecond,
+}
+
+// retryTransport retries a request once (or retries times) when the
+// underlying RoundTrip fails with a connection-level error before any
+// response was received — never after headers/body have started streaming
+// back to the client (httputil.ReverseProxy only calls RoundTrip once per
+// request, so a retry here is invisible to the caller either way: it either
+// gets the eventual response or the final error, exactly as if this were a
+// single slower attempt).
+type retryTransport struct {
+	base    http.RoundTripper
+	retries int
+	backoff time.Duration
+}
+
+func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Buffer the body once so it can be replayed on retry — Ollama/Infinity
+	// request bodies here are small JSON payloads (a handful of texts per
+	// embed batch), so buffering is cheap.
+	if req.Body != nil && req.GetBody == nil {
+		body, err := io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= t.retries; attempt++ {
+		if attempt > 0 {
+			if req.Context().Err() != nil {
+				return nil, lastErr
+			}
+			if req.GetBody != nil {
+				b, err := req.GetBody()
+				if err != nil {
+					return nil, lastErr
+				}
+				req.Body = b
+			}
+			time.Sleep(t.backoff)
+			slog.Warn("retrying upstream request after connection error", "path", req.URL.Path, "attempt", attempt, "err", lastErr)
+		}
+		resp, err := t.base.RoundTrip(req)
+		if err == nil {
+			return resp, nil
+		}
+		if req.Context().Err() != nil || !isRetryableConnError(err) {
+			return resp, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// isRetryableConnError reports whether err looks like a connection-level
+// failure (reset, dropped, or a stale pooled connection failing on reuse)
+// rather than an application-level error that a retry can't help — this
+// covers both the io/net-typed errors and net/http's own untyped
+// "server disconnected without sending a response" (returned as a plain
+// errors.New from net/http/httputil for a response with no status line).
+func isRetryableConnError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "server disconnected") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "EOF")
+}
 
 // embedImagePath is the route on the Infinity upstream that performs *image*
 // embedding. Infinity's unified OpenAI /embeddings route tokenizes a base64
@@ -26,6 +132,7 @@ const embedImagePath = "/embeddings_image"
 func New(target *url.URL) http.Handler {
 	rp := &httputil.ReverseProxy{
 		FlushInterval: -1,
+		Transport:     transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			// Ollama does not require a specific Host header; match the target.
@@ -49,6 +156,7 @@ func New(target *url.URL) http.Handler {
 func NewEmbed(target *url.URL) http.Handler {
 	rp := &httputil.ReverseProxy{
 		FlushInterval: -1,
+		Transport:     transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Host = target.Host
@@ -62,13 +170,25 @@ func NewEmbed(target *url.URL) http.Handler {
 }
 
 // errorHandler fires only before the response header is written. If the
-// upstream was cancelled (yield/disconnect) before any bytes, send 503 so the
-// client gets a clear status instead of an empty 200. (Mid-stream cancellation
-// never reaches here.) Server-level "superfluous WriteHeader" noise is routed
-// to slog via Server.ErrorLog.
+// upstream was cancelled (yield/disconnect) or hit its bound (a Gate
+// upstreamTimeout, ADR-0013 — currently only the embed lane sets one) before
+// any bytes, send 503 with Retry-After so the client gets the same
+// deferral shape Gate's own deferRequest uses elsewhere ("GPU busy: wait
+// budget exceeded", "yielding GPU") instead of an empty 200 or an opaque
+// 502. (Mid-stream cancellation never reaches here.) Server-level
+// "superfluous WriteHeader" noise is routed to slog via Server.ErrorLog.
 func errorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, context.Canceled) {
 		slog.Debug("upstream cancelled", "path", r.URL.Path)
+		w.Header().Set("X-Broker-Status", "deferred")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		slog.Warn("upstream request timed out", "path", r.URL.Path)
+		w.Header().Set("X-Broker-Status", "deferred")
+		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}

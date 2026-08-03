@@ -1,22 +1,22 @@
 # Broker v2 design (HTTP-fronting, Go)
 
-**Status:** Planned. Output of a design grill (2026-06-15). Supersedes the Bash V3 daemon for the HTTP path. See `CONTEXT.md` for vocabulary and `docs/adr/0001–0003` for the load-bearing decisions. Driven by fashion-monitor ADR-0006 (multi-profile pipeline → shared GPU).
+**Status:** Planned. Output of a design grill (2026-06-15) — a structured review session that stress-tests a design before it is built. Supersedes the Bash V3 daemon for the HTTP path. See `CONTEXT.md` for vocabulary and `docs/adr/0001–0003` for the load-bearing decisions. Driven by fashion-monitor ADR-0006 (a multi-profile pipeline that needs a shared GPU).
 
 ## Why v2
 
-V3 (Bash, deployed) detects gaming/Plex and preempts + queues **CLI batch jobs** run through its wrapper. It does **not** front Ollama's HTTP API, which is how the actual consumers (fashion-monitor, LightRAG, estate-scraper, open-webui) reach the GPU. v2 closes that gap.
+V3 (the existing Bash version, already deployed) detects gaming and Plex, then preempts and queues **CLI batch jobs** run through its own wrapper script. It does not front Ollama's HTTP API — the interface the real Consumers (fashion-monitor, LightRAG, estate-scraper, open-webui) actually use to reach the GPU. v2 closes that gap.
 
 ## Decisions (grill)
 
 | # | Decision | ADR |
 |---|----------|-----|
-| Q1 | Arbitration = **HTTP-fronting proxy**; consumers repoint Ollama host, zero code | 0001 |
-| Q2 | **Go**, single static binary; folds detection + proxy; retires Bash daemon | 0001 |
-| Q3 | **Process-detect → binary yield** + a manual force-yield/force-serve override; hybrid GPU-% and presence deferred | — (roadmap) |
-| Q4 | **Two priority classes by listener port** (interactive high, batch low); interactive jumps the queue but does not preempt in-flight; preemption is reserved for gaming/Plex | — |
-| Q5 | **Stateless HTTP**: bounded in-memory wait → `503 Retry-After`; consumers own retry | 0002 |
-| Q6 | **Hard yield**: cancel in-flight + force VRAM unload | 0003 |
-| Q7 | **Observability**: `/metrics` (Prometheus) + JSON stdout logs + per-response headers + `GET /status`, into existing Grafana/Loki | — |
+| Q1 | Arbitration happens through an **HTTP-fronting proxy**. Consumers just point at the Broker instead of Ollama — no code changes needed. | 0001 |
+| Q2 | Written in **Go**, as a single static binary. It folds detection and proxying into one program and retires the Bash daemon. | 0001 |
+| Q3 | Detection works by **watching process names, then yielding all-or-nothing** (binary yield), plus a manual override. A finer-grained approach — reading actual GPU utilization percentage, or detecting a person's presence — is deferred. | — (roadmap) |
+| Q4 | **Two priority classes, one per listener port**: interactive (high) and batch (low). Interactive requests jump ahead of batch requests in line, but do not interrupt a batch request already running. Interrupting a running request is reserved for gaming/Plex Contention. | — |
+| Q5 | **Stateless HTTP**: a request waits in memory up to a time budget, then gets `503 Retry-After`. The Consumer is responsible for retrying. | 0002 |
+| Q6 | **Hard yield**: cancel any in-flight request and force VRAM to be freed. | 0003 |
+| Q7 | **Observability**: `/metrics` (Prometheus format) plus JSON logs to stdout, plus per-response headers, plus `GET /status` — all feeding the existing Grafana/Loki dashboards. | — |
 
 ## Request flow
 
@@ -29,21 +29,21 @@ consumer → Broker listener (interactive :PORT_I | batch :PORT_B)
          → response + headers: X-Broker-Status, X-Broker-Wait-Ms
 ```
 
-- Yield trigger: process-name detection (Plex Transcoder, Steam `SteamLaunch AppId=`, Lutris, Heroic, Wine/Proton) — ported from `resource-manager-v3.sh` — plus a manual override (file or `POST /control`).
-- Wait budgets: interactive ~30s, batch ~5s (tunable).
-- Streaming: Ollama NDJSON relayed transparently. On preemption the stream is cut with no in-band marker; a consumer detects it via the `X-Broker-Status: preempted` trailer, the `preempted` metric, or the absence of Ollama's terminal `{"done":true}`. (An injected in-band marker was rejected — cancelling mid-line would corrupt the NDJSON.)
+- **What triggers a Yield:** the Broker matches process names — Plex Transcoder, Steam (`SteamLaunch AppId=`), Lutris, Heroic, Wine/Proton — carried over from `resource-manager-v3.sh`. A manual override also works, through a file or `POST /control`.
+- **Wait budgets:** about 30 seconds for interactive requests, about 5 seconds for batch requests (both tunable).
+- **Streaming:** Ollama's NDJSON stream passes through unchanged. If a request is preempted mid-stream, the stream just stops — there is no marker inside the stream itself. A Consumer detects this by checking the `X-Broker-Status: preempted` trailer, the `preempted` metric, or noticing that Ollama's terminal `{"done":true}` message never arrived. (An alternative — inserting a marker directly into the stream — was rejected: cutting the connection mid-line would leave broken JSON.)
 
 ## Consumer integration
 
-- **fashion-monitor**: point pipeline `ollama_host` at the batch port. `PENDING` already handles 503. Record `X-Broker-Status` in `integration_events` — header (`served`, or `deferred` on a 503); for streamed calls the authoritative final outcome (`served`/`preempted`) is in the response trailer `X-Broker-Status`.
-- **estate-scraper vision**: batch port; retry on 503.
-- **LightRAG / open-webui chat**: interactive port.
-- **embeddings** (LightRAG indexing): batch port.
+- **fashion-monitor**: point its pipeline's `ollama_host` setting at the batch port. Its existing `PENDING` state already handles a `503`. It records `X-Broker-Status` in its `integration_events` table — the header value (`served`, or `deferred` on a 503) for a plain request, and the trailer's final value (`served`/`preempted`) for a streamed one.
+- **estate-scraper vision**: use the batch port; retry on `503`.
+- **LightRAG / open-webui chat**: use the interactive port.
+- **embeddings** (LightRAG indexing): use the batch port.
 
 ## Roadmap (deferred)
 
-- **Hybrid graded yield** — run inference concurrently with light games (RimWorld), full-yield heavy games (Cyberpunk); needs hysteresis + non-circular GPU-% detection (the V1/V2 failure mode).
-- **Presence/Home Assistant** yield signal.
-- **CLI durable queue** — a fire-and-forget CLI job path would have to share the Broker's yield state. Not built. The Bash V3 in `legacy/` is reference-only and must **not** be run alongside the Broker (two uncoordinated GPU arbiters).
-- **Web UI** — Tier-3 dashboard (Grafana covers it for now).
-- **Numeric per-request priority** — only if two classes prove too coarse.
+- **Hybrid graded yield** — let inference run alongside light games (for example RimWorld) while still fully yielding for heavy games (for example Cyberpunk). Needs hysteresis (a delay before switching states, to avoid flapping back and forth) and a way to read GPU utilization percentage without the circularity that broke the V1/V2 attempts.
+- **Presence detection** — use Home Assistant to detect whether anyone is home, as a Yield signal.
+- **A durable queue for CLI jobs** — a fire-and-forget command-line job path would need to share the Broker's Yield state. Not built. The Bash V3 code in `legacy/` is kept for reference only and must never run alongside the Broker — running both would mean two GPU arbiters fighting each other.
+- **Web UI** — a dashboard is deferred; Grafana covers this need for now.
+- **Numeric per-request priority** — only worth building if two priority classes prove too coarse.
