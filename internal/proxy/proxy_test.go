@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -133,6 +135,98 @@ func TestEmbedRewritesEmbeddingsPath(t *testing.T) {
 		if c.in == "/embeddings" && gotBody != `{"input":["x"]}` {
 			t.Errorf("body not passed through: %q", gotBody)
 		}
+	}
+}
+
+// fakeRoundTripper fails with err for the first failUntil calls (per the
+// shared counter), then delegates to ok. Also records each request body it
+// saw, so tests can confirm a retried request replays the same body.
+type fakeRoundTripper struct {
+	failUntil int
+	err       error
+	calls     int
+	bodies    []string
+}
+
+func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.calls++
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		f.bodies = append(f.bodies, string(b))
+	} else {
+		f.bodies = append(f.bodies, "")
+	}
+	if f.calls <= f.failUntil {
+		return nil, f.err
+	}
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header)}, nil
+}
+
+func TestRetryTransportRetriesOnConnError(t *testing.T) {
+	fake := &fakeRoundTripper{failUntil: 2, err: errors.New("server disconnected without sending a response")}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{"input":["a","b"]}`))
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip returned error after successful retry: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if fake.calls != 3 {
+		t.Errorf("calls = %d, want 3 (2 failures + 1 success)", fake.calls)
+	}
+	for i, b := range fake.bodies {
+		if b != `{"input":["a","b"]}` {
+			t.Errorf("attempt %d body = %q, want original body replayed", i, b)
+		}
+	}
+}
+
+func TestRetryTransportGivesUpAfterMaxRetries(t *testing.T) {
+	wantErr := errors.New("server disconnected without sending a response")
+	fake := &fakeRoundTripper{failUntil: 99, err: wantErr}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`))
+	_, err := rt.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected error after exhausting retries, got nil")
+	}
+	if fake.calls != 3 {
+		t.Errorf("calls = %d, want 3 (1 initial + 2 retries)", fake.calls)
+	}
+}
+
+func TestRetryTransportDoesNotRetryNonConnError(t *testing.T) {
+	fake := &fakeRoundTripper{failUntil: 99, err: errors.New("some unrelated application error")}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`))
+	_, err := rt.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if fake.calls != 1 {
+		t.Errorf("calls = %d, want 1 (non-retryable error must not retry)", fake.calls)
+	}
+}
+
+func TestRetryTransportDoesNotRetryAfterCancellation(t *testing.T) {
+	fake := &fakeRoundTripper{failUntil: 99, err: errors.New("server disconnected without sending a response")}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`)).WithContext(ctx)
+	_, err := rt.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if fake.calls != 1 {
+		t.Errorf("calls = %d, want 1 (cancelled context must not retry)", fake.calls)
 	}
 }
 
