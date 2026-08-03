@@ -37,6 +37,21 @@ type Config struct {
 	ControlToken string
 	// DetectInterval is how often process detection re-evaluates contention.
 	DetectInterval time.Duration
+	// YieldConfirmPolls is how many consecutive same-reason detections are
+	// required before entering yield, filtering single-poll false-positive
+	// blips (launcher background housekeeping) without weakening the
+	// hard-yield response once contention is confirmed real (ADR-0003).
+	// Clearing contention is never debounced. Default 2 (see the 2026-07-15
+	// research doc: most observed false positives were single-poll blips).
+	YieldConfirmPolls int
+	// PlexURL is the local Plex Media Server base URL used to corroborate a
+	// "Plex Transcoder" process match against an actual playback session
+	// (background maintenance runs the same binary — see internal/plex).
+	PlexURL string
+	// PlexToken authenticates PlexURL. Empty disables Plex session
+	// corroboration entirely: a process-name match alone is then treated as
+	// contention, the pre-existing behavior.
+	PlexToken string
 	// MaxWaiters caps queued requests per class before fast-failing with 503.
 	MaxWaiters int
 	// MaxInflight caps concurrent requests reaching Ollama (ADR-0004).
@@ -115,6 +130,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	ycp, err := getint("BROKER_YIELD_CONFIRM_POLLS", 2)
+	if err != nil {
+		return nil, err
+	}
 	mw, err := getint("BROKER_MAX_WAITERS", 256)
 	if err != nil {
 		return nil, err
@@ -161,30 +180,33 @@ func Load() (*Config, error) {
 	pdb := getintMin("BROKER_PARK_DRAIN_BURST", 8, 1)
 
 	return &Config{
-		InteractiveAddr:  getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
-		BatchAddr:        getenv("BROKER_BATCH_ADDR", ":11436"),
-		EmbedAddr:        getenv("BROKER_EMBED_ADDR", ":11438"),
-		OllamaURL:        u,
-		InfinityURL:      infinityURL,
-		InteractiveWait:  iw,
-		BatchWait:        bw,
-		ControlAddr:      getenv("BROKER_CONTROL_ADDR", ":11437"),
-		ControlToken:     getenv("BROKER_CONTROL_TOKEN", ""),
-		DetectInterval:   di,
-		MaxWaiters:       mw,
-		MaxInflight:      mi,
-		BatchQuantum:     bq,
-		JobDBPath:        getenv("BROKER_JOB_DB", "broker-jobs.db"),
-		JobMaxAttempts:   jma,
-		JobPruneInterval: jpi,
-		JobFetchedGrace:  jfg,
-		JobHardCap:       jhc,
-		TdarrURL:         getenv("BROKER_TDARR_URL", ""),
-		TdarrNodeID:      getenv("BROKER_TDARR_NODE_ID", ""),
-		TdarrGPUWorkers:  tgw,
-		ParkHold:         ph,
-		ParkMaxQueue:     pmq,
-		ParkDrainBurst:   pdb,
+		InteractiveAddr:   getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
+		BatchAddr:         getenv("BROKER_BATCH_ADDR", ":11436"),
+		EmbedAddr:         getenv("BROKER_EMBED_ADDR", ":11438"),
+		OllamaURL:         u,
+		InfinityURL:       infinityURL,
+		InteractiveWait:   iw,
+		BatchWait:         bw,
+		ControlAddr:       getenv("BROKER_CONTROL_ADDR", ":11437"),
+		ControlToken:      getenv("BROKER_CONTROL_TOKEN", ""),
+		DetectInterval:    di,
+		YieldConfirmPolls: ycp,
+		PlexURL:           getenv("PLEX_URL", "http://localhost:32400"),
+		PlexToken:         getenv("PLEX_TOKEN", ""),
+		MaxWaiters:        mw,
+		MaxInflight:       mi,
+		BatchQuantum:      bq,
+		JobDBPath:         getenv("BROKER_JOB_DB", "broker-jobs.db"),
+		JobMaxAttempts:    jma,
+		JobPruneInterval:  jpi,
+		JobFetchedGrace:   jfg,
+		JobHardCap:        jhc,
+		TdarrURL:          getenv("BROKER_TDARR_URL", ""),
+		TdarrNodeID:       getenv("BROKER_TDARR_NODE_ID", ""),
+		TdarrGPUWorkers:   tgw,
+		ParkHold:          ph,
+		ParkMaxQueue:      pmq,
+		ParkDrainBurst:    pdb,
 	}, nil
 }
 

@@ -69,10 +69,11 @@ type GPUManager interface {
 
 // Controller holds the effective yield state, refreshed by a polling loop.
 type Controller struct {
-	det      Detector
-	unloader Unloader
-	gpuMgr   GPUManager // optional; nil = disabled
-	interval time.Duration
+	det          Detector
+	unloader     Unloader
+	gpuMgr       GPUManager // optional; nil = disabled
+	interval     time.Duration
+	confirmPolls int // consecutive same-reason detections required to enter yield
 
 	mu            sync.Mutex
 	mode          Mode
@@ -80,6 +81,8 @@ type Controller struct {
 	autoReason    string
 	effective     bool
 	lastPoll      time.Time // set by refresh(); zero until Run's first tick
+	confirmCount  int
+	confirmReason string
 
 	// serveCtx is alive while NOT yielding; cancelled the instant yielding
 	// begins so in-flight upstream calls abort. A fresh one is made when
@@ -88,15 +91,34 @@ type Controller struct {
 	serveCancel context.CancelFunc
 }
 
-// New returns a Controller in ModeAuto, not yielding.
+// New returns a Controller in ModeAuto, not yielding, that acts on the first
+// detection (confirmPolls=1) — the historical, pre-debounce behavior. Use
+// NewWithConfirm to require sustained detection before yielding.
 func New(det Detector, unloader Unloader, interval time.Duration) *Controller {
+	return NewWithConfirm(det, unloader, interval, 1)
+}
+
+// NewWithConfirm returns a Controller that only enters yield after
+// confirmPolls consecutive polls report the same contention reason. This
+// filters brief single-poll process-match blips (launcher background
+// housekeeping subprocesses that transiently match a gaming regex but are
+// not sustained gameplay — see docs/adr and the 2026-07-15 research doc)
+// without weakening ADR-0003's hard-yield response once contention is
+// confirmed real. Clearing contention is never debounced: recovery only
+// benefits inference and never risks starving gaming/Plex, so it should be
+// as fast as detection allows. confirmPolls < 1 is treated as 1.
+func NewWithConfirm(det Detector, unloader Unloader, interval time.Duration, confirmPolls int) *Controller {
+	if confirmPolls < 1 {
+		confirmPolls = 1
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Controller{
-		det:         det,
-		unloader:    unloader,
-		interval:    interval,
-		serveCtx:    ctx,
-		serveCancel: cancel,
+		det:          det,
+		unloader:     unloader,
+		interval:     interval,
+		confirmPolls: confirmPolls,
+		serveCtx:     ctx,
+		serveCancel:  cancel,
 	}
 }
 
@@ -126,7 +148,7 @@ func (c *Controller) Run(ctx context.Context) {
 func (c *Controller) refresh() {
 	reason, contended := c.det.Detect()
 	c.mu.Lock()
-	c.autoContended, c.autoReason = contended, reason
+	c.autoContended, c.autoReason = c.debounceLocked(reason, contended)
 	c.lastPoll = time.Now()
 	event, r := c.applyLocked()
 	c.mu.Unlock()
@@ -145,6 +167,27 @@ func (c *Controller) PollAge() time.Duration {
 		return time.Duration(math.MaxInt64)
 	}
 	return time.Since(c.lastPoll)
+}
+
+// debounceLocked requires confirmPolls consecutive detections of the same
+// reason before reporting contention upward. A cleared detection or a
+// change in reason resets the count immediately — flapping between two
+// reasons (e.g. "gaming-steam" then "gaming-wine") must not accumulate
+// confirmation for either. Caller holds c.mu.
+func (c *Controller) debounceLocked(reason string, contended bool) (bool, string) {
+	if !contended {
+		c.confirmCount, c.confirmReason = 0, ""
+		return false, ""
+	}
+	if reason == c.confirmReason {
+		c.confirmCount++
+	} else {
+		c.confirmReason, c.confirmCount = reason, 1
+	}
+	if c.confirmCount < c.confirmPolls {
+		return false, ""
+	}
+	return true, reason
 }
 
 // SetMode applies an operator override.

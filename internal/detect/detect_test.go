@@ -105,3 +105,61 @@ var errReadProc = errTest("read /proc failed")
 type errTest string
 
 func (e errTest) Error() string { return string(e) }
+
+type fakePlexChecker struct {
+	active bool
+	err    error
+}
+
+func (f fakePlexChecker) ActiveSession() (bool, error) { return f.active, f.err }
+
+func TestDetectPlexCheckerSuppressesBackgroundMaintenance(t *testing.T) {
+	d := New(lister("/x/Plex Transcoder -i foo"))
+	d.SetPlexChecker(fakePlexChecker{active: false})
+	if reason, cont := d.Detect(); cont || reason != "" {
+		t.Fatalf("Plex Transcoder with no active session (background maintenance) should not report contention, got (%q,%v)", reason, cont)
+	}
+}
+
+func TestDetectPlexCheckerConfirmsRealSession(t *testing.T) {
+	d := New(lister("/x/Plex Transcoder -i foo"))
+	d.SetPlexChecker(fakePlexChecker{active: true})
+	if reason, cont := d.Detect(); !cont || reason != "plex" {
+		t.Fatalf("Plex Transcoder with an active session should report contention, got (%q,%v)", reason, cont)
+	}
+}
+
+func TestDetectPlexCheckerErrorFailsSafeTowardYielding(t *testing.T) {
+	d := New(lister("/x/Plex Transcoder -i foo"))
+	d.SetPlexChecker(fakePlexChecker{err: errTest("plex api unreachable")})
+	if reason, cont := d.Detect(); !cont || reason != "plex" {
+		t.Fatalf("a Plex API error must never silently hide real contention, got (%q,%v)", reason, cont)
+	}
+}
+
+func TestDetectNoPlexCheckerConfiguredKeepsLegacyBehavior(t *testing.T) {
+	d := New(lister("/x/Plex Transcoder -i foo"))
+	if reason, cont := d.Detect(); !cont || reason != "plex" {
+		t.Fatalf("with no checker configured, process match alone should still report contention, got (%q,%v)", reason, cont)
+	}
+}
+
+func TestDetectPlexCheckerNotCalledWhenNoPlexProcess(t *testing.T) {
+	called := false
+	d := New(lister("reaper SteamLaunch AppId=1"))
+	d.SetPlexChecker(fakePlexCheckerFunc(func() (bool, error) {
+		called = true
+		return true, nil
+	}))
+	reason, cont := d.Detect()
+	if called {
+		t.Fatal("Plex API should not be queried when no Plex Transcoder process is running")
+	}
+	if reason != "gaming-steam" || !cont {
+		t.Fatalf("Detect() = (%q,%v), want (\"gaming-steam\",true)", reason, cont)
+	}
+}
+
+type fakePlexCheckerFunc func() (bool, error)
+
+func (f fakePlexCheckerFunc) ActiveSession() (bool, error) { return f() }

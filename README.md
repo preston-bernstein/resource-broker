@@ -44,6 +44,9 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | `BROKER_INTERACTIVE_WAIT` | `30s` | Interactive slot wait budget |
 | `BROKER_BATCH_WAIT` | `5s` | Batch slot wait budget |
 | `BROKER_DETECT_INTERVAL` | `3s` | Contention re-check period |
+| `BROKER_YIELD_CONFIRM_POLLS` | `2` | Consecutive same-reason detections required before entering yield (filters single-poll false positives; clearing is never debounced) |
+| `PLEX_URL` | `http://localhost:32400` | Local Plex Media Server base URL, used to corroborate a "Plex Transcoder" process match against a real playback session |
+| `PLEX_TOKEN` | _(unset)_ | Plex API token. Unset disables Plex session corroboration entirely (a process-name match alone is treated as contention, the pre-existing behavior) |
 | `BROKER_MAX_WAITERS` | `256` | Max queued requests per class before fast 503 |
 | `BROKER_MAX_INFLIGHT` | `1` | Max concurrent requests reaching Ollama (ADR-0004) |
 | `BROKER_BATCH_QUANTUM` | `10s` | Min-run window before interactive may preempt a Job |

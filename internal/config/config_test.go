@@ -239,6 +239,76 @@ func TestLoadParkHoldInvalid(t *testing.T) {
 	}
 }
 
+// --- Plex session corroboration (PLEX_URL / PLEX_TOKEN) and yield debounce (BROKER_YIELD_CONFIRM_POLLS) ---
+
+func TestLoadYieldConfirmPollsDefault(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_YIELD_CONFIRM_POLLS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.YieldConfirmPolls != 2 {
+		t.Errorf("YieldConfirmPolls = %d, want default 2", cfg.YieldConfirmPolls)
+	}
+}
+
+func TestLoadYieldConfirmPollsOverride(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_YIELD_CONFIRM_POLLS", "5")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.YieldConfirmPolls != 5 {
+		t.Errorf("YieldConfirmPolls = %d, want 5", cfg.YieldConfirmPolls)
+	}
+}
+
+func TestLoadYieldConfirmPollsInvalid(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_YIELD_CONFIRM_POLLS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for YieldConfirmPolls < 1 (getint rejects, unlike getintMin-backed park vars)")
+	}
+}
+
+func TestLoadPlexDefaults(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("PLEX_URL", "")
+	t.Setenv("PLEX_TOKEN", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PlexURL != "http://localhost:32400" {
+		t.Errorf("PlexURL = %q, want default http://localhost:32400", cfg.PlexURL)
+	}
+	if cfg.PlexToken != "" {
+		t.Errorf("PlexToken = %q, want empty (corroboration disabled) by default", cfg.PlexToken)
+	}
+}
+
+func TestLoadPlexOverrides(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("PLEX_URL", "http://desktop.example.internal:32400")
+	t.Setenv("PLEX_TOKEN", "secret-token")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PlexURL != "http://desktop.example.internal:32400" {
+		t.Errorf("PlexURL = %q", cfg.PlexURL)
+	}
+	if cfg.PlexToken != "secret-token" {
+		t.Errorf("PlexToken = %q", cfg.PlexToken)
+	}
+}
+
 // TestParkHoldBatchWaitBudget is the NFR-2 headroom guard: BROKER_PARK_HOLD
 // plus BROKER_BATCH_WAIT is a wait-time-only budget that must leave
 // comfortable margin under LightRAG's 1200s wrapping EMBEDDING_TIMEOUT (the
