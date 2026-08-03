@@ -203,11 +203,11 @@ func main() {
 	// handshake is negligible on a LAN but this trades a little latency for
 	// eliminating an entire failure class — not worth paying on the
 	// low-latency interactive lane where the race hasn't been observed.
-	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, upstream))
+	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, upstream))
 	batchServer.SetKeepAlivesEnabled(false)
 
 	servers := []*http.Server{
-		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, ctrl, reg, upstream)),
+		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, upstream)),
 		batchServer,
 		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, cfg.ControlToken)),
 	}
@@ -218,6 +218,13 @@ func main() {
 	// but runs on its OWN scheduler: CPU embedding and GPU inference use
 	// different hardware, so they must not contend for the single GPU slot.
 	// Disabled (lane not started) when INFINITY_URL is unset.
+	//
+	// Gate's upstreamTimeout is set here (cfg.EmbedTimeout, ADR-0013) and
+	// nowhere else: this lane's own MaxInflight is hardcoded to 1 (line
+	// below), so one stuck Infinity call — no response, connection just
+	// hangs — wedges the lane's single slot forever with no bound to free
+	// it, unlike Ollama's interactive/batch lanes where a legitimate
+	// generation can legitimately run for minutes and must NOT be cut off.
 	if cfg.InfinityURL != nil {
 		embedSched := queue.New()
 		embedSched.SetMaxWaiters(cfg.MaxWaiters)
@@ -227,8 +234,8 @@ func main() {
 		go embedSched.RunParkDrain(ctx, yieldingFn)
 		embedUpstream := proxy.NewEmbed(cfg.InfinityURL)
 		servers = append(servers, newServer(cfg.EmbedAddr,
-			embedSched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, embedUpstream)))
-		slog.Info("embed lane enabled", "addr", cfg.EmbedAddr, "upstream", cfg.InfinityURL.String())
+			embedSched.Gate(queue.Batch, cfg.BatchWait, cfg.EmbedTimeout, ctrl, reg, embedUpstream)))
+		slog.Info("embed lane enabled", "addr", cfg.EmbedAddr, "upstream", cfg.InfinityURL.String(), "embed_timeout", cfg.EmbedTimeout.String())
 	}
 
 	var wg sync.WaitGroup

@@ -8,8 +8,10 @@ description: >
   embed lane connection refused or 404; the Broker NOT yielding while a game runs; go test
   failing at HEAD; Tdarr GPU workers not restored after yield; suspected double GPU
   arbitration; lane ports (11435/11436) hanging or timing out (curl HTTP 000) while the
-  control plane responds; or all Broker ports down. Gives exact first-check commands,
-  ranked causes, discriminating experiments, and fixes.
+  control plane responds; the embed lane (11438) itself hanging or never responding, even
+  though :11437 answers, and outcome=upstream_timeout in logs/metrics; or all Broker ports
+  down. Gives exact first-check commands, ranked causes, discriminating experiments, and
+  fixes.
 ---
 
 # Broker debugging playbook
@@ -69,6 +71,7 @@ journalctl -u ollama-broker -f          # follow live
 | 11 | Weird contention / GPU state flapping / double arbitration | On desktop: `systemctl status resource-manager` | The legacy Bash daemon `resource-manager.service` STILL runs alongside the Broker (verified 2026-07-02) — an uncoordinated second arbiter, explicitly forbidden by `docs/DESIGN.md`. | Correlate flap timestamps in `journalctl -u ollama-broker` vs `journalctl -u resource-manager`. | Treat it as a prime suspect but do NOT stop/disable it ad hoc — that is the `broker-cutover-hardening-campaign` skill's job. |
 | 12 | All lanes down (connection refused on 11435–11438) | `systemctl status ollama-broker` on the desktop | 1. Unit stopped/crashed. 2. Config error at startup (`config` error log then exit 1). 3. Port conflict (`listen ... : address already in use`). | `journalctl -u ollama-broker -n 50` — look for `"broker up"`, `"config"`, or `"listen"` errors. | Fix config/port, `sudo systemctl restart ollama-broker`. Remember: the unit is `ollama-broker.service`, not `broker.service`. |
 | 13 | Lane ports (11435/11436) hang or time out (curl `HTTP 000`) while `:11437`/`:11438` answer instantly | `curl -s http://desktop.example.internal:11437/status` → `queue.busy`, `queue.inflight` | 1. A long in-flight generation holds the single GPU slot — the Gate wraps EVERY lane path, so even `GET /api/tags` queues behind it (`BROKER_MAX_INFLIGHT=1`). 2. Only if `busy:false` too: real network/listener issue → symptom 12. | `busy:true, inflight:1` + responsive control plane = working as designed under load, NOT an outage (observed live 2026-07-02: probes with an 8s client timeout got `000` on both lanes mid-generation). | Wait it out or raise the client's timeout past the wait budget. Do NOT restart — that kills the in-flight work to fix a non-problem. Recurring pattern → move the long workload to the Job API. |
+| 14 | Embed lane (`:11438`) itself hangs indefinitely — no response, no timeout, even after minutes; `grep upstream_timeout` in logs is EMPTY (i.e. it never even got that far) | `curl -sm10 -o /dev/null -w '%{http_code}\n' http://desktop.example.internal:11438/metrics` from `:11437` proxied metrics if separately exposed, or `journalctl -u ollama-broker -n 50 \| grep embed` | 1. Pre-ADR-0013 binary (no `BROKER_EMBED_TIMEOUT` support) — a stuck Infinity backend call held the lane's single `MaxInflight=1` slot forever, wedging every request behind it permanently, not just for one wait-budget cycle. 2. `BROKER_EMBED_TIMEOUT=0` explicitly set, disabling the bound. | Check the deployed binary's build date/commit against ADR-0013's landing commit; check `deploy/broker.service`/live unit for `BROKER_EMBED_TIMEOUT`. | Deploy the ADR-0013 binary (or unset `BROKER_EMBED_TIMEOUT=0` if it was deliberately disabled) and restart. After the fix, a stuck backend call surfaces as `outcome=upstream_timeout` in `/metrics` and the access log within `BROKER_EMBED_TIMEOUT` (default 30s), not as a permanent wedge — see `rate(broker_requests_total{outcome="upstream_timeout"}[5m]) > 0` alerting in README. |
 
 ## Symptom detail
 

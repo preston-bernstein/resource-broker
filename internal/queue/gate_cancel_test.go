@@ -59,7 +59,7 @@ func TestGateCancelsInFlightOnYield(t *testing.T) {
 
 	adm := newManualAdm()
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, adm, nil, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, adm, nil, upstream))
 	defer srv.Close()
 
 	done := make(chan struct{})

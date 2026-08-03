@@ -170,13 +170,25 @@ func NewEmbed(target *url.URL) http.Handler {
 }
 
 // errorHandler fires only before the response header is written. If the
-// upstream was cancelled (yield/disconnect) before any bytes, send 503 so the
-// client gets a clear status instead of an empty 200. (Mid-stream cancellation
-// never reaches here.) Server-level "superfluous WriteHeader" noise is routed
-// to slog via Server.ErrorLog.
+// upstream was cancelled (yield/disconnect) or hit its bound (a Gate
+// upstreamTimeout, ADR-0013 — currently only the embed lane sets one) before
+// any bytes, send 503 with Retry-After so the client gets the same
+// deferral shape Gate's own deferRequest uses elsewhere ("GPU busy: wait
+// budget exceeded", "yielding GPU") instead of an empty 200 or an opaque
+// 502. (Mid-stream cancellation never reaches here.) Server-level
+// "superfluous WriteHeader" noise is routed to slog via Server.ErrorLog.
 func errorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, context.Canceled) {
 		slog.Debug("upstream cancelled", "path", r.URL.Path)
+		w.Header().Set("X-Broker-Status", "deferred")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		slog.Warn("upstream request timed out", "path", r.URL.Path)
+		w.Header().Set("X-Broker-Status", "deferred")
+		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}

@@ -239,6 +239,42 @@ func TestLoadParkHoldInvalid(t *testing.T) {
 	}
 }
 
+// --- Embed lane upstream timeout (BROKER_EMBED_TIMEOUT, ADR-0013) ---
+
+func TestLoadEmbedTimeoutDefault(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_EMBED_TIMEOUT", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EmbedTimeout != 30*time.Second {
+		t.Errorf("EmbedTimeout = %v, want default 30s", cfg.EmbedTimeout)
+	}
+}
+
+func TestLoadEmbedTimeoutOverride(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_EMBED_TIMEOUT", "10s")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EmbedTimeout != 10*time.Second {
+		t.Errorf("EmbedTimeout = %v, want 10s", cfg.EmbedTimeout)
+	}
+}
+
+func TestLoadEmbedTimeoutInvalid(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_EMBED_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for unparseable BROKER_EMBED_TIMEOUT")
+	}
+}
+
 // --- Plex session corroboration (PLEX_URL / PLEX_TOKEN) and yield debounce (BROKER_YIELD_CONFIRM_POLLS) ---
 
 func TestLoadYieldConfirmPollsDefault(t *testing.T) {
