@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -133,6 +135,158 @@ func TestEmbedRewritesEmbeddingsPath(t *testing.T) {
 		if c.in == "/embeddings" && gotBody != `{"input":["x"]}` {
 			t.Errorf("body not passed through: %q", gotBody)
 		}
+	}
+}
+
+// fakeRoundTripper fails with err for the first failUntil calls (per the
+// shared counter), then delegates to ok. Also records each request body it
+// saw, so tests can confirm a retried request replays the same body.
+type fakeRoundTripper struct {
+	failUntil int
+	err       error
+	calls     int
+	bodies    []string
+}
+
+func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.calls++
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		f.bodies = append(f.bodies, string(b))
+	} else {
+		f.bodies = append(f.bodies, "")
+	}
+	if f.calls <= f.failUntil {
+		return nil, f.err
+	}
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header)}, nil
+}
+
+// TestErrorHandlerDeadlineExceededMatches503Shape pins ADR-0013's client-
+// facing contract: when a Gate upstreamTimeout fires (context.DeadlineExceeded,
+// currently only set on the embed lane), the client must see the same 503 +
+// Retry-After + X-Broker-Status: deferred shape Gate's own deferRequest uses
+// for every other deferral ("GPU busy: wait budget exceeded", "yielding
+// GPU") — not an opaque 502, which would read as a genuine upstream fault
+// rather than a broker-side bound.
+func TestErrorHandlerDeadlineExceededMatches503Shape(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/embeddings", nil)
+
+	errorHandler(rec, req, context.DeadlineExceeded)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Header().Get("X-Broker-Status"); got != "deferred" {
+		t.Errorf("X-Broker-Status = %q, want %q", got, "deferred")
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+}
+
+// TestErrorHandlerCanceledMatches503Shape pins the pre-existing yield/
+// disconnect path still carries the same shape after adding the
+// DeadlineExceeded branch alongside it.
+func TestErrorHandlerCanceledMatches503Shape(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/generate", nil)
+
+	errorHandler(rec, req, context.Canceled)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Header().Get("X-Broker-Status"); got != "deferred" {
+		t.Errorf("X-Broker-Status = %q, want %q", got, "deferred")
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+}
+
+// TestErrorHandlerOtherErrorStays502 pins that a genuine upstream fault
+// (connection refused, DNS failure, etc.) still surfaces as 502, not the
+// broker-deferral 503 shape — that distinction is what lets an operator
+// tell "the broker deferred this on purpose" from "Infinity/Ollama is
+// actually down" in the response status alone.
+func TestErrorHandlerOtherErrorStays502(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/generate", nil)
+
+	errorHandler(rec, req, errors.New("dial tcp: connection refused"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+}
+
+func TestRetryTransportRetriesOnConnError(t *testing.T) {
+	fake := &fakeRoundTripper{failUntil: 2, err: errors.New("server disconnected without sending a response")}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{"input":["a","b"]}`))
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip returned error after successful retry: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if fake.calls != 3 {
+		t.Errorf("calls = %d, want 3 (2 failures + 1 success)", fake.calls)
+	}
+	for i, b := range fake.bodies {
+		if b != `{"input":["a","b"]}` {
+			t.Errorf("attempt %d body = %q, want original body replayed", i, b)
+		}
+	}
+}
+
+func TestRetryTransportGivesUpAfterMaxRetries(t *testing.T) {
+	wantErr := errors.New("server disconnected without sending a response")
+	fake := &fakeRoundTripper{failUntil: 99, err: wantErr}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`))
+	_, err := rt.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected error after exhausting retries, got nil")
+	}
+	if fake.calls != 3 {
+		t.Errorf("calls = %d, want 3 (1 initial + 2 retries)", fake.calls)
+	}
+}
+
+func TestRetryTransportDoesNotRetryNonConnError(t *testing.T) {
+	fake := &fakeRoundTripper{failUntil: 99, err: errors.New("some unrelated application error")}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`))
+	_, err := rt.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if fake.calls != 1 {
+		t.Errorf("calls = %d, want 1 (non-retryable error must not retry)", fake.calls)
+	}
+}
+
+func TestRetryTransportDoesNotRetryAfterCancellation(t *testing.T) {
+	fake := &fakeRoundTripper{failUntil: 99, err: errors.New("server disconnected without sending a response")}
+	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`)).WithContext(ctx)
+	_, err := rt.RoundTrip(req)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if fake.calls != 1 {
+		t.Errorf("calls = %d, want 1 (cancelled context must not retry)", fake.calls)
 	}
 }
 

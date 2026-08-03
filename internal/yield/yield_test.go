@@ -127,6 +127,88 @@ func TestYieldTransitionCancelsServeAndUnloads(t *testing.T) {
 	}
 }
 
+// TestPollAge proves the /healthz staleness signal: before Run/refresh ever
+// happens PollAge is "infinite" (never polled — a wedged or never-started
+// detection loop), and after a refresh it drops to a small, real duration.
+func TestPollAge(t *testing.T) {
+	d := &fakeDet{}
+	c := New(d, nil, time.Hour)
+
+	if age := c.PollAge(); age < 24*time.Hour {
+		t.Fatalf("PollAge before any refresh = %v, want a very large sentinel", age)
+	}
+
+	c.refresh()
+	if age := c.PollAge(); age < 0 || age > time.Second {
+		t.Fatalf("PollAge just after refresh = %v, want ~0", age)
+	}
+}
+
+func TestConfirmPollsDebouncesTransientMatch(t *testing.T) {
+	d := &fakeDet{}
+	c := NewWithConfirm(d, nil, time.Hour, 3)
+
+	// A single-poll blip (launcher background housekeeping) must not yield.
+	d.set("gaming-heroic", true)
+	c.refresh()
+	if y, _ := c.Yielding(); y {
+		t.Fatal("single detection should not yield with confirmPolls=3")
+	}
+	d.set("", false)
+	c.refresh()
+	if y, _ := c.Yielding(); y {
+		t.Fatal("clearing after one blip should not yield")
+	}
+
+	// Sustained detection across confirmPolls consecutive refreshes must yield.
+	d.set("gaming-heroic", true)
+	c.refresh()
+	c.refresh()
+	if y, _ := c.Yielding(); y {
+		t.Fatal("should not yield before confirmPolls consecutive detections")
+	}
+	c.refresh()
+	if y, r := c.Yielding(); !y || r != "gaming-heroic" {
+		t.Fatalf("should yield on the confirmPolls-th consecutive detection: (%v,%q)", y, r)
+	}
+}
+
+func TestConfirmPollsResetsOnReasonChange(t *testing.T) {
+	d := &fakeDet{}
+	c := NewWithConfirm(d, nil, time.Hour, 2)
+
+	d.set("gaming-heroic", true)
+	c.refresh()
+	d.set("gaming-wine", true) // different reason: must not carry over the count
+	c.refresh()
+	if y, _ := c.Yielding(); y {
+		t.Fatal("a reason change should reset confirmation, not accumulate")
+	}
+	c.refresh() // second consecutive "gaming-wine"
+	if y, r := c.Yielding(); !y || r != "gaming-wine" {
+		t.Fatalf("should yield after confirmPolls consecutive detections of the new reason: (%v,%q)", y, r)
+	}
+}
+
+func TestConfirmPollsClearIsInstant(t *testing.T) {
+	d := &fakeDet{}
+	c := NewWithConfirm(d, nil, time.Hour, 3)
+
+	d.set("plex", true)
+	c.refresh()
+	c.refresh()
+	c.refresh()
+	if y, _ := c.Yielding(); !y {
+		t.Fatal("setup: expected yielding after confirmPolls detections")
+	}
+
+	d.set("", false)
+	c.refresh() // recovery must not be debounced
+	if y, _ := c.Yielding(); y {
+		t.Fatal("clearing contention should take effect on the very next poll")
+	}
+}
+
 func TestParseMode(t *testing.T) {
 	for in, want := range map[string]Mode{"auto": ModeAuto, "yield": ModeForceYield, "serve": ModeForceServe} {
 		if m, ok := ParseMode(in); !ok || m != want {

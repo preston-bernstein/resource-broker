@@ -29,10 +29,30 @@ func TestHandlerRendersCountersAndGauges(t *testing.T) {
 		`broker_busy 1`,
 		`broker_queue_depth{class="interactive"} 2`,
 		`broker_queue_depth{class="batch"} 1`,
+		`broker_detect_errors_total 0`,
 	}
 	for _, w := range want {
 		if !strings.Contains(body, w) {
 			t.Errorf("metrics output missing %q\n--- got ---\n%s", w, body)
 		}
+	}
+}
+
+// TestIncDetectError proves the detect.ErrorRecorder wiring (2026-08-01
+// audit fix): each call is a separate poll's fail-open, tallied as a
+// monotonic counter, visible on /metrics.
+func TestIncDetectError(t *testing.T) {
+	r := New()
+	r.IncDetectError()
+	r.IncDetectError()
+	r.IncDetectError()
+
+	h := r.Handler(func() Gauges { return Gauges{} })
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "broker_detect_errors_total 3") {
+		t.Errorf("metrics output missing broker_detect_errors_total 3\n--- got ---\n%s", body)
 	}
 }

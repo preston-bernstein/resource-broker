@@ -1,11 +1,14 @@
 package admin
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
@@ -26,7 +29,11 @@ type fakeStats struct{}
 func (fakeStats) Stats() queue.Stats { return queue.Stats{Busy: true, Interactive: 1, Batch: 2} }
 
 func newMux(c Controller, token string) http.Handler {
-	return Mux(c, fakeStats{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return newMuxWithHealth(c, nil, token)
+}
+
+func newMuxWithHealth(c Controller, health HealthCheck, token string) http.Handler {
+	return Mux(c, fakeStats{}, health, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "metrics")
 	}), nil, nil, nil, token)
 }
@@ -45,6 +52,64 @@ func TestHealthz(t *testing.T) {
 	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "ok") {
 		t.Fatalf("healthz: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// --- ADR-0010: /healthz becomes a real readiness check ---
+
+// TestHealthzWithCheckerHealthy proves a configured HealthCheck that returns
+// nil still yields 200, with a body that says so.
+func TestHealthzWithCheckerHealthy(t *testing.T) {
+	rec := httptest.NewRecorder()
+	health := func(context.Context) error { return nil }
+	newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ok") {
+		t.Fatalf("healthz (healthy): %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHealthzWithCheckerUnhealthy is the defect this ADR fixes, pinned as a
+// test: /healthz must be able to fail, and the body must name what's wrong —
+// not report "ok" while the broker can't actually reach Ollama, the job
+// store, or the detector loop (the clamd-shaped defect from the 2026-08-01
+// audit).
+func TestHealthzWithCheckerUnhealthy(t *testing.T) {
+	rec := httptest.NewRecorder()
+	health := func(context.Context) error {
+		return errors.New("ollama upstream unreachable: dial tcp: connection refused")
+	}
+	newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("healthz (unhealthy): status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "ollama upstream unreachable") {
+		t.Fatalf("healthz (unhealthy) body does not name the failed dependency: %q", rec.Body.String())
+	}
+}
+
+// TestHealthzTimeoutBound proves a HealthCheck that never returns still
+// resolves the HTTP response — the probe must not hang forever just because
+// one dependency did.
+func TestHealthzTimeoutBound(t *testing.T) {
+	blocked := make(chan struct{})
+	defer close(blocked)
+	health := func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("healthz did not resolve within its own timeout bound")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("healthz (timeout): status = %d, want 503", rec.Code)
 	}
 }
 

@@ -57,6 +57,16 @@ type Scheduler struct {
 	// interactive request parks because no slot is free. The Job worker selects
 	// on it to decide whether to preempt a running batch Job past its quantum.
 	interactiveWaiting chan struct{}
+
+	// park is this Scheduler's bounded FIFO park queue for Batch requests
+	// caught during a GPU yield (see park.go). Zero-value (maxQueue == 0)
+	// means parking is disabled — fail-closed for a Scheduler that never
+	// calls SetParkConfig.
+	park parker
+	// shutdownCtx is the broker's top-level shutdown signal, wired via
+	// SetShutdownContext. Defaults to context.Background() (never fires) so
+	// existing tests that never call the setter are unaffected.
+	shutdownCtx context.Context
 }
 
 // New returns an idle Scheduler: concurrency 1, default per-class waiter cap.
@@ -65,6 +75,7 @@ func New() *Scheduler {
 		maxInflight:        1,
 		maxWaiters:         MaxWaitersPerClass,
 		interactiveWaiting: make(chan struct{}, 1),
+		shutdownCtx:        context.Background(),
 	}
 }
 
@@ -153,19 +164,28 @@ type Stats struct {
 	MaxInflight int
 	Interactive int
 	Batch       int
+	Parked      int // live park-queue depth, this Scheduler instance
 }
 
-// Stats returns current occupancy and per-class queue depth.
+// Stats returns current occupancy and per-class queue depth, plus live park
+// depth. Lock order: s.mu, then park.mu — Stats is the ONLY place both are
+// held at once (nested, s.mu outer). Every other path in this file takes at
+// most one of the two. If a future change needs to hold both somewhere else,
+// it MUST follow this same order or risk deadlock against Stats().
 func (s *Scheduler) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Stats{
+	st := Stats{
 		Busy:        s.inflight > 0,
 		Inflight:    s.inflight,
 		MaxInflight: s.maxInflight,
 		Interactive: len(s.iq),
 		Batch:       len(s.bq),
 	}
+	s.park.mu.Lock()
+	st.Parked = len(s.park.q)
+	s.park.mu.Unlock()
+	return st
 }
 
 // --- helpers (caller holds s.mu) ---
