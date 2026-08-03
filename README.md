@@ -41,6 +41,7 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | `BROKER_BATCH_ADDR` | `:11436` | Batch (low-priority) port |
 | `BROKER_CONTROL_ADDR` | `:11437` | Control plane (`/control`,`/status`,`/metrics`,`/healthz`) |
 | `BROKER_EMBED_ADDR` | `:11438` | Image-embedding lane (fronts Infinity; only listens when `INFINITY_URL` set) |
+| `BROKER_EMBED_TIMEOUT` | `30s` | Bounds how long the embed lane's own upstream call may run once admitted, so a stuck Infinity call can't wedge the lane's single slot forever (ADR-0013). `0` disables the bound |
 | `BROKER_INTERACTIVE_WAIT` | `30s` | Interactive slot wait budget |
 | `BROKER_BATCH_WAIT` | `5s` | Batch slot wait budget |
 | `BROKER_DETECT_INTERVAL` | `3s` | Contention re-check period |
@@ -66,6 +67,10 @@ Detection-blind alerting: `rate(broker_detect_errors_total[10m]) > 0` — a nonz
 Contention detection is failing open: the Broker can't read `/proc` (or lost visibility to
 running processes after a hardening change), so the Yield feature may be silently doing
 nothing. See `internal/detect/detect.go`'s `Detect()`.
+
+Embed-lane wedge alerting: `rate(broker_requests_total{outcome="upstream_timeout"}[5m]) > 0` —
+a nonzero rate means the embed lane's own upstream call to Infinity hit `BROKER_EMBED_TIMEOUT`
+instead of returning normally, the exact failure ADR-0013 exists to stop from being silent.
 
 ### Control plane
 

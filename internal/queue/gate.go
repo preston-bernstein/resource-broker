@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -60,7 +61,17 @@ type Recorder interface {
 // the top rather than recursing. Interactive requests never park (FR-10):
 // class != Batch short-circuits straight to the old immediate-deferRequest
 // path in both places Yielding() is checked below. See ADR-0009.
-func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Recorder, next http.Handler) http.Handler {
+//
+// upstreamTimeout bounds how long next.ServeHTTP may run once the slot is
+// held, separately from wait (which only bounds how long a request may
+// queue FOR the slot). Zero disables the bound — the pre-existing behavior,
+// required for the Ollama interactive/batch lanes where a legitimate
+// generation can run for minutes. A stuck backend call on a lane with no
+// bound holds its slot forever: since MaxInflight/embed-lane concurrency is
+// 1, one wedged request permanently starves every request behind it (ADR-
+// 0013). Callers that pass a nonzero upstreamTimeout get that guarantee;
+// see cmd/broker/main.go's embed-lane wiring for the one lane that does.
+func (s *Scheduler) Gate(class Class, wait, upstreamTimeout time.Duration, adm Admission, rec Recorder, next http.Handler) http.Handler {
 	cls := class.String()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -124,7 +135,13 @@ func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Rec
 			break
 		}
 
-		ctx, cancel := context.WithCancel(r.Context())
+		var ctx context.Context
+		var cancel context.CancelFunc
+		if upstreamTimeout > 0 {
+			ctx, cancel = context.WithTimeout(r.Context(), upstreamTimeout)
+		} else {
+			ctx, cancel = context.WithCancel(r.Context())
+		}
 		defer cancel()
 		serveDone := adm.ServeContext().Done()
 		go func() {
@@ -148,12 +165,19 @@ func (s *Scheduler) Gate(class Class, wait time.Duration, adm Admission, rec Rec
 		next.ServeHTTP(w, r.WithContext(ctx))
 
 		// Final outcome for metrics/logs/trailer, read deterministically from the
-		// serve state rather than a raced flag.
+		// serve state rather than a raced flag. A yield preemption and an
+		// upstream-timeout both cancel ctx, so serveDone is checked first:
+		// contention is the higher-priority explanation when both are
+		// possible (e.g. yield began just as the bound also would have
+		// fired) and is what operators need to see in the outcome label.
 		outcome := "served"
 		select {
 		case <-serveDone:
 			outcome = "preempted"
 		default:
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				outcome = "upstream_timeout"
+			}
 		}
 		w.Header().Set(http.TrailerPrefix+"X-Broker-Status", outcome)
 		if wasParked && outcome == "served" {

@@ -31,7 +31,7 @@ func TestGateSerializes(t *testing.T) {
 	})
 
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, alwaysServe{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, alwaysServe{}, nil, upstream))
 	defer srv.Close()
 
 	const n = 5
@@ -71,7 +71,7 @@ func TestGateRequestIDCorrelation(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, alwaysServe{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, alwaysServe{}, nil, upstream))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/api/generate")

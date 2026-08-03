@@ -38,7 +38,7 @@ func TestGateRefusesWhenYielding(t *testing.T) {
 		io.WriteString(w, "ok")
 	})
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, alwaysYield{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, alwaysYield{}, nil, upstream))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL)
@@ -73,7 +73,7 @@ func TestGateInteractiveNeverParksWhenConfigured(t *testing.T) {
 	})
 	s := New()
 	s.SetParkConfig(time.Second, 32, 8) // parking on; still must not affect Interactive
-	srv := httptest.NewServer(s.Gate(Interactive, 2*time.Second, alwaysYield{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(Interactive, 2*time.Second, 0, alwaysYield{}, nil, upstream))
 	defer srv.Close()
 
 	client := &http.Client{Timeout: 500 * time.Millisecond}
@@ -178,7 +178,7 @@ func TestGateParksDuringYield(t *testing.T) {
 	s.SetParkConfig(3*time.Second, 4, 4)
 	rec := newCountRec()
 	yf := newYieldFlag(true)
-	srv := httptest.NewServer(s.Gate(Batch, 3*time.Second, flagAdm{yf}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 3*time.Second, 0, flagAdm{yf}, rec, upstream))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -237,7 +237,7 @@ func TestGateParkExpires(t *testing.T) {
 	s := New()
 	s.SetParkConfig(120*time.Millisecond, 4, 4) // short hold, never drained
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, alwaysYield{}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, alwaysYield{}, rec, upstream))
 	defer srv.Close()
 
 	start := time.Now()
@@ -281,7 +281,7 @@ func TestGateParkQueueCeiling(t *testing.T) {
 	s := New()
 	s.SetParkConfig(5*time.Second, maxQueue, maxQueue)
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, alwaysYield{}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, alwaysYield{}, rec, upstream))
 	defer srv.Close()
 
 	// Fill the ceiling with cancellable requests so they can be cleaned up
@@ -346,7 +346,7 @@ func TestGateParkDrainBurst(t *testing.T) {
 	s := New()
 	s.SetParkConfig(5*time.Second, n, burst)
 	yf := newYieldFlag(true)
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, flagAdm{yf}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, flagAdm{yf}, nil, upstream))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -418,7 +418,7 @@ func TestGateParkClientDisconnect(t *testing.T) {
 	s := New()
 	s.SetParkConfig(5*time.Second, 5, 5)
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, alwaysYield{}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, alwaysYield{}, rec, upstream))
 	defer srv.Close()
 
 	baseGoroutines := runtime.NumGoroutine()
@@ -471,7 +471,7 @@ func TestGateParkShutdown(t *testing.T) {
 	shutCtx, shutCancel := context.WithCancel(context.Background())
 	s.SetShutdownContext(shutCtx)
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 10*time.Second, alwaysYield{}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 10*time.Second, 0, alwaysYield{}, rec, upstream))
 	defer srv.Close()
 
 	type result struct {

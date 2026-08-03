@@ -162,6 +162,66 @@ func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header)}, nil
 }
 
+// TestErrorHandlerDeadlineExceededMatches503Shape pins ADR-0013's client-
+// facing contract: when a Gate upstreamTimeout fires (context.DeadlineExceeded,
+// currently only set on the embed lane), the client must see the same 503 +
+// Retry-After + X-Broker-Status: deferred shape Gate's own deferRequest uses
+// for every other deferral ("GPU busy: wait budget exceeded", "yielding
+// GPU") — not an opaque 502, which would read as a genuine upstream fault
+// rather than a broker-side bound.
+func TestErrorHandlerDeadlineExceededMatches503Shape(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/embeddings", nil)
+
+	errorHandler(rec, req, context.DeadlineExceeded)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Header().Get("X-Broker-Status"); got != "deferred" {
+		t.Errorf("X-Broker-Status = %q, want %q", got, "deferred")
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+}
+
+// TestErrorHandlerCanceledMatches503Shape pins the pre-existing yield/
+// disconnect path still carries the same shape after adding the
+// DeadlineExceeded branch alongside it.
+func TestErrorHandlerCanceledMatches503Shape(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/generate", nil)
+
+	errorHandler(rec, req, context.Canceled)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Header().Get("X-Broker-Status"); got != "deferred" {
+		t.Errorf("X-Broker-Status = %q, want %q", got, "deferred")
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+}
+
+// TestErrorHandlerOtherErrorStays502 pins that a genuine upstream fault
+// (connection refused, DNS failure, etc.) still surfaces as 502, not the
+// broker-deferral 503 shape — that distinction is what lets an operator
+// tell "the broker deferred this on purpose" from "Infinity/Ollama is
+// actually down" in the response status alone.
+func TestErrorHandlerOtherErrorStays502(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/generate", nil)
+
+	errorHandler(rec, req, errors.New("dial tcp: connection refused"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+}
+
 func TestRetryTransportRetriesOnConnError(t *testing.T) {
 	fake := &fakeRoundTripper{failUntil: 2, err: errors.New("server disconnected without sending a response")}
 	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}

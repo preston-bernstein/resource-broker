@@ -25,6 +25,15 @@ type Config struct {
 	// Infinity, gated by yield but on its own scheduler so CPU embedding does
 	// not share the GPU concurrency slot).
 	EmbedAddr string
+	// EmbedTimeout bounds how long the embed lane's own upstream call to
+	// Infinity may run once admitted, separate from BatchWait (which only
+	// bounds how long a request may queue for the slot). The embed lane's
+	// MaxInflight is hardcoded to 1 (cmd/broker/main.go), so a stuck backend
+	// call with no bound wedges the lane's single slot forever (ADR-0013).
+	// Zero disables the bound; only the embed lane wiring uses this — the
+	// Ollama interactive/batch lanes stay unbounded (a legitimate generation
+	// can run for minutes and must not be cut off).
+	EmbedTimeout time.Duration
 	// InteractiveWait is the queue wait budget for interactive requests.
 	InteractiveWait time.Duration
 	// BatchWait is the queue wait budget for batch requests.
@@ -126,6 +135,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	et, err := getdur("BROKER_EMBED_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	di, err := getdur("BROKER_DETECT_INTERVAL", 3*time.Second)
 	if err != nil {
 		return nil, err
@@ -183,6 +196,7 @@ func Load() (*Config, error) {
 		InteractiveAddr:   getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
 		BatchAddr:         getenv("BROKER_BATCH_ADDR", ":11436"),
 		EmbedAddr:         getenv("BROKER_EMBED_ADDR", ":11438"),
+		EmbedTimeout:      et,
 		OllamaURL:         u,
 		InfinityURL:       infinityURL,
 		InteractiveWait:   iw,
