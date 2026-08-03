@@ -26,6 +26,30 @@ Environment=BROKER_INTERACTIVE_WAIT=30s
 Environment=BROKER_BATCH_WAIT=300s
 Environment=BROKER_DETECT_INTERVAL=3s
 
+# Yield debounce: require this many consecutive same-reason detections before
+# entering yield, filtering single-poll false positives (launcher background
+# housekeeping that transiently matches a gaming/Plex pattern) without
+# weakening the hard-yield response once contention is confirmed real.
+# Clearing contention is never debounced.
+Environment=BROKER_YIELD_CONFIRM_POLLS=2
+
+# Plex session corroboration (optional): a "Plex Transcoder" process match is
+# treated as real GPU contention only once Plex's own /status/sessions
+# confirms an active playback session — Plex runs that same binary for
+# background maintenance (Skip Intro/Credits detection, thumbnail
+# generation) independent of anyone watching anything. Requires a Plex
+# token; leave PLEX_TOKEN unset to disable corroboration and fall back to
+# the pre-existing process-match-only behavior.
+#Environment=PLEX_URL=http://localhost:32400
+#Environment=PLEX_TOKEN=<set to enable Plex session corroboration>
+
+# Request parking during yield (optional): batch requests exceeding wait budget park here
+# instead of failing immediately. Defaults hold for 600s, queue ceiling 32, release 8/1s tick.
+# If parking misbehaves, set BROKER_PARK_MAX_QUEUE=0 and restart (kill-switch, no code change).
+Environment=BROKER_PARK_HOLD=600s
+Environment=BROKER_PARK_MAX_QUEUE=32
+Environment=BROKER_PARK_DRAIN_BURST=8
+
 # Image-embedding lane (optional): fronts the Infinity SigLIP CPU server for the
 # internal-scraper-service durable corpus, gated by the same yield controller but on its
 # own scheduler (CPU embed must not share the GPU slot). The lane rewrites the
@@ -33,6 +57,12 @@ Environment=BROKER_DETECT_INTERVAL=3s
 # to disable the lane.
 Environment=INFINITY_URL=http://127.0.0.1:7997
 Environment=BROKER_EMBED_ADDR=:11438
+# Bounds how long the embed lane's own upstream call may run once admitted.
+# This lane's MaxInflight is hardcoded to 1 (Infinity saturates all CPU cores
+# per request), so a stuck backend call with no bound wedges the lane's one
+# slot forever instead of failing; 30s leaves comfortable margin over
+# ADR-0009's documented < 1s-per-image embedding cost. 0 disables the bound.
+Environment=BROKER_EMBED_TIMEOUT=30s
 
 # Durable Job queue (ADR-0006/0007). StateDirectory creates and owns
 # /var/lib/ollama-broker, which stays writable under ProtectSystem=strict.

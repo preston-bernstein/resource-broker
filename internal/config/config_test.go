@@ -105,3 +105,266 @@ func TestLoadInvalidDuration(t *testing.T) {
 		t.Fatal("expected error for bad duration")
 	}
 }
+
+// --- Park config (BROKER_PARK_HOLD / BROKER_PARK_MAX_QUEUE / BROKER_PARK_DRAIN_BURST) ---
+
+func TestLoadParkDefaults(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_PARK_HOLD", "")
+	t.Setenv("BROKER_PARK_MAX_QUEUE", "")
+	t.Setenv("BROKER_PARK_DRAIN_BURST", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ParkHold != 600*time.Second {
+		t.Errorf("ParkHold = %v, want 600s", cfg.ParkHold)
+	}
+	if cfg.ParkMaxQueue != 32 {
+		t.Errorf("ParkMaxQueue = %d, want 32", cfg.ParkMaxQueue)
+	}
+	if cfg.ParkDrainBurst != 8 {
+		t.Errorf("ParkDrainBurst = %d, want 8", cfg.ParkDrainBurst)
+	}
+}
+
+func TestLoadParkOverrides(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_PARK_HOLD", "120s")
+	t.Setenv("BROKER_PARK_MAX_QUEUE", "10")
+	t.Setenv("BROKER_PARK_DRAIN_BURST", "3")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ParkHold != 120*time.Second {
+		t.Errorf("ParkHold = %v, want 120s", cfg.ParkHold)
+	}
+	if cfg.ParkMaxQueue != 10 {
+		t.Errorf("ParkMaxQueue = %d, want 10", cfg.ParkMaxQueue)
+	}
+	if cfg.ParkDrainBurst != 3 {
+		t.Errorf("ParkDrainBurst = %d, want 3", cfg.ParkDrainBurst)
+	}
+}
+
+// TestLoadParkMaxQueueZero pins the documented kill-switch: 0 must load
+// successfully (not be rejected like getint's "< 1" rule), because
+// BROKER_PARK_MAX_QUEUE=0 is the operator's first-line rollback if parking
+// misbehaves — see ADR-0009 point 4 and plan.md's SetParkConfig contract.
+func TestLoadParkMaxQueueZero(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_PARK_MAX_QUEUE", "0")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ParkMaxQueue != 0 {
+		t.Errorf("ParkMaxQueue = %d, want 0 (kill-switch)", cfg.ParkMaxQueue)
+	}
+}
+
+// TestLoadParkMaxQueueNegative asserts a negative value is a config error,
+// not a disable request: it is ignored (falls back to the default) with a
+// warning logged, rather than crashing Load() or being silently treated as
+// the 0 kill-switch (which would hide a typo behind seemingly-correct
+// behavior).
+func TestLoadParkMaxQueueNegative(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_PARK_MAX_QUEUE", "-5")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v (must not crash on negative ParkMaxQueue)", err)
+	}
+	if cfg.ParkMaxQueue != 32 {
+		t.Errorf("ParkMaxQueue = %d, want default 32 after negative override", cfg.ParkMaxQueue)
+	}
+}
+
+func TestLoadParkMaxQueueGarbage(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_PARK_MAX_QUEUE", "not-a-number")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v (must not crash on garbage ParkMaxQueue)", err)
+	}
+	if cfg.ParkMaxQueue != 32 {
+		t.Errorf("ParkMaxQueue = %d, want default 32 after garbage override", cfg.ParkMaxQueue)
+	}
+}
+
+// TestLoadParkDrainBurstInvalid asserts values < 1 (including 0 and
+// negative) are ignored in favor of the default — unlike ParkMaxQueue, 0 has
+// no meaningful "disabled" interpretation for a drain burst size.
+func TestLoadParkDrainBurstInvalid(t *testing.T) {
+	for _, v := range []string{"0", "-1", "garbage"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+			t.Setenv("BROKER_PARK_DRAIN_BURST", v)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v (must not crash on invalid ParkDrainBurst %q)", err, v)
+			}
+			if cfg.ParkDrainBurst != 8 {
+				t.Errorf("ParkDrainBurst = %d, want default 8 for input %q", cfg.ParkDrainBurst, v)
+			}
+		})
+	}
+}
+
+// TestLoadParkHoldInvalid asserts a zero/negative/unparseable ParkHold is
+// ignored in favor of the default rather than crashing Load() or silently
+// producing an instant-expire (0 or negative) hold bound — see plan.md's
+// note that hold<=0 must never be applied silently.
+func TestLoadParkHoldInvalid(t *testing.T) {
+	for _, v := range []string{"0s", "-5s", "soon"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+			t.Setenv("BROKER_PARK_HOLD", v)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v (must not crash on invalid ParkHold %q)", err, v)
+			}
+			if cfg.ParkHold != 600*time.Second {
+				t.Errorf("ParkHold = %v, want default 600s for input %q", cfg.ParkHold, v)
+			}
+		})
+	}
+}
+
+// --- Embed lane upstream timeout (BROKER_EMBED_TIMEOUT, ADR-0013) ---
+
+func TestLoadEmbedTimeoutDefault(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_EMBED_TIMEOUT", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EmbedTimeout != 30*time.Second {
+		t.Errorf("EmbedTimeout = %v, want default 30s", cfg.EmbedTimeout)
+	}
+}
+
+func TestLoadEmbedTimeoutOverride(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_EMBED_TIMEOUT", "10s")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.EmbedTimeout != 10*time.Second {
+		t.Errorf("EmbedTimeout = %v, want 10s", cfg.EmbedTimeout)
+	}
+}
+
+func TestLoadEmbedTimeoutInvalid(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_EMBED_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for unparseable BROKER_EMBED_TIMEOUT")
+	}
+}
+
+// --- Plex session corroboration (PLEX_URL / PLEX_TOKEN) and yield debounce (BROKER_YIELD_CONFIRM_POLLS) ---
+
+func TestLoadYieldConfirmPollsDefault(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_YIELD_CONFIRM_POLLS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.YieldConfirmPolls != 2 {
+		t.Errorf("YieldConfirmPolls = %d, want default 2", cfg.YieldConfirmPolls)
+	}
+}
+
+func TestLoadYieldConfirmPollsOverride(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_YIELD_CONFIRM_POLLS", "5")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.YieldConfirmPolls != 5 {
+		t.Errorf("YieldConfirmPolls = %d, want 5", cfg.YieldConfirmPolls)
+	}
+}
+
+func TestLoadYieldConfirmPollsInvalid(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_YIELD_CONFIRM_POLLS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for YieldConfirmPolls < 1 (getint rejects, unlike getintMin-backed park vars)")
+	}
+}
+
+func TestLoadPlexDefaults(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("PLEX_URL", "")
+	t.Setenv("PLEX_TOKEN", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PlexURL != "http://localhost:32400" {
+		t.Errorf("PlexURL = %q, want default http://localhost:32400", cfg.PlexURL)
+	}
+	if cfg.PlexToken != "" {
+		t.Errorf("PlexToken = %q, want empty (corroboration disabled) by default", cfg.PlexToken)
+	}
+}
+
+func TestLoadPlexOverrides(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("PLEX_URL", "http://desktop.example.internal:32400")
+	t.Setenv("PLEX_TOKEN", "secret-token")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PlexURL != "http://desktop.example.internal:32400" {
+		t.Errorf("PlexURL = %q", cfg.PlexURL)
+	}
+	if cfg.PlexToken != "secret-token" {
+		t.Errorf("PlexToken = %q", cfg.PlexToken)
+	}
+}
+
+// TestParkHoldBatchWaitBudget is the NFR-2 headroom guard: BROKER_PARK_HOLD
+// plus BROKER_BATCH_WAIT is a wait-time-only budget that must leave
+// comfortable margin under LightRAG's 1200s wrapping EMBEDDING_TIMEOUT (the
+// serve-plus-retry-transport budget is what's left over, and it is not
+// slack — see plan.md's "Config surface" table). This asserts the two
+// loaded defaults together stay under 900s, so a future default bump to
+// either var is caught here instead of silently eating into that serve
+// budget.
+func TestParkHoldBatchWaitBudget(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_PARK_HOLD", "")
+	t.Setenv("BROKER_BATCH_WAIT", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	budget := cfg.ParkHold + cfg.BatchWait
+	if budget >= 900*time.Second {
+		t.Errorf("ParkHold(%v) + BatchWait(%v) = %v, want < 900s (LightRAG 1200s headroom guard)",
+			cfg.ParkHold, cfg.BatchWait, budget)
+	}
+}

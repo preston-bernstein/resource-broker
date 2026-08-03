@@ -18,14 +18,30 @@ type Registry struct {
 	waitSumMs float64
 	waitCount int64
 
+	parkWaitSumMs float64
+	parkWaitCount int64
+
 	jobCounts   map[string]int64 // key: job outcome
 	jobRunSumMs float64
 	jobRunCount int64
+
+	detectErrors int64 // internal/detect.Detector fail-open count (2026-08-01 audit)
 }
 
 // New returns an empty Registry.
 func New() *Registry {
 	return &Registry{counts: make(map[string]int64), jobCounts: make(map[string]int64)}
+}
+
+// IncDetectError tallies one contention-detection failure (implements
+// detect.ErrorRecorder). Every increment corresponds to a poll that failed
+// open — see internal/detect/detect.go's Detect(). A nonzero rate here means
+// the yield feature may be silently blind; alert on
+// rate(broker_detect_errors_total[10m]) > 0.
+func (r *Registry) IncDetectError() {
+	r.mu.Lock()
+	r.detectErrors++
+	r.mu.Unlock()
 }
 
 // RecordJob tallies one terminal Job outcome ("succeeded", "failed",
@@ -52,6 +68,17 @@ func (r *Registry) Record(class, outcome string, wait time.Duration) {
 	r.mu.Unlock()
 }
 
+// RecordPark tallies time spent parked (waiting during yield) for a request
+// that was eventually served. Outcome strings ("expired", "park_rejected",
+// "canceled", "crash_failed") are recorded separately via Record(); this
+// method is only called for requests with outcome "served" that were parked.
+func (r *Registry) RecordPark(wait time.Duration) {
+	r.mu.Lock()
+	r.parkWaitSumMs += float64(wait) / float64(time.Millisecond)
+	r.parkWaitCount++
+	r.mu.Unlock()
+}
+
 // Gauges are point-in-time values sampled at scrape time.
 type Gauges struct {
 	Yielding    bool
@@ -60,6 +87,7 @@ type Gauges struct {
 	MaxInflight int
 	Interactive int
 	Batch       int
+	Parked      int
 
 	// Durable Job counts by state (ADR-0006).
 	JobQueued    int
@@ -92,6 +120,7 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 		fmt.Fprintf(w, "broker_requests_total{class=%q,outcome=%q} %d\n", class, outcome, r.counts[k])
 	}
 	sumMs, count := r.waitSumMs, r.waitCount
+	parkSumMs, parkCount := r.parkWaitSumMs, r.parkWaitCount
 	jobKeys := make([]string, 0, len(r.jobCounts))
 	for k := range r.jobCounts {
 		jobKeys = append(jobKeys, k)
@@ -102,6 +131,7 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 		jobCountsCopy[k] = v
 	}
 	jobRunSumMs, jobRunCount := r.jobRunSumMs, r.jobRunCount
+	detectErrors := r.detectErrors
 	r.mu.Unlock()
 
 	fmt.Fprint(w, "# HELP broker_wait_seconds_sum Total time served requests waited for the GPU slot.\n")
@@ -110,6 +140,10 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 	fmt.Fprint(w, "# HELP broker_wait_seconds_count Number of served requests.\n")
 	fmt.Fprint(w, "# TYPE broker_wait_seconds_count counter\n")
 	fmt.Fprintf(w, "broker_wait_seconds_count %d\n", count)
+
+	fmt.Fprint(w, "# HELP broker_detect_errors_total Contention-detection polls that failed and reported no contention (fail-open). Nonzero means the yield feature may be blind.\n")
+	fmt.Fprint(w, "# TYPE broker_detect_errors_total counter\n")
+	fmt.Fprintf(w, "broker_detect_errors_total %d\n", detectErrors)
 
 	fmt.Fprint(w, "# HELP broker_yielding Whether the broker is currently yielding the GPU.\n")
 	fmt.Fprint(w, "# TYPE broker_yielding gauge\n")
@@ -127,6 +161,17 @@ func (r *Registry) write(w io.Writer, g Gauges) {
 	fmt.Fprint(w, "# TYPE broker_queue_depth gauge\n")
 	fmt.Fprintf(w, "broker_queue_depth{class=\"interactive\"} %d\n", g.Interactive)
 	fmt.Fprintf(w, "broker_queue_depth{class=\"batch\"} %d\n", g.Batch)
+
+	fmt.Fprint(w, "# HELP broker_parked_depth Batch-class park depth; Interactive never parks.\n")
+	fmt.Fprint(w, "# TYPE broker_parked_depth gauge\n")
+	fmt.Fprintf(w, "broker_parked_depth %d\n", g.Parked)
+
+	fmt.Fprint(w, "# HELP broker_park_wait_seconds_sum Total time requests spent parked waiting for yield to end.\n")
+	fmt.Fprint(w, "# TYPE broker_park_wait_seconds_sum counter\n")
+	fmt.Fprintf(w, "broker_park_wait_seconds_sum %g\n", parkSumMs/1000.0)
+	fmt.Fprint(w, "# HELP broker_park_wait_seconds_count Number of requests that were parked and eventually served.\n")
+	fmt.Fprint(w, "# TYPE broker_park_wait_seconds_count counter\n")
+	fmt.Fprintf(w, "broker_park_wait_seconds_count %d\n", parkCount)
 
 	fmt.Fprint(w, "# HELP broker_jobs Durable Jobs by state.\n")
 	fmt.Fprint(w, "# TYPE broker_jobs gauge\n")

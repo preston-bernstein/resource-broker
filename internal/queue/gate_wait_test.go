@@ -21,7 +21,7 @@ func TestGateWaitBudgetExceeded(t *testing.T) {
 	})
 
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 100*time.Millisecond, alwaysServe{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(Batch, 100*time.Millisecond, 0, alwaysServe{}, nil, upstream))
 	defer srv.Close()
 
 	// Occupy the slot with a long-held request.
