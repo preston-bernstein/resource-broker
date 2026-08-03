@@ -1,47 +1,25 @@
 # Ollama Resource Broker
 
-Single-GPU arbitration for a home PC shared by **gaming**, **Plex transcoding**,
-and **Ollama inference**. Gaming/Plex take absolute priority; inference is
-queued, preempted, and resumed around them.
+The Ollama Resource Broker (called "the Broker" throughout this repo) decides who gets the GPU on a home PC. Three things compete for it: gaming, Plex video transcoding, and Ollama inference (AI model requests). Gaming and Plex always win. The Broker queues inference requests, pauses them, and resumes them around gaming and Plex.
 
-This is the **v2 Go HTTP-fronting broker**. It sits in front of Ollama and every
-inference consumer points at it instead of Ollama directly — no per-consumer
-code. The original Bash daemon lives in [`legacy/`](legacy/).
+This is the **v2 Go HTTP-fronting broker**: a single program, written in Go, that sits between every inference Consumer (a service that sends Ollama requests, such as fashion-monitor or LightRAG) and Ollama itself. Consumers point at the Broker instead of Ollama directly, so no Consumer needs custom code to cooperate with gaming or Plex. The original Bash version of this idea lives in [`legacy/`](legacy/) for reference only — do not run it alongside the Broker.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the design and
-[`docs/adr/`](docs/adr/) for the decisions; [`CONTEXT.md`](CONTEXT.md) is the
-glossary.
+Read next:
+- [`docs/DESIGN.md`](docs/DESIGN.md) — the design
+- [`docs/adr/`](docs/adr/) — the ADRs, one per major decision
+- [`CONTEXT.md`](CONTEXT.md) — the glossary of every term this repo uses
 
 ## How it works
 
-- **Two listener ports** speak Ollama's API: interactive (high priority) and
-  batch (low). Consumers pick a port; interactive jumps ahead of batch.
-- **Concurrency 1** — exactly one request reaches Ollama at a time.
-- **Yield** — when a game or Plex transcode is detected (by process name), the
-  broker refuses new inference (`503 Retry-After`), cancels any in-flight call,
-  and forces Ollama to unload models so the GPU is fully free for the game. When
-  contention clears, it serves again.
-- **Two paths** — *synchronous* requests stream live through the proxy (all
-  interactive work + short batch like embeddings) and are stateless: they wait
-  at most a per-class budget, then `503`, and the consumer retries. *Durable
-  Jobs* (long batch — scoring, vision) are submitted to `POST /jobs`, persisted
-  in SQLite, processed through the same GPU gate, and **survive a restart** — a
-  Job interrupted by a crash re-runs; one preempted by gaming or an interactive
-  burst requeues at the front. See [`docs/DESIGN-jobs.md`](docs/DESIGN-jobs.md).
-- **Configurable concurrency + quantum** (ADR-0004) — `BROKER_MAX_INFLIGHT`
-  (default 1) caps requests reaching Ollama; a running Job is protected for
-  `BROKER_BATCH_QUANTUM` before an interactive request may preempt it.
-- **Observable** — Prometheus `/metrics`, JSON logs, `/status`, and per-request
-  signals: `X-Broker-Request-Id` correlating one request end to end through
-  admission, the access log, and the response (ADR-0011); `X-Broker-Wait-Ms`
-  header; `X-Broker-Status` as a header (`served`, or `deferred` on a 503)
-  plus an authoritative **trailer** on streamed responses that carries the
-  true final outcome (`served`/`preempted`), since mid-stream preemption
-  isn't known when headers are sent.
-- **A real `/healthz`** (ADR-0010) — checks Ollama reachability, the durable
-  Job store, and that the contention-detection loop is still polling, not
-  just that the process is up. Returns `503` with the failed dependency
-  named when any of the three is broken.
+- **Two listener ports.** Both speak Ollama's own API. The interactive port is high priority; the batch port is low priority. A Consumer picks a port by which one it connects to. Interactive requests jump ahead of batch requests in line.
+- **One request at a time.** The Broker sends at most one request to Ollama at once (concurrency 1).
+- **Yield.** When the Broker detects a game or a Plex transcode running (by matching its process name), it stops serving inference: new requests get `503 Retry-After`, any request already in flight is canceled, and the Broker forces Ollama to unload its models so the GPU is fully free for the game. When the game or transcode ends, the Broker serves inference again.
+- **Two request paths.**
+  - *Synchronous requests* stream live through the Broker's proxy. This covers all interactive work and short batch calls like embeddings. They are stateless: each one waits at most a fixed time budget for its class, then gets `503`, and the Consumer must retry.
+  - *Durable Jobs* are for long batch work (scoring, vision). A Consumer submits one with `POST /jobs`; the Broker saves it to a SQLite database, runs it through the same GPU rule as everything else, and it survives a Broker restart. A Job interrupted by a crash re-runs; one interrupted by gaming or a burst of interactive traffic goes back to the front of the line. See [`docs/DESIGN-jobs.md`](docs/DESIGN-jobs.md) for detail.
+- **Configurable concurrency and protected run time (ADR-0004).** `BROKER_MAX_INFLIGHT` (default 1) sets how many requests may reach Ollama at once. `BROKER_BATCH_QUANTUM` sets how long a running Job is protected from being preempted by an interactive request.
+- **Observable.** The Broker exposes Prometheus metrics at `/metrics`, writes JSON logs, and serves `/status`. Each response also carries: an `X-Broker-Request-Id` header, a unique id minted for every Synchronous request (ADR-0011) so one request's admission, log lines, and response can all be tied together — useful when a Consumer needs to match its own failure to a specific line in the Broker's logs; an `X-Broker-Wait-Ms` header (how long the request waited); an `X-Broker-Status` header (`served`, or `deferred` if it got a 503); and, on streamed responses, an authoritative `X-Broker-Status` trailer with the true final outcome (`served` or `preempted`) — a trailer is needed because a stream can still get preempted after its headers are already sent.
+- **A real `/healthz` (ADR-0010).** It checks three things, not just whether the process is running: that Ollama is reachable, that the durable Job store can be read, and that the Contention-detection loop is still actively polling (not stuck or dead). If any of the three fails, `/healthz` returns `503` naming which dependency is broken, instead of always reporting healthy.
 
 ## Build & run
 
@@ -79,14 +57,16 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | `BROKER_JOB_HARD_CAP` | `168h` | Max age of any terminal Job before pruning |
 
 Park-expiry alerting: `rate(broker_requests_total{outcome="expired"}[5m]) > 0` — a parked
-request aging out means yields are outlasting `BROKER_PARK_HOLD`; see ADR-0009.
+request aging out means Yields are outlasting `BROKER_PARK_HOLD`; see ADR-0009.
 
 Detection-blind alerting: `rate(broker_detect_errors_total[10m]) > 0` — a nonzero rate means
-contention detection is failing open (can't read `/proc`, or lost process visibility to a
-hardening change) and the yield feature may be silently doing nothing; see
-`internal/detect/detect.go`'s `Detect()`.
+Contention detection is failing open: the Broker can't read `/proc` (or lost visibility to
+running processes after a hardening change), so the Yield feature may be silently doing
+nothing. See `internal/detect/detect.go`'s `Detect()`.
 
 ### Control plane
+
+The control plane is the Broker's management interface: check its status, read its metrics, confirm it's actually healthy, or force it into a mode by hand.
 
 ```sh
 curl localhost:11437/status                              # yield + queue state
@@ -121,7 +101,7 @@ fetched (then pruned after a grace), with a hard age cap.
 
 ## Consumer integration
 
-Point each consumer's Ollama host at a broker port — that's the whole change for
+Point each Consumer's Ollama host at a Broker port — that's the whole change for
 synchronous work:
 
 | Consumer | Path |
@@ -139,5 +119,7 @@ sudo install -m644 deploy/broker.service /etc/systemd/system/broker.service
 sudo systemctl daemon-reload && sudo systemctl enable --now broker
 ```
 
-Run it on **other ports alongside** the legacy V3 daemon first; cut consumers
-over one at a time; retire V3 only after a soak. See `docs/DESIGN.md`.
+Install and run the Broker on ports that don't conflict with the legacy V3
+daemon, so both run side by side at first. Move each consumer over to the
+Broker one at a time. Retire V3 only after a soak — an extended trial run
+under real load that proves the Broker is stable. See `docs/DESIGN.md`.
