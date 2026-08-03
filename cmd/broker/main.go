@@ -23,6 +23,7 @@ import (
 	"github.com/preston-bernstein/ollama-resource-broker/internal/job"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/metrics"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
+	"github.com/preston-bernstein/ollama-resource-broker/internal/plex"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/schedule"
@@ -69,8 +70,12 @@ func main() {
 	sched.SetMaxInflight(cfg.MaxInflight)
 	sched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
 	detector := detect.New(detect.ProcLister)
+	if cfg.PlexToken != "" {
+		detector.SetPlexChecker(plex.New(cfg.PlexURL, cfg.PlexToken))
+		slog.Info("plex session corroboration enabled", "url", cfg.PlexURL)
+	}
 	oc := ollama.New(cfg.OllamaURL)
-	ctrl := yield.New(detector, oc, cfg.DetectInterval)
+	ctrl := yield.NewWithConfirm(detector, oc, cfg.DetectInterval, cfg.YieldConfirmPolls)
 	// yieldingFn adapts ctrl.Yielding()'s (bool, string) signature to the
 	// plain closure RunParkDrain expects (ADR-0009's Core redesign: the park
 	// drain loop is a plain ticker poll, not a yield.Controller broadcast).
@@ -179,9 +184,31 @@ func main() {
 		return nil
 	}
 
+	// batchServer fronts bulk/background traffic (LightRAG's embedding calls
+	// among it) — exactly the workload that repeatedly hit a "server
+	// disconnected without sending a response" failure during sustained
+	// multi-minute runs (2026-07-15), even after removing every timer on the
+	// broker's own inbound and outbound sides that could plausibly explain a
+	// stale-connection race (see IdleTimeout comment above, IdleConnTimeout
+	// and retryTransport in internal/proxy/proxy.go). The broker's own access
+	// log showed every request "served" cleanly on the outbound (Ollama) leg
+	// right up to the crash, and the retry layer never activated — narrowing
+	// the failure to the final hop, writing the response back over an
+	// already-established connection that something (the client's own pool,
+	// or the network path) killed without either endpoint logging why.
+	// SetKeepAlivesEnabled(false) removes connection reuse entirely on this
+	// lane: every request gets a fresh TCP connection, so there is no pooled
+	// connection left for either side to race on reusing. Scoped to the
+	// batch lane only (not interactive) since the extra per-request TCP
+	// handshake is negligible on a LAN but this trades a little latency for
+	// eliminating an entire failure class — not worth paying on the
+	// low-latency interactive lane where the race hasn't been observed.
+	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, upstream))
+	batchServer.SetKeepAlivesEnabled(false)
+
 	servers := []*http.Server{
 		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, ctrl, reg, upstream)),
-		newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, ctrl, reg, upstream)),
+		batchServer,
 		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, cfg.ControlToken)),
 	}
 
@@ -216,7 +243,7 @@ func main() {
 			}
 		}(srv)
 	}
-	slog.Info("broker up", "upstream", cfg.OllamaURL.String(), "detect_interval", cfg.DetectInterval.String())
+	slog.Info("broker up", "upstream", cfg.OllamaURL.String(), "detect_interval", cfg.DetectInterval.String(), "yield_confirm_polls", cfg.YieldConfirmPolls)
 
 	// Shut down on either an OS signal or a fatal listener error — both paths
 	// run the same graceful shutdown so nothing is hard-killed mid-flight.
@@ -280,6 +307,25 @@ func newServer(addr string, h http.Handler) *http.Server {
 		Addr:              addr,
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
+		// No IdleTimeout: an inbound client (LightRAG's httpx client, in
+		// particular) legitimately goes idle for minutes at a time between
+		// requests — e.g. its own CPU-bound entity/relationship merge work
+		// between embedding bursts — while still holding this connection open
+		// in its own pool as "good." A 60s IdleTimeout was tried on
+		// 2026-07-15 on the theory that proactively closing idle connections
+		// server-side would prevent a client from reusing one that had gone
+		// stale for some external reason; in practice this made the broker
+		// itself the thing closing connections out from under a client that
+		// still considered them valid — confirmed 2026-07-15 by a LightRAG
+		// bulk-embedding crash ("server disconnected without sending a
+		// response") landing after a 3+ minute gap with zero broker-side
+		// activity, comfortably past that 60s timeout, on every observed
+		// crash. A server unilaterally closing idle keep-alives shorter than
+		// a real client's idle pattern IS the stale-connection race, not a
+		// defense against it — removed rather than tuned, since there's no
+		// value here we can pick that's safely longer than every legitimate
+		// client gap. See Development/Research/
+		// lightrag-ollama-embedding-batch-instability.md on the vault.
 		// Route net/http's own error lines (e.g. superfluous WriteHeader) into
 		// the structured JSON stream instead of raw stderr.
 		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
