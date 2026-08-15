@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/preston-bernstein/ollama-resource-broker/internal/httpx"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/schedule"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
@@ -72,13 +73,13 @@ func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandle
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 		if err := health(ctx); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			httpx.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"status": "unhealthy",
 				"error":  err.Error(),
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	mux.Handle("/metrics", metricsHandler)
@@ -93,7 +94,7 @@ func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandle
 	mux.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, http.StatusOK, ctrl.Snapshot())
+			httpx.WriteJSON(w, http.StatusOK, ctrl.Snapshot())
 		case http.MethodPost:
 			if !authorized(r, controlToken) {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="control"`)
@@ -113,7 +114,7 @@ func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandle
 				return
 			}
 			ctrl.SetMode(m)
-			writeJSON(w, http.StatusOK, ctrl.Snapshot())
+			httpx.WriteJSON(w, http.StatusOK, ctrl.Snapshot())
 		default:
 			w.Header().Set("Allow", "GET, POST")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -142,7 +143,7 @@ func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandle
 				out["tdarr"] = ts
 			}
 		}
-		writeJSON(w, http.StatusOK, out)
+		httpx.WriteJSON(w, http.StatusOK, out)
 	})
 
 	return mux
@@ -174,10 +175,4 @@ func isLoopback(remoteAddr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
 }
