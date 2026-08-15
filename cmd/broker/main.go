@@ -122,7 +122,11 @@ func main() {
 		slog.Error("open job store", "err", err)
 		os.Exit(1)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			slog.Warn("job store close", "err", err)
+		}
+	}()
 	jobSvc := job.NewService(store, cfg.JobMaxAttempts)
 	jobSvc.SetRecorder(reg)
 	if err := jobSvc.Recover(ctx); err != nil {
