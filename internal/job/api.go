@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/httpx"
+	"github.com/preston-bernstein/resource-broker/internal/httpx"
 )
 
 // Routes returns the Job HTTP surface (ADR-0006). Mount it on the control plane

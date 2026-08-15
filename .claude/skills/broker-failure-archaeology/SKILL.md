@@ -1,6 +1,6 @@
 ---
 name: broker-failure-archaeology
-description: Chronicle of every major investigation, dead end, rejected fix, and revert in the ollama-resource-broker project. Load when you need the HISTORY behind a behavior — why detection is process-name based and not GPU-%, why the X-Broker-Status trailer exists in its current form, why batch wait is 300s live but 5s in config, why ADR-0002 says "superseded", what broke the test suite at HEAD, why Ollama once reported "total vram=0 B" on the RX 9070 XT, why image embeddings once came back near-identical. Also load before repeating an experiment ("has this been tried?"), before writing an ADR that touches yield/detection/Jobs, or when a symptom smells like a known past incident. NOT for live triage — use broker-debugging-playbook for that.
+description: Chronicle of every major investigation, dead end, rejected fix, and revert in the resource-broker project. Load when you need the HISTORY behind a behavior — why detection is process-name based and not GPU-%, why the X-Broker-Status trailer exists in its current form, why batch wait is 300s live but 5s in config, why ADR-0002 says "superseded", what broke the test suite at HEAD, why Ollama once reported "total vram=0 B" on the RX 9070 XT, why image embeddings once came back near-identical. Also load before repeating an experiment ("has this been tried?"), before writing an ADR that touches yield/detection/Jobs, or when a symptom smells like a known past incident. NOT for live triage — use broker-debugging-playbook for that.
 ---
 
 # Broker failure archaeology
@@ -29,7 +29,7 @@ Vocabulary follows `CONTEXT.md`: Broker (not gateway), Yield (not pause), Preemp
 
 - **SYMPTOM:** `go test ./...` and `go vet ./...` fail on branch `v2-go` HEAD: `internal/admin/admin_test.go:31` — `not enough arguments in call to Mux; have (Controller, fakeStats, http.HandlerFunc, nil, nil); want (Controller, StatsProvider, http.Handler, http.Handler, func() any, TdarrStatusFn)`. All other packages pass.
 - **ROOT CAUSE:** Commit `dd39d20` (2026-06-29, "Add Tdarr cooperative GPU management + schedule awareness") added a sixth `TdarrStatusFn` parameter to `admin.Mux` (`internal/admin/admin.go:39`) but its diff never touched `internal/admin/admin_test.go`. The full suite was evidently not run before commit. The same commit created `internal/tdarr/` and `internal/schedule/` with **zero tests** — still true at HEAD.
-- **EVIDENCE:** `git show --stat dd39d20` (no `admin_test.go` in the stat); `go test ./...` output; `/Users/prestonbernstein/dev/ollama-resource-broker/internal/admin/admin_test.go` line 31 (`newMux` passes 5 args).
+- **EVIDENCE:** `git show --stat dd39d20` (no `admin_test.go` in the stat); `go test ./...` output; `/Users/prestonbernstein/dev/resource-broker/internal/admin/admin_test.go` line 31 (`newMux` passes 5 args).
 - **STATUS:** **open** (re-verified 2026-07-02). Lesson on record: a cross-package signature change must run `go test ./...` before commit. Do not "fix" this casually — it is a tracked item in `broker-cutover-hardening-campaign`.
 
 ### O2. ADR-0005 control-plane auth accepted but never implemented
@@ -41,9 +41,9 @@ Vocabulary follows `CONTEXT.md`: Broker (not gateway), Yield (not pause), Preemp
 
 ### O3. Cutover never finished: legacy V3 daemon still running beside the Broker
 
-- **SYMPTOM:** As of the 2026-07-02 read-only live check (do not re-probe; take as dated fact), `resource-manager.service` (`/usr/local/bin/resource-manager.sh`, the Bash V3 daemon) is **still active** on the desktop alongside `ollama-broker.service`.
+- **SYMPTOM:** As of the 2026-07-02 read-only live check (do not re-probe; take as dated fact), `resource-manager.service` (`/usr/local/bin/resource-manager.sh`, the Bash V3 daemon) is **still active** on the desktop alongside `resource-broker.service`.
 - **ROOT CAUSE:** The migration plan was explicitly "run alongside → cut consumers over one at a time → retire V3 only after a soak" (`README.md` ~line 124). The retire step was never executed. This directly violates the design: `docs/DESIGN.md` line 47 — the Bash V3 "must **not** be run alongside the Broker (two uncoordinated GPU arbiters)"; the "Severe audit" commit `d2b831d` demoted `legacy/` to reference-only for the same reason.
-- **EVIDENCE:** `docs/DESIGN.md:47`; `README.md` Deploy section; live-deployment findings dated 2026-07-02 (shared authoring brief). Related drift found in the same check: live unit is `ollama-broker.service` while README says install as `broker.service`; repo `deploy/broker.service` lacks the Tdarr env vars the live unit sets.
+- **EVIDENCE:** `docs/DESIGN.md:47`; `README.md` Deploy section; live-deployment findings dated 2026-07-02 (shared authoring brief). Related drift found in the same check: live unit is `resource-broker.service` while README says install as `broker.service`; repo `deploy/broker.service` lacks the Tdarr env vars the live unit sets.
 - **STATUS:** **open**. This is the headline item of `broker-cutover-hardening-campaign`.
 
 ### O4. Config-vs-deploy drift class: batch wait budget fixed in the unit, not the default
@@ -165,9 +165,9 @@ This file is **append-only history**. Never rewrite or delete an existing entry;
 
 All claims verified 2026-07-02 on branch `v2-go` at `ad07905`. Re-verify with:
 
-- Test breakage still open? `cd /Users/prestonbernstein/dev/ollama-resource-broker && go test ./... 2>&1 | grep -E 'FAIL|no test files'` (expect `internal/admin` FAIL, `internal/tdarr`/`internal/schedule` no test files — until fixed).
-- ADR-0005 still unimplemented? `grep -rn "BROKER_CONTROL_TOKEN" --include='*.go' /Users/prestonbernstein/dev/ollama-resource-broker` (empty = still open) and check the Status line of `docs/adr/0005-control-plane-auth.md`.
-- Batch-wait drift still present? `grep -n 'BROKER_BATCH_WAIT' /Users/prestonbernstein/dev/ollama-resource-broker/internal/config/config.go /Users/prestonbernstein/dev/ollama-resource-broker/deploy/broker.service` (drift = default 5s vs unit 300s).
+- Test breakage still open? `cd /Users/prestonbernstein/dev/resource-broker && go test ./... 2>&1 | grep -E 'FAIL|no test files'` (expect `internal/admin` FAIL, `internal/tdarr`/`internal/schedule` no test files — until fixed).
+- ADR-0005 still unimplemented? `grep -rn "BROKER_CONTROL_TOKEN" --include='*.go' /Users/prestonbernstein/dev/resource-broker` (empty = still open) and check the Status line of `docs/adr/0005-control-plane-auth.md`.
+- Batch-wait drift still present? `grep -n 'BROKER_BATCH_WAIT' /Users/prestonbernstein/dev/resource-broker/internal/config/config.go /Users/prestonbernstein/dev/resource-broker/deploy/broker.service` (drift = default 5s vs unit 300s).
 - Legacy daemon still running live? Requires an authorized check of `resource-manager.service` on the desktop — see `broker-cutover-hardening-campaign`; do not assume this file's 2026-07-02 snapshot holds.
-- Commit citations: `git -C /Users/prestonbernstein/dev/ollama-resource-broker show --stat <sha>` for any SHA above (`dd39d20`, `ad07905`, `e1304ec`, `bdf74b2`, `8f2a981`, `2a07b70`, `529d075`, `3e35ae5`, `d2b831d`).
-- New history since this file was written? `git -C /Users/prestonbernstein/dev/ollama-resource-broker log --oneline ad07905..v2-go` — anything listed is not yet chronicled here.
+- Commit citations: `git -C /Users/prestonbernstein/dev/resource-broker show --stat <sha>` for any SHA above (`dd39d20`, `ad07905`, `e1304ec`, `bdf74b2`, `8f2a981`, `2a07b70`, `529d075`, `3e35ae5`, `d2b831d`).
+- New history since this file was written? `git -C /Users/prestonbernstein/dev/resource-broker log --oneline ad07905..v2-go` — anything listed is not yet chronicled here.

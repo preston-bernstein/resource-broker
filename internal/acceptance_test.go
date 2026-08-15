@@ -35,16 +35,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/admin"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/backend"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/detect"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/job"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/metrics"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/openaicompat"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
+	"github.com/preston-bernstein/resource-broker/internal/admin"
+	"github.com/preston-bernstein/resource-broker/internal/backend"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/detect"
+	"github.com/preston-bernstein/resource-broker/internal/job"
+	"github.com/preston-bernstein/resource-broker/internal/metrics"
+	"github.com/preston-bernstein/resource-broker/internal/openaicompat"
+	"github.com/preston-bernstein/resource-broker/internal/proxy"
+	"github.com/preston-bernstein/resource-broker/internal/queue"
+	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
 // --- rig: a full in-process Broker, mirroring cmd/broker/main.go's wiring ---

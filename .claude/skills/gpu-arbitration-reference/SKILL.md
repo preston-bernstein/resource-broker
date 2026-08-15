@@ -1,11 +1,11 @@
 ---
 name: gpu-arbitration-reference
-description: Domain-theory reference for the ollama-resource-broker — single-GPU arbitration theory, VRAM vs CPU preemption, Ollama keep_alive/unload and NDJSON stream mechanics, utilization- vs identity-based contention detection (the V1/V2 circularity failure), priority scheduling and the batch min-run quantum, durable-queue semantics (idempotency, write-before-ack, SQLite WAL), 503/Retry-After backpressure and HTTP trailers, AMD RDNA4/gfx1201/ROCm quirks, and SigLIP dual-tower embedding pitfalls. Load when you need to understand WHY the Broker works the way it does, when a term like yield/preemption/quantum/hysteresis/trailer/WAL/dual-tower is unclear, or when reasoning about GPU sharing, Ollama unload behavior, streaming cutoffs, or Infinity embedding correctness.
+description: Domain-theory reference for the resource-broker — single-GPU arbitration theory, VRAM vs CPU preemption, Ollama keep_alive/unload and NDJSON stream mechanics, utilization- vs identity-based contention detection (the V1/V2 circularity failure), priority scheduling and the batch min-run quantum, durable-queue semantics (idempotency, write-before-ack, SQLite WAL), 503/Retry-After backpressure and HTTP trailers, AMD RDNA4/gfx1201/ROCm quirks, and SigLIP dual-tower embedding pitfalls. Load when you need to understand WHY the Broker works the way it does, when a term like yield/preemption/quantum/hysteresis/trailer/WAL/dual-tower is unclear, or when reasoning about GPU sharing, Ollama unload behavior, streaming cutoffs, or Infinity embedding correctness.
 ---
 
 # GPU arbitration reference (domain theory as it applies to this repo)
 
-This is the background-knowledge pack for the ollama-resource-broker. It teaches the theory a mid-level engineer typically lacks, always tied to how it shows up in THIS codebase. It is the only skill in this library that carries general background; every other skill assumes it.
+This is the background-knowledge pack for the resource-broker. It teaches the theory a mid-level engineer typically lacks, always tied to how it shows up in THIS codebase. It is the only skill in this library that carries general background; every other skill assumes it.
 
 Claims verifiable in the repo cite the file. Claims the repo cannot verify are labeled **background knowledge (verify independently if load-bearing)**.
 
@@ -124,7 +124,7 @@ Background knowledge (verify independently if load-bearing): SigLIP, like CLIP, 
 
 ## Provenance and maintenance
 
-Repo-anchored claims and their one-line re-verification (run from the repo root, `/Users/prestonbernstein/dev/ollama-resource-broker`):
+Repo-anchored claims and their one-line re-verification (run from the repo root, `/Users/prestonbernstein/dev/resource-broker`):
 
 - Unload = list `/api/ps` then per-model `/api/generate` with `keep_alive: 0`: `grep -n "keep_alive" internal/ollama/client.go`
 - `{"done":true}` terminal line handling: `grep -n "done" internal/ollama/client.go`

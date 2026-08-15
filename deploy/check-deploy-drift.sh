@@ -4,7 +4,7 @@
 # metrics so drift shows up in Grafana instead of silently sitting for weeks.
 #
 # Why this exists (2026-08-15): the desktop checkout at
-# /home/ollama-broker/ollama-resource-broker sat 30+ commits behind origin/main
+# /home/ollama-broker/resource-broker sat 30+ commits behind origin/main
 # for weeks with zero observability, because `sudo -u ollama-broker git fetch`
 # had been silently failing since the account was created — the ollama-broker
 # system user's real home (/var/lib/ollama-broker, per /etc/passwd) doesn't
@@ -43,21 +43,21 @@ fi
 now=$(date +%s)
 
 {
-	echo "# HELP ollama_broker_deploy_git_fetch_success Whether the last git fetch against origin succeeded (1) or failed (0)."
-	echo "# TYPE ollama_broker_deploy_git_fetch_success gauge"
-	echo "ollama_broker_deploy_git_fetch_success $fetch_ok"
+	echo "# HELP resource_broker_deploy_git_fetch_success Whether the last git fetch against origin succeeded (1) or failed (0)."
+	echo "# TYPE resource_broker_deploy_git_fetch_success gauge"
+	echo "resource_broker_deploy_git_fetch_success $fetch_ok"
 
-	echo "# HELP ollama_broker_deploy_checkout_behind_commits How many commits the deploy checkout is behind origin/main."
-	echo "# TYPE ollama_broker_deploy_checkout_behind_commits gauge"
-	echo "ollama_broker_deploy_checkout_behind_commits $behind"
+	echo "# HELP resource_broker_deploy_checkout_behind_commits How many commits the deploy checkout is behind origin/main."
+	echo "# TYPE resource_broker_deploy_checkout_behind_commits gauge"
+	echo "resource_broker_deploy_checkout_behind_commits $behind"
 
-	echo "# HELP ollama_broker_deploy_checkout_dirty Whether the deploy checkout has uncommitted changes to tracked files (1) or is clean (0)."
-	echo "# TYPE ollama_broker_deploy_checkout_dirty gauge"
-	echo "ollama_broker_deploy_checkout_dirty $dirty"
+	echo "# HELP resource_broker_deploy_checkout_dirty Whether the deploy checkout has uncommitted changes to tracked files (1) or is clean (0)."
+	echo "# TYPE resource_broker_deploy_checkout_dirty gauge"
+	echo "resource_broker_deploy_checkout_dirty $dirty"
 
-	echo "# HELP ollama_broker_deploy_drift_check_timestamp_seconds Unix timestamp of the last drift check."
-	echo "# TYPE ollama_broker_deploy_drift_check_timestamp_seconds gauge"
-	echo "ollama_broker_deploy_drift_check_timestamp_seconds $now"
+	echo "# HELP resource_broker_deploy_drift_check_timestamp_seconds Unix timestamp of the last drift check."
+	echo "# TYPE resource_broker_deploy_drift_check_timestamp_seconds gauge"
+	echo "resource_broker_deploy_drift_check_timestamp_seconds $now"
 } >"$TMP"
 
 mv "$TMP" "$OUT"

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
+	"github.com/preston-bernstein/resource-broker/internal/queue"
+	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
 type fakeCtrl struct {
