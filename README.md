@@ -136,3 +136,24 @@ Install and run the Broker on ports that don't conflict with the legacy V3
 daemon, so both run side by side at first. Move each consumer over to the
 Broker one at a time. Retire V3 only after a soak — an extended trial run
 under real load that proves the Broker is stable. See `docs/DESIGN.md`.
+
+### Deploy-checkout drift watch (optional, host-level Prometheus setup)
+
+If the deploy host has its own git checkout of this repo (for building from
+source rather than a binary copy), a broken remote or stale credentials on
+that checkout can go unnoticed for a long time — it did, once, for 30+
+commits (see `deploy/check-deploy-drift.sh`'s own comment for the root
+cause). `deploy/check-deploy-drift.sh` writes Prometheus textfile metrics
+(`ollama_broker_deploy_git_fetch_success`, `ollama_broker_deploy_checkout_behind_commits`,
+`ollama_broker_deploy_checkout_dirty`) so this shows up on a dashboard
+instead of silently sitting there. Wire it up with:
+
+```sh
+sudo install -m644 deploy/ollama-broker-deploy-drift-watch.service /etc/systemd/system/
+sudo install -m644 deploy/ollama-broker-deploy-drift-watch.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ollama-broker-deploy-drift-watch.timer
+```
+
+Edit the two paths in `ollama-broker-deploy-drift-watch.service`'s `ExecStart`
+if this host's checkout or textfile-collector directory differs from the
+defaults.
