@@ -27,6 +27,15 @@ func TestDetect(t *testing.T) {
 		{"wine", []string{"C:/wine/Game.exe"}, "gaming-wine", true},
 		{"protonmail-excluded", []string{"wine protonmail-bridge.exe"}, "", false},
 		{"protonvpn-excluded", []string{"wine protonvpn.exe"}, "", false},
+		// Wine's own bootstrapped runtime executables (winedevice.exe,
+		// services.exe, etc.) always run from the prefix's windows/system32
+		// directory and start with *any* Wine prefix — including non-game
+		// tools like the Norgate Data Updater — so they must not be
+		// misdetected as gaming. Both commands include "wine" in the path
+		// (a real Wine prefix, e.g. ~/.wine/drive_c/...) so they actually
+		// exercise wineRe matching before the system32 exclusion applies.
+		{"wine-system32-excluded", []string{`C:\wine\drive_c\windows\system32\winedevice.exe`}, "", false},
+		{"wine-system32-excluded-forward-slash", []string{"/home/user/.wine/drive_c/windows/system32/services.exe"}, "", false},
 		{"plex-beats-steam", []string{"reaper SteamLaunch AppId=1", "Plex Transcoder x"}, "plex", true},
 	}
 	for _, c := range cases {
