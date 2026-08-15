@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -16,8 +17,24 @@ type Config struct {
 	InteractiveAddr string
 	// BatchAddr is the listen address for the low-priority class.
 	BatchAddr string
-	// OllamaURL is the upstream real Ollama base URL.
+	// UpstreamBackend selects which upstream API family the Broker fronts:
+	// "ollama" (default) or "openai" (an OpenAI-compatible server such as
+	// vLLM). Determines whether OllamaURL or UpstreamURL is required/
+	// validated at Load() time.
+	UpstreamBackend string
+	// OllamaURL is the upstream real Ollama base URL. Required and validated
+	// (scheme+host) only when UpstreamBackend is "ollama"; nil when
+	// UpstreamBackend is "openai".
 	OllamaURL *url.URL
+	// UpstreamURL is the OpenAI-compatible upstream base URL (e.g. a vLLM
+	// server). Required and validated (scheme+host, same pattern as
+	// OllamaURL) only when UpstreamBackend is "openai"; nil when
+	// UpstreamBackend is "ollama".
+	UpstreamURL *url.URL
+	// UpstreamAPIKey optionally authenticates requests to the OpenAI-
+	// compatible upstream (sent as "Authorization: Bearer <value>"; empty
+	// means no Authorization header is sent). Never log this value raw.
+	UpstreamAPIKey string
 	// InfinityURL is the upstream Infinity image-embedding base URL. Empty
 	// disables the embed lane entirely.
 	InfinityURL *url.URL
@@ -104,13 +121,55 @@ type Config struct {
 
 // Load reads configuration from the environment, applying defaults.
 func Load() (*Config, error) {
-	rawURL := getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid OLLAMA_URL %q: %w", rawURL, err)
+	// UPSTREAM_BACKEND selects which upstream API family is active. It gates
+	// which of OLLAMA_URL / UPSTREAM_URL is required below (FR-3/FR-4/FR-5,
+	// FR-23, AC-2/AC-3/AC-16).
+	backend := getenv("UPSTREAM_BACKEND", "ollama")
+	if backend != "ollama" && backend != "openai" {
+		return nil, fmt.Errorf("UPSTREAM_BACKEND %q must be one of: ollama, openai", backend)
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("OLLAMA_URL %q must include scheme and host", rawURL)
+
+	// OLLAMA_URL is required/validated only when the active backend is
+	// "ollama" (the default) — this is a behavior CHANGE from the previous
+	// unconditional requirement (FR-23, AC-16). The empty-string-resolves-
+	// to-default behavior (via getenv's def parameter) is unchanged: an
+	// unset/empty OLLAMA_URL still resolves to "http://127.0.0.1:11434" and
+	// loads successfully; only a truly malformed value fails.
+	var ollamaURL *url.URL
+	if backend == "ollama" {
+		rawURL := getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid OLLAMA_URL %q: %w", rawURL, err)
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("OLLAMA_URL %q must include scheme and host", rawURL)
+		}
+		ollamaURL = u
+	}
+
+	// UPSTREAM_URL (the OpenAI-compatible upstream base URL) is required/
+	// validated only when the active backend is "openai", using the same
+	// scheme+host check as OLLAMA_URL above (FR-5, AC-3).
+	var upstreamURL *url.URL
+	if backend == "openai" {
+		rawURL := getenv("UPSTREAM_URL", "")
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid UPSTREAM_URL %q: %w", rawURL, err)
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("UPSTREAM_URL %q must include scheme and host", rawURL)
+		}
+		upstreamURL = u
+	}
+
+	// UPSTREAM_API_KEY is optional. When set, it must not contain a CR or LF
+	// control character, which would allow HTTP header injection into the
+	// outbound "Authorization: Bearer <value>" header (FR-24, AC-17).
+	upstreamAPIKey := getenv("UPSTREAM_API_KEY", "")
+	if strings.ContainsAny(upstreamAPIKey, "\r\n") {
+		return nil, fmt.Errorf("UPSTREAM_API_KEY must not contain control characters")
 	}
 
 	// INFINITY_URL is optional; when set it must be a valid absolute URL. Empty
@@ -197,7 +256,10 @@ func Load() (*Config, error) {
 		BatchAddr:         getenv("BROKER_BATCH_ADDR", ":11436"),
 		EmbedAddr:         getenv("BROKER_EMBED_ADDR", ":11438"),
 		EmbedTimeout:      et,
-		OllamaURL:         u,
+		UpstreamBackend:   backend,
+		OllamaURL:         ollamaURL,
+		UpstreamURL:       upstreamURL,
+		UpstreamAPIKey:    upstreamAPIKey,
 		InfinityURL:       infinityURL,
 		InteractiveWait:   iw,
 		BatchWait:         bw,

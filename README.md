@@ -4,6 +4,8 @@ The Ollama Resource Broker (called "the Broker" throughout this repo) decides wh
 
 This is the **v2 Go HTTP-fronting broker**: a single program, written in Go, that sits between every inference Consumer (a service that sends Ollama requests, such as internal-monitor-app or LightRAG) and Ollama itself. Consumers point at the Broker instead of Ollama directly, so no Consumer needs custom code to cooperate with gaming or Plex. The original Bash version of this idea lives in [`legacy/`](legacy/) for reference only — do not run it alongside the Broker.
 
+The Broker's actual upstream is swappable: it defaults to Ollama's own API (zero change from today), but `UPSTREAM_BACKEND=openai` re-points it at any OpenAI-compatible server (e.g. vLLM) instead, translating requests/responses so every Consumer keeps speaking Ollama's API unchanged. See the `UPSTREAM_BACKEND`/`UPSTREAM_URL`/`UPSTREAM_API_KEY` rows below.
+
 Read next:
 - [`docs/DESIGN.md`](docs/DESIGN.md) — the design
 - [`docs/adr/`](docs/adr/) — the ADRs, one per major decision
@@ -35,7 +37,10 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | Upstream Ollama |
+| `UPSTREAM_BACKEND` | `ollama` | Which upstream API family the Broker speaks: `ollama` (default, current behavior, zero change) or `openai` (an OpenAI-compatible server such as vLLM) |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Upstream Ollama. Required/validated only when `UPSTREAM_BACKEND=ollama` |
+| `UPSTREAM_URL` | _(unset)_ | Upstream OpenAI-compatible server base URL (e.g. a vLLM instance). Required when `UPSTREAM_BACKEND=openai` |
+| `UPSTREAM_API_KEY` | _(unset)_ | Bearer token sent to the OpenAI-compatible upstream, if it requires auth. Ignored when `UPSTREAM_BACKEND=ollama`. Never logged |
 | `INFINITY_URL` | _(unset)_ | Upstream Infinity image-embedding server. Unset disables the embed lane (ADR-0008) |
 | `BROKER_INTERACTIVE_ADDR` | `:11435` | Interactive (high-priority) port |
 | `BROKER_BATCH_ADDR` | `:11436` | Batch (low-priority) port |
