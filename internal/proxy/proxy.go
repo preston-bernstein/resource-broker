@@ -35,7 +35,12 @@ import (
 // connection-level failure once, transparently, before any response bytes
 // reach the client, is safe and removes an entire class of upstream-fragile
 // cascading failure without LightRAG (or any other consumer) ever knowing.
-var transport http.RoundTripper = &retryTransport{
+// Transport is exported so other packages that speak HTTP to a shared,
+// potentially-busy upstream (e.g. internal/openaicompat talking to a
+// self-hosted OpenAI-compatible server such as vLLM) can reuse the same
+// connection-level retry behavior instead of standing up a bare
+// http.Client{}. See the comment above for the incident that motivated it.
+var Transport http.RoundTripper = &retryTransport{
 	base: &http.Transport{
 		IdleConnTimeout: 60 * time.Second,
 	},
@@ -132,7 +137,7 @@ const embedImagePath = "/embeddings_image"
 func New(target *url.URL) http.Handler {
 	rp := &httputil.ReverseProxy{
 		FlushInterval: -1,
-		Transport:     transport,
+		Transport:     Transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			// Ollama does not require a specific Host header; match the target.
@@ -156,7 +161,7 @@ func New(target *url.URL) http.Handler {
 func NewEmbed(target *url.URL) http.Handler {
 	rp := &httputil.ReverseProxy{
 		FlushInterval: -1,
-		Transport:     transport,
+		Transport:     Transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Host = target.Host
@@ -169,27 +174,43 @@ func NewEmbed(target *url.URL) http.Handler {
 	return rp
 }
 
-// errorHandler fires only before the response header is written. If the
-// upstream was cancelled (yield/disconnect) or hit its bound (a Gate
-// upstreamTimeout, ADR-0013 — currently only the embed lane sets one) before
-// any bytes, send 503 with Retry-After so the client gets the same
-// deferral shape Gate's own deferRequest uses elsewhere ("GPU busy: wait
-// budget exceeded", "yielding GPU") instead of an empty 200 or an opaque
-// 502. (Mid-stream cancellation never reaches here.) Server-level
-// "superfluous WriteHeader" noise is routed to slog via Server.ErrorLog.
-func errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+// WriteUpstreamError writes the broker's standard deferral response (503,
+// X-Broker-Status: deferred, Retry-After) when err is a cancellation
+// (yield/disconnect) or a Gate upstreamTimeout (context.DeadlineExceeded,
+// ADR-0013 — currently only the embed lane sets one), so the client gets the
+// same deferral shape Gate's own deferRequest uses elsewhere ("GPU busy:
+// wait budget exceeded", "yielding GPU") instead of an empty 200 or an
+// opaque 502. It returns true if it wrote a response, false if err doesn't
+// match either case — every caller MUST check the returned bool and write
+// its own fallback response (e.g. a 502) when it is false, since net/http
+// silently defaults to an empty 200 OK if a handler returns without writing
+// anything.
+func WriteUpstreamError(w http.ResponseWriter, r *http.Request, err error) bool {
 	if errors.Is(err, context.Canceled) {
 		slog.Debug("upstream cancelled", "path", r.URL.Path)
 		w.Header().Set("X-Broker-Status", "deferred")
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		return
+		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		slog.Warn("upstream request timed out", "path", r.URL.Path)
 		w.Header().Set("X-Broker-Status", "deferred")
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusServiceUnavailable)
+		return true
+	}
+	return false
+}
+
+// errorHandler fires only before the response header is written. It's a
+// thin wrapper around WriteUpstreamError: on a cancellation or Gate
+// upstreamTimeout it defers to the shared 503 shape; otherwise it falls back
+// to the pre-existing 502 behavior. (Mid-stream cancellation never reaches
+// here.) Server-level "superfluous WriteHeader" noise is routed to slog via
+// Server.ErrorLog.
+func errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	if WriteUpstreamError(w, r, err) {
 		return
 	}
 	slog.Warn("upstream error", "path", r.URL.Path, "err", err)
