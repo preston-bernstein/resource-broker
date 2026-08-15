@@ -1,0 +1,10 @@
+[Unit]
+Description=ollama-resource-broker deploy-checkout drift watchdog (git fetch health + commits-behind-origin/main)
+
+[Service]
+Type=oneshot
+User=ollama-broker
+Group=node-exporter-textfile
+ExecStart=/home/ollama-broker/ollama-resource-broker/deploy/check-deploy-drift.sh /home/ollama-broker/ollama-resource-broker /opt/docker/observability/node-exporter-textfiles/ollama_broker_deploy_drift.prom
+StandardOutput=journal
+StandardError=journal
