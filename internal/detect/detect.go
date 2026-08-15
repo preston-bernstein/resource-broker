@@ -42,6 +42,15 @@ var lutrisRe = regexp.MustCompile(`lutris.*runner`)
 var heroicRe = regexp.MustCompile(`heroic.*game`)
 var wineRe = regexp.MustCompile(`wine.*\.exe`)
 
+// wineSystemDirRe matches Wine's own bootstrapped runtime executables
+// (winedevice.exe, services.exe, plugplay.exe, etc.), which always run from
+// the prefix's windows\system32 directory regardless of which application
+// created the prefix. These start automatically with *any* Wine prefix —
+// including non-game tools like the Norgate Data Updater — so wineRe alone
+// false-positives on them; a game's own .exe always runs from the app's own
+// install path, never from system32.
+var wineSystemDirRe = regexp.MustCompile(`(?i)windows[\\/]system32`)
+
 const plexReason = "plex"
 
 // plexProcess matches Plex's transcoder binary. On its own this is not a
@@ -58,7 +67,8 @@ var gamingRules = []rule{
 	{"gaming-wine", func(c string) bool {
 		return wineRe.MatchString(c) &&
 			!strings.Contains(c, "protonmail") &&
-			!strings.Contains(c, "protonvpn")
+			!strings.Contains(c, "protonvpn") &&
+			!wineSystemDirRe.MatchString(c)
 	}},
 }
 
