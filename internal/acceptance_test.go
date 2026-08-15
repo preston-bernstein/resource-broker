@@ -69,6 +69,11 @@ type rig struct {
 	// cmd/broker/main.go's own "if cfg.InfinityURL != nil" gate. nil when the
 	// lane is disabled, exactly like main.go never starting that server.
 	embed *httptest.Server
+	// router is non-nil only when cfg.Routes is non-empty, mirroring
+	// cmd/broker/main.go's own router-construction gate (docs/adr/
+	// 0015-per-model-backend-routing.md) — nil is the pre-feature, zero-route
+	// state where be alone fronts both Gates exactly as before this feature.
+	router *backend.Router
 }
 
 // newRig builds a rig from cfg, exactly the way cmd/broker/main.go's main()
@@ -96,7 +101,44 @@ func newRig(t *testing.T, cfg *config.Config) *rig {
 	detector := detect.New(func() ([]detect.Process, error) { return nil, nil })
 	reg := metrics.New()
 	detector.SetErrorRecorder(reg)
-	ctrl := yield.NewWithConfirm(detector, be.Unloader(), cfg.DetectInterval, cfg.YieldConfirmPolls)
+
+	// Mirrors cmd/broker/main.go's own router-construction gate exactly
+	// (docs/adr/0015-per-model-backend-routing.md): when cfg.Routes is empty
+	// (every AC-1..AC-24 test predating per-model routing), router stays nil
+	// and activeBackend is be — byte-for-byte the pre-feature rig. Only tests
+	// that explicitly set cfg.Routes exercise the routed path, keeping this
+	// rig representative of real production wiring either way — the whole
+	// reason this file exists (see the package doc comment above).
+	var router *backend.Router
+	var activeBackend backend.Backend = be
+	var ctrl *yield.Controller
+	if len(cfg.Routes) == 0 {
+		ctrl = yield.NewWithConfirm(detector, be.Unloader(), cfg.DetectInterval, cfg.YieldConfirmPolls)
+	} else {
+		routeBackends := make([]backend.Backend, len(cfg.Routes))
+		unloaders := make([]yield.Unloader, len(cfg.Routes)+1)
+		labels := make([]string, len(cfg.Routes)+1)
+		unloaders[0] = be.Unloader()
+		labels[0] = "default"
+		for i, rb := range cfg.Routes {
+			rbBackend, err := backend.NewInstance(rb.Backend, rb.URL, rb.APIKey, rb.UnitName)
+			if err != nil {
+				t.Fatalf("backend.NewInstance route %d: %v", i, err)
+			}
+			routeBackends[i] = rbBackend
+			unloaders[i+1] = rbBackend.Unloader()
+			labels[i+1] = rb.URL.String()
+		}
+		r := backend.NewRouter(be)
+		for i, rb := range cfg.Routes {
+			for _, model := range rb.Models {
+				r.AddRoute(model, rb.Lane, routeBackends[i])
+			}
+		}
+		router = r
+		activeBackend = router
+		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sched.SetShutdownContext(ctx)
@@ -115,7 +157,7 @@ func newRig(t *testing.T, cfg *config.Config) *rig {
 	if err := jobSvc.Recover(ctx); err != nil {
 		t.Fatalf("job recover: %v", err)
 	}
-	worker := job.NewWorker(jobSvc, sched, ctrl, be, cfg.BatchQuantum, 0)
+	worker := job.NewWorker(jobSvc, sched, ctrl, activeBackend, cfg.BatchQuantum, 0)
 	go worker.Run(ctx)
 
 	jobCounts := func() job.Counts {
@@ -149,15 +191,28 @@ func newRig(t *testing.T, cfg *config.Config) *rig {
 	// checks are deliberately omitted here — see this function's doc comment on
 	// why this rig doesn't need them wired for AC-1..AC-9's scope.
 	healthCheck := func(ctx context.Context) error {
-		if err := be.Reachable(ctx); err != nil {
+		if err := activeBackend.Reachable(ctx); err != nil {
 			return fmt.Errorf("upstream unreachable: %w", err)
 		}
 		return nil
 	}
 
-	interactive := httptest.NewServer(sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, be.Proxy()))
-	batchSrv := httptest.NewServer(sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, be.Proxy()))
-	control := httptest.NewServer(admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), func() any { return jobCounts() }, nil, cfg.ControlToken))
+	var interactiveProxy, batchProxy http.Handler
+	if router != nil {
+		interactiveProxy = router.ProxyForLane(queue.Interactive.String())
+		batchProxy = router.ProxyForLane(queue.Batch.String())
+	} else {
+		interactiveProxy = be.Proxy()
+		batchProxy = be.Proxy()
+	}
+	var routingStatus func() any
+	if router != nil {
+		routingStatus = router.RoutingSummary
+	}
+
+	interactive := httptest.NewServer(sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, interactiveProxy))
+	batchSrv := httptest.NewServer(sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, batchProxy))
+	control := httptest.NewServer(admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), func() any { return jobCounts() }, nil, routingStatus, cfg.ControlToken))
 
 	// Optional image-embedding lane, wired only when cfg.InfinityURL is set
 	// (AC-12): mirrors cmd/broker/main.go's own "if cfg.InfinityURL != nil"
@@ -190,6 +245,7 @@ func newRig(t *testing.T, cfg *config.Config) *rig {
 	return &rig{
 		cfg: cfg, be: be, sched: sched, ctrl: ctrl, jobSvc: jobSvc,
 		interactive: interactive, batch: batchSrv, control: control, embed: embedSrv,
+		router: router,
 	}
 }
 
@@ -1003,6 +1059,188 @@ func TestAcceptance_AC11_MetricsEndToEnd(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics missing pre-existing metric %q (renamed or removed?):\n%s", want, body)
 		}
+	}
+}
+
+// TestAcceptance_RoutingContentionBlocksAllConfiguredInstances proves
+// docs/per-model-backend-routing/requirements.md's own AC-12 (distinct from
+// this file's pre-existing AC-12 above, which predates per-model routing):
+// during active gaming/Plex contention, no request — regardless of which
+// model or backend instance it targets — is admitted to any configured
+// instance. Two real upstreams are wired (default ollama-shaped, one routed
+// openai-shaped instance for "routed-model"); both track whether they were
+// ever actually called. Forcing yield via the real POST /control path (the
+// same mechanism TestAcceptance_AC7 uses) and then sending one request for
+// the routed model and one for an unrouted model must defer both with 503,
+// and neither upstream may ever see a request — proving the yield gate
+// blocks admission before Router ever dispatches, for every instance alike.
+func TestAcceptance_RoutingContentionBlocksAllConfiguredInstances(t *testing.T) {
+	var defaultCalls, routedCalls atomic.Int32
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"model": "m", "response": "hi", "done": true})
+	}))
+	defer defaultUpstream.Close()
+	routedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routedCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"id": "x", "object": "chat.completion", "choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "hi"}}}})
+	}))
+	defer routedUpstream.Close()
+
+	cfg := ollamaCfg(t, defaultUpstream.URL)
+	routedURL, err := url.Parse(routedUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse routed upstream url: %v", err)
+	}
+	cfg.Routes = []config.RouteBackend{{Models: []string{"routed-model"}, Backend: "openai", URL: routedURL}}
+
+	r := newRig(t, cfg)
+	if r.router == nil {
+		t.Fatal("newRig did not construct a Router despite cfg.Routes being set")
+	}
+
+	ctrlResp, err := http.Post(r.control.URL+"/control", "application/json", strings.NewReader(`{"mode":"yield"}`))
+	if err != nil {
+		t.Fatalf("POST /control: %v", err)
+	}
+	ctrlResp.Body.Close()
+	if ctrlResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /control status = %d, want 200", ctrlResp.StatusCode)
+	}
+
+	routedResp, err := http.Post(r.interactive.URL+"/api/chat", "application/json", strings.NewReader(`{"model":"routed-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post routed model: %v", err)
+	}
+	routedResp.Body.Close()
+	if routedResp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("routed-model request during yield: status = %d, want 503", routedResp.StatusCode)
+	}
+
+	defaultResp, err := http.Post(r.interactive.URL+"/api/generate", "application/json", strings.NewReader(`{"model":"unrouted-model","prompt":"hi"}`))
+	if err != nil {
+		t.Fatalf("post unrouted model: %v", err)
+	}
+	defaultResp.Body.Close()
+	if defaultResp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("unrouted-model request during yield: status = %d, want 503", defaultResp.StatusCode)
+	}
+
+	// routedCalls must be exactly 0: the route has no _UNIT_NAME configured,
+	// so its Unloader() is nil (no unload call is ever made to it), and the
+	// routed inference request itself was correctly deferred with 503 above
+	// — nothing legitimate should ever reach this upstream during yield.
+	if n := routedCalls.Load(); n != 0 {
+		t.Errorf("routed upstream received %d calls during yield, want 0 — the routed instance was not blocked by contention", n)
+	}
+	// defaultCalls is NOT asserted to be 0: ollama.Client.Unload (ADR-0003's
+	// hard-yield VRAM-unload mechanism) legitimately calls this same upstream
+	// with keep_alive=0 as part of yield-start itself — that is correct,
+	// expected traffic, not a leaked inference admission. The two 503
+	// responses above are what actually prove admission was blocked for both
+	// instances; a raw call count on the default upstream can't distinguish
+	// "an inference request got through" from "the unload call ran," since
+	// both hit the same mock handler.
+}
+
+// TestAcceptance_OneRouteBothLanesReachCorrectBackend proves docs/
+// per-model-backend-routing/steps.md's own Task 9 acceptance check outside
+// of a contention scenario: with exactly one route configured, a request for
+// the routed model reaches the routed upstream and a request for an
+// unrouted model reaches the default upstream, on both the Interactive and
+// the Batch lane — through the real rig (real queue, real Router, real
+// backend.NewInstance-constructed openai backend), not a bare Router
+// constructed directly by a unit test (see internal/backend/router_test.go
+// for that coverage).
+func TestAcceptance_OneRouteBothLanesReachCorrectBackend(t *testing.T) {
+	var defaultCalls, routedCalls atomic.Int32
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"model": "unrouted-model", "response": "from-default", "done": true})
+	}))
+	defer defaultUpstream.Close()
+	routedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routedCalls.Add(1)
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("mock routed upstream ResponseWriter is not a Flusher")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"from-routed\"}}]}\n\n")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":1}}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+		fl.Flush()
+	}))
+	defer routedUpstream.Close()
+
+	cfg := ollamaCfg(t, defaultUpstream.URL)
+	routedURL, err := url.Parse(routedUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse routed upstream url: %v", err)
+	}
+	cfg.Routes = []config.RouteBackend{{Models: []string{"routed-model"}, Backend: "openai", URL: routedURL}}
+
+	r := newRig(t, cfg)
+	if r.router == nil {
+		t.Fatal("newRig did not construct a Router despite cfg.Routes being set")
+	}
+
+	for _, lane := range []struct {
+		name string
+		addr string
+	}{
+		{"interactive", r.interactive.URL},
+		{"batch", r.batch.URL},
+	} {
+		t.Run(lane.name+"/routed-model", func(t *testing.T) {
+			defaultCalls.Store(0)
+			routedCalls.Store(0)
+			resp, err := http.Post(lane.addr+"/api/chat", "application/json", strings.NewReader(`{"model":"routed-model","messages":[]}`))
+			if err != nil {
+				t.Fatalf("post routed model on %s: %v", lane.name, err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("routed-model on %s: status = %d, want 200, body=%s", lane.name, resp.StatusCode, body)
+			}
+			if !strings.Contains(string(body), "from-routed") {
+				t.Errorf("routed-model on %s: body = %s, want it to contain the routed upstream's response", lane.name, body)
+			}
+			if n := routedCalls.Load(); n != 1 {
+				t.Errorf("routed-model on %s: routed upstream got %d calls, want 1", lane.name, n)
+			}
+			if n := defaultCalls.Load(); n != 0 {
+				t.Errorf("routed-model on %s: default upstream got %d calls, want 0 — request leaked to the wrong backend", lane.name, n)
+			}
+		})
+
+		t.Run(lane.name+"/unrouted-model", func(t *testing.T) {
+			defaultCalls.Store(0)
+			routedCalls.Store(0)
+			resp, err := http.Post(lane.addr+"/api/generate", "application/json", strings.NewReader(`{"model":"unrouted-model","prompt":"hi"}`))
+			if err != nil {
+				t.Fatalf("post unrouted model on %s: %v", lane.name, err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("unrouted-model on %s: status = %d, want 200, body=%s", lane.name, resp.StatusCode, body)
+			}
+			if !strings.Contains(string(body), "from-default") {
+				t.Errorf("unrouted-model on %s: body = %s, want it to contain the default upstream's response", lane.name, body)
+			}
+			if n := defaultCalls.Load(); n != 1 {
+				t.Errorf("unrouted-model on %s: default upstream got %d calls, want 1", lane.name, n)
+			}
+			if n := routedCalls.Load(); n != 0 {
+				t.Errorf("unrouted-model on %s: routed upstream got %d calls, want 0 — request leaked to the wrong backend", lane.name, n)
+			}
+		})
 	}
 }
 
