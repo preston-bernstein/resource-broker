@@ -18,11 +18,11 @@ import (
 	"time"
 
 	"github.com/preston-bernstein/ollama-resource-broker/internal/admin"
+	"github.com/preston-bernstein/ollama-resource-broker/internal/backend"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/detect"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/job"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/metrics"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/plex"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
 	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
@@ -64,7 +64,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	upstream := proxy.New(cfg.OllamaURL)
+	be, err := backend.New(cfg)
+	if err != nil {
+		slog.Error("backend", "err", err)
+		os.Exit(1)
+	}
+
 	sched := queue.New()
 	sched.SetMaxWaiters(cfg.MaxWaiters)
 	sched.SetMaxInflight(cfg.MaxInflight)
@@ -74,8 +79,7 @@ func main() {
 		detector.SetPlexChecker(plex.New(cfg.PlexURL, cfg.PlexToken))
 		slog.Info("plex session corroboration enabled", "url", cfg.PlexURL)
 	}
-	oc := ollama.New(cfg.OllamaURL)
-	ctrl := yield.NewWithConfirm(detector, oc, cfg.DetectInterval, cfg.YieldConfirmPolls)
+	ctrl := yield.NewWithConfirm(detector, be.Unloader(), cfg.DetectInterval, cfg.YieldConfirmPolls)
 	// yieldingFn adapts ctrl.Yielding()'s (bool, string) signature to the
 	// plain closure RunParkDrain expects (ADR-0009's Core redesign: the park
 	// drain loop is a plain ticker poll, not a yield.Controller broadcast).
@@ -129,7 +133,7 @@ func main() {
 		slog.Error("job recovery", "err", err)
 		os.Exit(1)
 	}
-	worker := job.NewWorker(jobSvc, sched, ctrl, genAdapter{oc}, cfg.BatchQuantum, 0)
+	worker := job.NewWorker(jobSvc, sched, ctrl, be, cfg.BatchQuantum, 0)
 	go worker.Run(ctx)
 	go jobSvc.RunPrune(ctx, cfg.JobPruneInterval, cfg.JobFetchedGrace, cfg.JobHardCap)
 
@@ -164,15 +168,15 @@ func main() {
 	jobStatus := func() any { return jobCounts() }
 
 	// healthCheck backs /healthz with the three things "the process is up"
-	// says nothing about (ADR-0010): can we reach Ollama, can we read the
-	// durable job store, and is the contention-detection loop still actually
-	// polling. Any one failing means the broker cannot do its job even though
-	// systemd shows it active — the exact clamd-shaped defect the
+	// says nothing about (ADR-0010): can we reach the upstream, can we read
+	// the durable job store, and is the contention-detection loop still
+	// actually polling. Any one failing means the broker cannot do its job
+	// even though systemd shows it active — the exact clamd-shaped defect the
 	// 2026-08-01 audit flagged against the old hardcoded "ok".
 	const detectStaleFactor = 3 // see ADR-0010: >3 missed polls is a stalled loop, not a slow one
 	healthCheck := func(ctx context.Context) error {
-		if _, err := oc.LoadedModels(ctx); err != nil {
-			return fmt.Errorf("ollama upstream unreachable: %w", err)
+		if err := be.Reachable(ctx); err != nil {
+			return fmt.Errorf("upstream unreachable: %w", err)
 		}
 		if _, err := store.HasQueued(ctx); err != nil {
 			return fmt.Errorf("job store unreadable: %w", err)
@@ -203,11 +207,11 @@ func main() {
 	// handshake is negligible on a LAN but this trades a little latency for
 	// eliminating an entire failure class — not worth paying on the
 	// low-latency interactive lane where the race hasn't been observed.
-	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, upstream))
+	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, be.Proxy()))
 	batchServer.SetKeepAlivesEnabled(false)
 
 	servers := []*http.Server{
-		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, upstream)),
+		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, be.Proxy())),
 		batchServer,
 		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, cfg.ControlToken)),
 	}
@@ -232,6 +236,8 @@ func main() {
 		embedSched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
 		embedSched.SetShutdownContext(ctx)
 		go embedSched.RunParkDrain(ctx, yieldingFn)
+		// embed lane always fronts Infinity directly, never routed through
+		// backend.New() — UPSTREAM_BACKEND has no effect here.
 		embedUpstream := proxy.NewEmbed(cfg.InfinityURL)
 		servers = append(servers, newServer(cfg.EmbedAddr,
 			embedSched.Gate(queue.Batch, cfg.BatchWait, cfg.EmbedTimeout, ctrl, reg, embedUpstream)))
@@ -250,7 +256,17 @@ func main() {
 			}
 		}(srv)
 	}
-	slog.Info("broker up", "upstream", cfg.OllamaURL.String(), "detect_interval", cfg.DetectInterval.String(), "yield_confirm_polls", cfg.YieldConfirmPolls)
+	// cfg.OllamaURL is nil under UPSTREAM_BACKEND=openai (and cfg.UpstreamURL
+	// is nil under the default "ollama" backend) — config.Load() only
+	// populates the URL matching the active backend, so this log line must
+	// pick whichever one is actually set rather than assuming OllamaURL.
+	var upstreamURLStr string
+	if cfg.UpstreamBackend == "ollama" {
+		upstreamURLStr = cfg.OllamaURL.String()
+	} else {
+		upstreamURLStr = cfg.UpstreamURL.String()
+	}
+	slog.Info("broker up", "backend", cfg.UpstreamBackend, "upstream", upstreamURLStr, "detect_interval", cfg.DetectInterval.String(), "yield_confirm_polls", cfg.YieldConfirmPolls)
 
 	// Shut down on either an OS signal or a fatal listener error — both paths
 	// run the same graceful shutdown so nothing is hard-killed mid-flight.
@@ -299,14 +315,6 @@ func runTdarrSchedule(ctx context.Context, tc *tdarr.Client) {
 			}
 		}
 	}
-}
-
-// genAdapter bridges the Ollama client to the Job worker's Generator interface.
-type genAdapter struct{ c *ollama.Client }
-
-func (g genAdapter) Generate(ctx context.Context, model, prompt string, opts map[string]any, onTokens func(int)) (string, error) {
-	out, _, err := g.c.Generate(ctx, ollama.GenerateRequest{Model: model, Prompt: prompt, Options: opts}, onTokens)
-	return out, err
 }
 
 func newServer(addr string, h http.Handler) *http.Server {
