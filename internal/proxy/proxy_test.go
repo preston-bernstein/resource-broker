@@ -7,11 +7,65 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestSharedTransportConfig pins the shared Transport's tuned constants — the
+// 60s IdleConnTimeout (proxy.go's own comment explains why this must not
+// silently drift back to http.DefaultTransport's 90s) and the 2-retries/
+// 500ms-backoff connection-retry policy — since no other test exercises the
+// package-level var's literal values directly.
+func TestSharedTransportConfig(t *testing.T) {
+	rt, ok := Transport.(*retryTransport)
+	if !ok {
+		t.Fatalf("Transport = %T, want *retryTransport", Transport)
+	}
+	if rt.retries != 2 {
+		t.Errorf("retries = %d, want 2", rt.retries)
+	}
+	if rt.backoff != 500*time.Millisecond {
+		t.Errorf("backoff = %v, want 500ms", rt.backoff)
+	}
+	base, ok := rt.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base = %T, want *http.Transport", rt.base)
+	}
+	if base.IdleConnTimeout != 60*time.Second {
+		t.Errorf("IdleConnTimeout = %v, want 60s", base.IdleConnTimeout)
+	}
+}
+
+// TestNewSetsNoBufferFlushInterval proves New()'s ReverseProxy sets
+// FlushInterval: -1 (flush every write immediately) — the specific setting
+// TestStreamingNotBuffered proves the *effect* of end-to-end, but nothing
+// asserted the literal field value itself.
+func TestNewSetsNoBufferFlushInterval(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1:0")
+	rp, ok := New(target).(*httputil.ReverseProxy)
+	if !ok {
+		t.Fatalf("New() = %T, want *httputil.ReverseProxy", New(target))
+	}
+	if rp.FlushInterval != -1 {
+		t.Errorf("FlushInterval = %v, want -1", rp.FlushInterval)
+	}
+}
+
+// TestNewEmbedSetsNoBufferFlushInterval is NewEmbed's analog to
+// TestNewSetsNoBufferFlushInterval — same field, separate ReverseProxy value.
+func TestNewEmbedSetsNoBufferFlushInterval(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1:0")
+	rp, ok := NewEmbed(target).(*httputil.ReverseProxy)
+	if !ok {
+		t.Fatalf("NewEmbed() = %T, want *httputil.ReverseProxy", NewEmbed(target))
+	}
+	if rp.FlushInterval != -1 {
+		t.Errorf("FlushInterval = %v, want -1", rp.FlushInterval)
+	}
+}
 
 // TestStreamingNotBuffered deterministically proves the proxy relays each
 // upstream write immediately instead of buffering the whole response. The
@@ -28,7 +82,17 @@ func TestStreamingNotBuffered(t *testing.T) {
 		}
 		io.WriteString(w, "line1\n")
 		fl.Flush()
-		<-release // do not produce line2 until the client has read line1
+		// Bounded, not a bare <-release: if the test fails/returns before
+		// close(release) (e.g. line1 never arrives), an unbounded read here
+		// blocks this handler goroutine forever, and the deferred
+		// httptest.Server.Close() (which waits for in-flight connections)
+		// hangs the entire test binary until the outer `go test -timeout`
+		// kills it — a real robustness gap, not just a slow test.
+		select {
+		case <-release: // do not produce line2 until the client has read line1
+		case <-time.After(2 * time.Second):
+			return
+		}
 		io.WriteString(w, "line2\n")
 		fl.Flush()
 	}))
