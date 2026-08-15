@@ -2,10 +2,12 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -262,4 +264,216 @@ type fakeDetector struct {
 
 func (f *fakeDetector) Detect() (string, bool) {
 	return f.reason, f.contended
+}
+
+// TestOpenAIBackendUnloaderNonNilWhenUnitSet is the mirror of
+// TestOpenAIBackendUnloaderIsTrueNilInterface: with cfg.UpstreamUnitName set,
+// newOpenAIBackend must wire a real, non-nil Unloader (a *systemdUnitController
+// via newSystemdUnitController), not the nil zero value used when no unit is
+// configured.
+func TestOpenAIBackendUnloaderNonNilWhenUnitSet(t *testing.T) {
+	u, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	cfg := &config.Config{UpstreamURL: u, UpstreamUnitName: "vllm"}
+	be, err := newOpenAIBackend(cfg)
+	if err != nil {
+		t.Fatalf("newOpenAIBackend: %v", err)
+	}
+	ob := be.(*openaiBackend)
+
+	if ob.Unloader() == nil {
+		t.Fatal("Unloader() = nil, want a non-nil Unloader when UpstreamUnitName is set")
+	}
+}
+
+// TestOpenAIBackendFactoryWiresSystemdController is THE regression test for
+// the wiring bug an earlier adversarial review flagged: every other test in
+// this file that touches systemdUnitController builds it by hand
+// (&systemdUnitController{unit: "vllm", run: stubRun}), which would keep
+// passing even if newOpenAIBackend's construction got "simplified" to a bare
+// &systemdUnitController{unit: cfg.UpstreamUnitName} struct literal, leaving
+// run as its nil zero-value func — that compiles fine, returns non-nil from
+// Unloader(), passes every hand-built-struct test, and then panics at
+// runtime on the first real yield event when run (a nil func) gets called.
+// This is the only test that goes through the real newOpenAIBackend factory
+// and proves run actually got wired to a working command runner.
+func TestOpenAIBackendFactoryWiresSystemdController(t *testing.T) {
+	u, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	cfg := &config.Config{UpstreamURL: u, UpstreamUnitName: "vllm"}
+
+	be, err := newOpenAIBackend(cfg)
+	if err != nil {
+		t.Fatalf("newOpenAIBackend: %v", err)
+	}
+	ob, ok := be.(*openaiBackend)
+	if !ok {
+		t.Fatalf("newOpenAIBackend returned %T, want *openaiBackend", be)
+	}
+
+	ctrl, ok := ob.Unloader().(*systemdUnitController)
+	if !ok {
+		t.Fatalf("Unloader() = %T, want *systemdUnitController", ob.Unloader())
+	}
+
+	// Primary assertion: run must not be the nil zero-value func. A struct
+	// literal like &systemdUnitController{unit: cfg.UpstreamUnitName} (no run
+	// field set) compiles fine and would fail this check.
+	if ctrl.run == nil {
+		t.Fatal("factory-built systemdUnitController.run is nil — newOpenAIBackend did not wire the real command runner (see newSystemdUnitController)")
+	}
+
+	// Defense in depth: substitute run with a spy post-construction and drive
+	// Unload/Reload through the exact object the factory returned, proving
+	// run is not just non-nil but actually invoked (with the right verbs) by
+	// the real methods on the real returned instance.
+	var gotVerbs []string
+	ctrl.run = func(ctx context.Context, verb string) error {
+		gotVerbs = append(gotVerbs, verb)
+		return nil
+	}
+
+	if err := ctrl.Unload(context.Background()); err != nil {
+		t.Fatalf("Unload() = %v, want nil", err)
+	}
+	if err := ctrl.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload() = %v, want nil", err)
+	}
+
+	want := []string{"stop", "start"}
+	if len(gotVerbs) != len(want) || gotVerbs[0] != want[0] || gotVerbs[1] != want[1] {
+		t.Errorf("run verbs recorded via factory-built controller = %v, want %v", gotVerbs, want)
+	}
+}
+
+// TestSystemdUnitControllerUnloadRunsStop proves Unload invokes run with the
+// "stop" verb — never "restart" — constructing the controller directly as a
+// struct literal (this test is in-package and exercises the type's own
+// methods in isolation, not the factory wiring).
+func TestSystemdUnitControllerUnloadRunsStop(t *testing.T) {
+	var gotVerb string
+	u := &systemdUnitController{
+		unit: "vllm",
+		run: func(ctx context.Context, verb string) error {
+			gotVerb = verb
+			return nil
+		},
+	}
+
+	if err := u.Unload(context.Background()); err != nil {
+		t.Fatalf("Unload() = %v, want nil", err)
+	}
+	if gotVerb != "stop" {
+		t.Errorf("run verb = %q, want %q", gotVerb, "stop")
+	}
+}
+
+// TestSystemdUnitControllerReloadRunsStart proves Reload invokes run with the
+// "start" verb — never "restart".
+func TestSystemdUnitControllerReloadRunsStart(t *testing.T) {
+	var gotVerb string
+	u := &systemdUnitController{
+		unit: "vllm",
+		run: func(ctx context.Context, verb string) error {
+			gotVerb = verb
+			return nil
+		},
+	}
+
+	if err := u.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload() = %v, want nil", err)
+	}
+	if gotVerb != "start" {
+		t.Errorf("run verb = %q, want %q", gotVerb, "start")
+	}
+}
+
+// TestSystemdUnitControllerErrorPropagates proves that when the underlying
+// run closure fails, Unload/Reload return a non-nil wrapped error rather than
+// panicking or swallowing the failure.
+func TestSystemdUnitControllerErrorPropagates(t *testing.T) {
+	stubErr := errors.New("boom")
+	u := &systemdUnitController{
+		unit: "vllm",
+		run: func(ctx context.Context, verb string) error {
+			return stubErr
+		},
+	}
+
+	if err := u.Unload(context.Background()); err == nil {
+		t.Fatal("Unload() = nil, want a non-nil wrapped error when run fails")
+	} else if !errors.Is(err, stubErr) {
+		t.Errorf("Unload() error = %v, want it to wrap %v", err, stubErr)
+	}
+
+	if err := u.Reload(context.Background()); err == nil {
+		t.Fatal("Reload() = nil, want a non-nil wrapped error when run fails")
+	} else if !errors.Is(err, stubErr) {
+		t.Errorf("Reload() error = %v, want it to wrap %v", err, stubErr)
+	}
+}
+
+// TestSystemdUnitControllerSerializesUnloadAndReload proves mu actually
+// serializes Unload and Reload against each other: a rapid yield-clear/
+// yield-start flap must never let a `systemctl start` run concurrently with
+// a `systemctl stop` for the same unit. The stub run blocks until signaled,
+// and a background watcher records whether it ever observed the in-progress
+// flag already set on entry (i.e. two calls overlapping).
+func TestSystemdUnitControllerSerializesUnloadAndReload(t *testing.T) {
+	var mu sync.Mutex
+	inProgress := false
+	overlapped := false
+
+	proceed := make(chan struct{})
+	entered := make(chan struct{}, 2)
+
+	u := &systemdUnitController{
+		unit: "vllm",
+		run: func(ctx context.Context, verb string) error {
+			mu.Lock()
+			if inProgress {
+				overlapped = true
+			}
+			inProgress = true
+			mu.Unlock()
+
+			entered <- struct{}{}
+			<-proceed // block until the test signals both goroutines have started
+
+			mu.Lock()
+			inProgress = false
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := u.Unload(context.Background()); err != nil {
+			t.Errorf("Unload() = %v, want nil", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := u.Reload(context.Background()); err != nil {
+			t.Errorf("Reload() = %v, want nil", err)
+		}
+	}()
+
+	// Wait for the first goroutine to enter run, then give the second a
+	// window to attempt entry too (it must block on mu, not on the channel).
+	<-entered
+	time.Sleep(50 * time.Millisecond)
+	close(proceed)
+	wg.Wait()
+
+	if overlapped {
+		t.Error("run() was in-progress concurrently for Unload and Reload; systemdUnitController.mu did not serialize them")
+	}
 }

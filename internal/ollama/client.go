@@ -170,6 +170,14 @@ func (c *Client) Unload(ctx context.Context) error {
 	return firstErr
 }
 
+// Reload is a no-op: Ollama's model reload is implicit. After Unload sends
+// keep_alive=0, the next /api/generate call lazily reloads the model on demand.
+// This method exists solely to satisfy the yield.Unloader interface that
+// ollamaBackend.Unloader() relies on.
+func (c *Client) Reload(ctx context.Context) error {
+	return nil
+}
+
 func (c *Client) unloadOne(ctx context.Context, model string) error {
 	payload, _ := json.Marshal(map[string]any{"model": model, "keep_alive": 0})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/api/generate"), bytes.NewReader(payload))

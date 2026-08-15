@@ -1,0 +1,20 @@
+{
+  "queue": {
+    "batch": 2,
+    "busy": true,
+    "inflight": 0,
+    "interactive": 1,
+    "max_inflight": 0,
+    "parked": 0
+  },
+  "schedule": {
+    "active_windows": [],
+    "safe_for_tdarr": true
+  },
+  "yield": {
+    "auto_reason": "",
+    "mode": "auto",
+    "reason": "",
+    "yielding": false
+  }
+}

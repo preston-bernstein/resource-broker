@@ -11,6 +11,41 @@ import (
 	"time"
 )
 
+// RouteBackend is one per-model routing rule, parsed from a single indexed
+// BROKER_ROUTE_<N>_* group: requests for any model listed in Models are
+// proxied to this instance instead of the default OllamaURL/UpstreamURL.
+type RouteBackend struct {
+	// Models is the set of model names routed to this instance. A model name
+	// may appear in at most one RouteBackend across the whole Config.Routes
+	// slice (and at most once within this instance's own list).
+	Models []string
+	// Backend selects the upstream API family for this instance: "ollama" or
+	// "openai" — same values and meaning as Config.UpstreamBackend. Defaults
+	// to "openai" (note: a different default than UpstreamBackend, which
+	// defaults to "ollama").
+	Backend string
+	// URL is this instance's base URL, validated for scheme+host the same
+	// way as OllamaURL/UpstreamURL.
+	URL *url.URL
+	// APIKey optionally authenticates requests to this instance (openai
+	// family only), sent as "Authorization: Bearer <value>". Never log this
+	// value raw.
+	APIKey string
+	// UnitName is the systemd unit name to stop/start on yield-start/yield-
+	// clear for this instance only. Empty disables the Unloader for this
+	// instance, the same precedent as Config.UpstreamUnitName.
+	UnitName string
+	// IdleTimeout is how long this instance may sit idle before its systemd
+	// unit is stopped to free resources. Zero (unset or explicitly "0")
+	// disables idle-unload for this instance. Requires UnitName to be set —
+	// Load() rejects a nonzero value with an empty UnitName, the same
+	// precedent as Config.UpstreamIdleTimeout.
+	IdleTimeout time.Duration
+	// Lane optionally scopes this rule to a single lane: "interactive" or
+	// "batch". Empty (the default) means the rule applies to both lanes.
+	Lane string
+}
+
 // Config holds all broker runtime settings.
 type Config struct {
 	// InteractiveAddr is the listen address for the high-priority class.
@@ -35,6 +70,22 @@ type Config struct {
 	// compatible upstream (sent as "Authorization: Bearer <value>"; empty
 	// means no Authorization header is sent). Never log this value raw.
 	UpstreamAPIKey string
+	// UpstreamUnitName is the systemd unit name to stop/start on yield-start/
+	// yield-clear when set. Used only by the openai backend. Empty, unset, or
+	// whitespace-only (trimmed to "") disables the Unloader entirely.
+	UpstreamUnitName string
+	// UpstreamIdleTimeout is how long the default backend may sit idle
+	// before its systemd unit is stopped to free GPU/resources. Zero (unset
+	// or explicitly "0") disables idle-unload entirely. Requires
+	// UpstreamUnitName to be set — Load() rejects a nonzero value with an
+	// empty UpstreamUnitName.
+	UpstreamIdleTimeout time.Duration
+	// Routes holds per-model routing rules parsed from the indexed
+	// BROKER_ROUTE_<N>_* env vars (N = 1..32). A request for a model listed
+	// in a RouteBackend.Models is proxied to that instance instead of the
+	// default OllamaURL/UpstreamURL. An unset/empty BROKER_ROUTE_1_MODELS
+	// disables routing entirely, leaving Routes nil (FR-9/AC-5).
+	Routes []RouteBackend
 	// InfinityURL is the upstream Infinity image-embedding base URL. Empty
 	// disables the embed lane entirely.
 	InfinityURL *url.URL
@@ -138,12 +189,9 @@ func Load() (*Config, error) {
 	var ollamaURL *url.URL
 	if backend == "ollama" {
 		rawURL := getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-		u, err := url.Parse(rawURL)
+		u, err := parseBaseURL("OLLAMA_URL", rawURL)
 		if err != nil {
-			return nil, fmt.Errorf("invalid OLLAMA_URL %q: %w", rawURL, err)
-		}
-		if u.Scheme == "" || u.Host == "" {
-			return nil, fmt.Errorf("OLLAMA_URL %q must include scheme and host", rawURL)
+			return nil, err
 		}
 		ollamaURL = u
 	}
@@ -154,12 +202,9 @@ func Load() (*Config, error) {
 	var upstreamURL *url.URL
 	if backend == "openai" {
 		rawURL := getenv("UPSTREAM_URL", "")
-		u, err := url.Parse(rawURL)
+		u, err := parseBaseURL("UPSTREAM_URL", rawURL)
 		if err != nil {
-			return nil, fmt.Errorf("invalid UPSTREAM_URL %q: %w", rawURL, err)
-		}
-		if u.Scheme == "" || u.Host == "" {
-			return nil, fmt.Errorf("UPSTREAM_URL %q must include scheme and host", rawURL)
+			return nil, err
 		}
 		upstreamURL = u
 	}
@@ -172,16 +217,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("UPSTREAM_API_KEY must not contain control characters")
 	}
 
+	// UPSTREAM_UNIT_NAME is read once, here, into a local var reused both by
+	// the cross-instance unit-name dedup logic below and the final Config
+	// field — there must be exactly one place this env var is read from.
+	unitName := strings.TrimSpace(getenv("UPSTREAM_UNIT_NAME", ""))
+
 	// INFINITY_URL is optional; when set it must be a valid absolute URL. Empty
 	// leaves InfinityURL nil and the embed lane is not started.
 	var infinityURL *url.URL
 	if raw := getenv("INFINITY_URL", ""); raw != "" {
-		iu, err := url.Parse(raw)
+		iu, err := parseBaseURL("INFINITY_URL", raw)
 		if err != nil {
-			return nil, fmt.Errorf("invalid INFINITY_URL %q: %w", raw, err)
-		}
-		if iu.Scheme == "" || iu.Host == "" {
-			return nil, fmt.Errorf("INFINITY_URL %q must include scheme and host", raw)
+			return nil, err
 		}
 		infinityURL = iu
 	}
@@ -201,6 +248,16 @@ func Load() (*Config, error) {
 	di, err := getdur("BROKER_DETECT_INTERVAL", 3*time.Second)
 	if err != nil {
 		return nil, err
+	}
+	uit, err := getdur("UPSTREAM_IDLE_TIMEOUT", 0)
+	if err != nil {
+		return nil, err
+	}
+	if uit < 0 {
+		return nil, fmt.Errorf("UPSTREAM_IDLE_TIMEOUT must not be negative, got %v", uit)
+	}
+	if uit != 0 && unitName == "" {
+		return nil, fmt.Errorf("UPSTREAM_IDLE_TIMEOUT is set but UPSTREAM_UNIT_NAME is empty; idle-unload requires a unit name")
 	}
 	ycp, err := getint("BROKER_YIELD_CONFIRM_POLLS", 2)
 	if err != nil {
@@ -251,39 +308,186 @@ func Load() (*Config, error) {
 	pmq := getintMin("BROKER_PARK_MAX_QUEUE", 32, 0)
 	pdb := getintMin("BROKER_PARK_DRAIN_BURST", 8, 1)
 
+	// BROKER_ROUTE_<N>_* (N = 1..maxRouteIndex) define per-model routing
+	// rules. An unset/empty BROKER_ROUTE_1_MODELS means routing is fully
+	// disabled (routes stays nil), matching the UPSTREAM_UNIT_NAME
+	// empty-disables-it precedent (FR-9/AC-5).
+	const maxRouteIndex = 32
+	const maxRoutes = 16
+
+	// Bounded scan to find the highest index with BROKER_ROUTE_<N>_MODELS
+	// configured; indices beyond maxRouteIndex are never examined.
+	highestRoute := 0
+	for i := 1; i <= maxRouteIndex; i++ {
+		if getenv(fmt.Sprintf("BROKER_ROUTE_%d_MODELS", i), "") != "" {
+			highestRoute = i
+		}
+	}
+
+	var routes []RouteBackend
+	if highestRoute > 0 {
+		if highestRoute > maxRoutes {
+			return nil, fmt.Errorf("too many configured routes: index %d exceeds max %d", highestRoute, maxRoutes)
+		}
+
+		// Cross-instance uniqueness: no two instances (default backend
+		// and/or any route) may share a resolved unit name or URL, and no
+		// model name may be routed by more than one rule.
+		seenModels := make(map[string]int, highestRoute)
+		seenUnitNames := make(map[string]string, highestRoute+1)
+		seenURLs := make(map[string]string, highestRoute+1)
+
+		var defaultURL *url.URL
+		if backend == "ollama" {
+			defaultURL = ollamaURL
+		} else {
+			defaultURL = upstreamURL
+		}
+		if defaultURL != nil {
+			seenURLs[defaultURL.String()] = "the default backend"
+		}
+		if unitName != "" {
+			seenUnitNames[unitName] = "the default backend"
+		}
+
+		for i := 1; i <= highestRoute; i++ {
+			prefix := fmt.Sprintf("BROKER_ROUTE_%d_", i)
+			source := fmt.Sprintf("BROKER_ROUTE_%d", i)
+
+			rawModels := getenv(prefix+"MODELS", "")
+			if rawModels == "" {
+				// Any index below highestRoute without _MODELS set is a
+				// gap, not a silent stop — fail loudly rather than
+				// silently limiting the table.
+				return nil, fmt.Errorf("%sMODELS is unset but BROKER_ROUTE_%d_MODELS is configured (index gap not allowed)", prefix, highestRoute)
+			}
+
+			parts := strings.Split(rawModels, ",")
+			models := make([]string, 0, len(parts))
+			localSeen := make(map[string]bool, len(parts))
+			for _, p := range parts {
+				m := strings.TrimSpace(p)
+				if m == "" {
+					return nil, fmt.Errorf("%sMODELS %q contains an empty model name", prefix, rawModels)
+				}
+				if localSeen[m] {
+					return nil, fmt.Errorf("%sMODELS %q lists model %q more than once", prefix, rawModels, m)
+				}
+				localSeen[m] = true
+				if existingSource, ok := seenModels[m]; ok {
+					return nil, fmt.Errorf("model %q is routed by both BROKER_ROUTE_%d and %s; a model may be routed to at most one backend", m, existingSource, source)
+				}
+				seenModels[m] = i
+				models = append(models, m)
+			}
+
+			routeBackend := getenv(prefix+"BACKEND", "openai")
+			if routeBackend != "ollama" && routeBackend != "openai" {
+				return nil, fmt.Errorf("%sBACKEND %q must be one of: ollama, openai", prefix, routeBackend)
+			}
+
+			rawURL := getenv(prefix+"URL", "")
+			routeURL, err := parseBaseURL(prefix+"URL", rawURL)
+			if err != nil {
+				return nil, err
+			}
+			if existingSource, ok := seenURLs[routeURL.String()]; ok {
+				return nil, fmt.Errorf("%sURL %q duplicates the URL already used by %s", prefix, rawURL, existingSource)
+			}
+			seenURLs[routeURL.String()] = source
+
+			routeAPIKey := getenv(prefix+"API_KEY", "")
+			if strings.ContainsAny(routeAPIKey, "\r\n") {
+				return nil, fmt.Errorf("%sAPI_KEY must not contain control characters", prefix)
+			}
+
+			routeUnitName := strings.TrimSpace(getenv(prefix+"UNIT_NAME", ""))
+			if routeUnitName != "" {
+				if existingSource, ok := seenUnitNames[routeUnitName]; ok {
+					return nil, fmt.Errorf("%sUNIT_NAME %q duplicates the unit name already used by %s", prefix, routeUnitName, existingSource)
+				}
+				seenUnitNames[routeUnitName] = source
+			}
+
+			routeIdleTimeout, err := getdur(prefix+"IDLE_TIMEOUT", 0)
+			if err != nil {
+				return nil, err
+			}
+			if routeIdleTimeout < 0 {
+				return nil, fmt.Errorf("%sIDLE_TIMEOUT must not be negative, got %v", prefix, routeIdleTimeout)
+			}
+			if routeIdleTimeout != 0 && routeUnitName == "" {
+				return nil, fmt.Errorf("%sIDLE_TIMEOUT is set but %sUNIT_NAME is empty; idle-unload requires a unit name", prefix, prefix)
+			}
+
+			lane := getenv(prefix+"LANE", "")
+			if lane != "" && lane != "interactive" && lane != "batch" {
+				return nil, fmt.Errorf("%sLANE %q must be one of: \"\", interactive, batch", prefix, lane)
+			}
+
+			routes = append(routes, RouteBackend{
+				Models:      models,
+				Backend:     routeBackend,
+				URL:         routeURL,
+				APIKey:      routeAPIKey,
+				UnitName:    routeUnitName,
+				IdleTimeout: routeIdleTimeout,
+				Lane:        lane,
+			})
+		}
+	}
+
 	return &Config{
-		InteractiveAddr:   getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
-		BatchAddr:         getenv("BROKER_BATCH_ADDR", ":11436"),
-		EmbedAddr:         getenv("BROKER_EMBED_ADDR", ":11438"),
-		EmbedTimeout:      et,
-		UpstreamBackend:   backend,
-		OllamaURL:         ollamaURL,
-		UpstreamURL:       upstreamURL,
-		UpstreamAPIKey:    upstreamAPIKey,
-		InfinityURL:       infinityURL,
-		InteractiveWait:   iw,
-		BatchWait:         bw,
-		ControlAddr:       getenv("BROKER_CONTROL_ADDR", ":11437"),
-		ControlToken:      getenv("BROKER_CONTROL_TOKEN", ""),
-		DetectInterval:    di,
-		YieldConfirmPolls: ycp,
-		PlexURL:           getenv("PLEX_URL", "http://localhost:32400"),
-		PlexToken:         getenv("PLEX_TOKEN", ""),
-		MaxWaiters:        mw,
-		MaxInflight:       mi,
-		BatchQuantum:      bq,
-		JobDBPath:         getenv("BROKER_JOB_DB", "broker-jobs.db"),
-		JobMaxAttempts:    jma,
-		JobPruneInterval:  jpi,
-		JobFetchedGrace:   jfg,
-		JobHardCap:        jhc,
-		TdarrURL:          getenv("BROKER_TDARR_URL", ""),
-		TdarrNodeID:       getenv("BROKER_TDARR_NODE_ID", ""),
-		TdarrGPUWorkers:   tgw,
-		ParkHold:          ph,
-		ParkMaxQueue:      pmq,
-		ParkDrainBurst:    pdb,
+		InteractiveAddr:     getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
+		BatchAddr:           getenv("BROKER_BATCH_ADDR", ":11436"),
+		EmbedAddr:           getenv("BROKER_EMBED_ADDR", ":11438"),
+		EmbedTimeout:        et,
+		UpstreamBackend:     backend,
+		OllamaURL:           ollamaURL,
+		UpstreamURL:         upstreamURL,
+		UpstreamAPIKey:      upstreamAPIKey,
+		UpstreamUnitName:    unitName,
+		UpstreamIdleTimeout: uit,
+		Routes:              routes,
+		InfinityURL:         infinityURL,
+		InteractiveWait:     iw,
+		BatchWait:           bw,
+		ControlAddr:         getenv("BROKER_CONTROL_ADDR", ":11437"),
+		ControlToken:        getenv("BROKER_CONTROL_TOKEN", ""),
+		DetectInterval:      di,
+		YieldConfirmPolls:   ycp,
+		PlexURL:             getenv("PLEX_URL", "http://localhost:32400"),
+		PlexToken:           getenv("PLEX_TOKEN", ""),
+		MaxWaiters:          mw,
+		MaxInflight:         mi,
+		BatchQuantum:        bq,
+		JobDBPath:           getenv("BROKER_JOB_DB", "broker-jobs.db"),
+		JobMaxAttempts:      jma,
+		JobPruneInterval:    jpi,
+		JobFetchedGrace:     jfg,
+		JobHardCap:          jhc,
+		TdarrURL:            getenv("BROKER_TDARR_URL", ""),
+		TdarrNodeID:         getenv("BROKER_TDARR_NODE_ID", ""),
+		TdarrGPUWorkers:     tgw,
+		ParkHold:            ph,
+		ParkMaxQueue:        pmq,
+		ParkDrainBurst:      pdb,
 	}, nil
+}
+
+// parseBaseURL parses raw and validates it includes both a scheme and a
+// host. key names the source env var, used only for error messages. Shared
+// by OLLAMA_URL, UPSTREAM_URL, INFINITY_URL, and each BROKER_ROUTE_<N>_URL —
+// all validated the same way.
+func parseBaseURL(key, raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", key, raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("%s %q must include scheme and host", key, raw)
+	}
+	return u, nil
 }
 
 func getenv(key, def string) string {

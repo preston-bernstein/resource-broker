@@ -173,19 +173,25 @@ curl -s localhost:11437/control    # current yield state only
 
 ### POST /control — force yield mode
 
+**Auth (verified live 2026-08-15, supersedes the 2026-07-02 "unauthenticated"
+warning below this section's history): ADR-0005 is now implemented and
+enabled live.** `BROKER_CONTROL_TOKEN` is set via
+`EnvironmentFile=/home/ollama-broker/resource-broker/broker-control-token.env`
+on the live unit — read it with `sudo cat` on that path. Once a token is
+configured, POST /control requires it from every caller, loopback included
+(GET /control, /healthz, /metrics, /status stay open regardless):
+
 ```sh
-curl -s -XPOST localhost:11437/control -d '{"mode":"yield"}'   # force yield
-curl -s -XPOST localhost:11437/control -d '{"mode":"serve"}'   # force serve
-curl -s -XPOST localhost:11437/control -d '{"mode":"auto"}'    # back to detection (default)
+TOKEN=$(sudo cat /home/ollama-broker/resource-broker/broker-control-token.env | cut -d= -f2)
+curl -s -XPOST localhost:11437/control -H "Authorization: Bearer $TOKEN" -d '{"mode":"yield"}'   # force yield
+curl -s -XPOST localhost:11437/control -H "Authorization: Bearer $TOKEN" -d '{"mode":"serve"}'   # force serve
+curl -s -XPOST localhost:11437/control -H "Authorization: Bearer $TOKEN" -d '{"mode":"auto"}'    # back to detection (default)
 ```
 
 Returns the resulting yield state. Invalid mode → 400 `mode must be one of:
-auto, yield, serve`. Other methods → 405.
+auto, yield, serve`. Missing/wrong token → 401. Other methods → 405.
 
-**WARNING (as of 2026-07-02): this endpoint is UNAUTHENTICATED on a port bound
-to all interfaces.** ADR-0005 (control-plane token auth) is accepted but
-unimplemented — `BROKER_CONTROL_TOKEN` appears nowhere in the code. Anyone on
-the LAN can flip modes. Use sparingly and always return to `auto`:
+Use sparingly and always return to `auto`:
 
 - `"yield"` refuses all inference and unloads VRAM — every Consumer sees 503s
   until you revert.
@@ -437,10 +443,73 @@ active before touching Tdarr itself.
    `INFINITY_URL`/`BROKER_EMBED_ADDR` `Environment=` lines (harmless —
    systemd last-wins — but drift). Always `diff <(systemctl cat
    resource-broker) deploy/broker.service` before installing.
-3. **`POST /control` is unauthenticated** on an all-interfaces port
-   (ADR-0005 pending) — see section 3.
+3. ~~`POST /control` is unauthenticated~~ **FIXED as of 2026-08-15 — ADR-0005
+   is live**, see section 3's auth block.
 4. **Raw Ollama `:11434` listens on all interfaces** — the "nothing talks to
    :11434" rule is convention only; audit new Consumer configs.
+5. **Deploy drift now also covers two new drop-ins/rules, neither in this
+   repo** (per-model routing is config-only, ADR-0015, so this was a
+   deliberate host-side choice matching the existing embed.conf/plex.conf/
+   tdarr.conf pattern — not an oversight):
+   - `/etc/systemd/system/resource-broker.service.d/route-qwen25-vllm.conf` —
+     `BROKER_ROUTE_1_*` env vars for the live qwen2.5→vLLM cutover (see
+     section 7).
+   - `/etc/polkit-1/rules.d/53-resource-broker-vllm-yield.rules` — scoped
+     grant letting `ollama-broker` run `systemctl start/stop vllm` (exactly
+     those two verbs, exactly that one unit) for the route's VRAM-yield
+     unload. Without it, `BROKER_ROUTE_1_UNIT_NAME` would silently fail every
+     yield transition (WARN-logged, not crashed) and gaming/Plex would not
+     free vLLM's VRAM.
+   - `/etc/systemd/system/vllm.service.d/served-model-name.conf` — adds
+     `qwen2.5` as a second `--served-model-name` alongside the full HF id, so
+     vLLM accepts the bare name litellm actually sends. This is a vLLM unit
+     change, not a resource-broker one, but exists only because of the
+     routing cutover — future re-provisioning of `vllm.service` must
+     preserve it or the route will 404.
+
+---
+
+## 7. Live per-model routing (vLLM cutover, added 2026-08-15)
+
+`llm-gateway`'s Interactive-lane chat model (`ollama/interactive/qwen2.5` in
+`config/config.yaml`, which litellm resolves to the bare model string
+`"qwen2.5"` — verified via litellm's own `LiteLLM completion() model=
+qwen2.5; provider = ollama` log line) is routed to the desktop's vLLM
+instance (`vllm.service`, `127.0.0.1:8000`, serving
+`Qwen/Qwen2.5-3B-Instruct`) instead of Ollama. Everything else (batch-lane
+models, embeddings, other interactive models) still goes to Ollama unchanged
+— this is a single-model cutover, not a backend swap.
+
+Live config (`route-qwen25-vllm.conf` drop-in, item 5 above):
+```
+BROKER_ROUTE_1_MODELS=qwen2.5
+BROKER_ROUTE_1_BACKEND=openai
+BROKER_ROUTE_1_URL=http://127.0.0.1:8000
+BROKER_ROUTE_1_LANE=interactive
+BROKER_ROUTE_1_UNIT_NAME=vllm
+```
+
+Verify the cutover is live: `curl -s localhost:11437/status` should show a
+`"routing"` key with `qwen2.5`/`interactive`. A real end-to-end test (with
+the control token from section 3): fire a chat completion at
+`ollama/interactive/qwen2.5` through litellm (`:4000`) and confirm
+`journalctl -u vllm` shows the request landing there, not Ollama (`curl -s
+127.0.0.1:11434/api/ps` should show nothing loaded).
+
+**vLLM restart needs free VRAM.** vLLM's `gpu_memory_utilization` reserves a
+fixed fraction of the card at startup; if Ollama has anything resident when
+`systemctl start vllm` runs (during yield-clear, or a manual restart), vLLM's
+engine init fails with `ValueError: Free memory on device cuda:0 (...) is
+less than desired GPU memory utilization` and the unit crash-loops
+(`Restart=on-failure`, `StartLimitBurst=5`) until it either succeeds or hits
+the burst limit and gives up. Hit live 2026-08-15 during initial setup — fix
+was `curl -s 127.0.0.1:11434/api/generate -d '{"model":"<name>","keep_alive":0}'`
+to force-unload the resident Ollama model, then `systemctl start vllm`
+again. If a gaming/Plex yield-clear ever races a batch request that just
+loaded a model into Ollama, the same failure could recur on the *automatic*
+reload path — this is a real, currently-unmitigated edge case, not just a
+one-time setup hiccup; worth revisiting if `vllm.service`'s `NRestarts`
+climbs unexpectedly after a yield-clear in production.
 
 ---
 
@@ -457,4 +526,5 @@ active before touching Tdarr itself.
   map: `README.md` ("Deploy", "Consumer integration").
 - Windows: `internal/schedule/schedule.go` `windows` slice.
 - Tdarr wiring: `cmd/broker/main.go` (`runTdarrSchedule`), `internal/tdarr/tdarr.go`.
-- ADR-0005 status: `grep -rn BROKER_CONTROL_TOKEN internal/ cmd/` (empty = still unimplemented).
+- ADR-0005 status: implemented and live as of 2026-08-15 (`internal/admin/admin.go`'s `authorized()`); token lives in `/home/ollama-broker/resource-broker/broker-control-token.env` on the live host, not in this repo.
+- Live per-model route / vLLM cutover state: section 7 above, dated 2026-08-15 — re-verify with `curl -s localhost:11437/status` and `systemctl cat resource-broker`/`systemctl cat vllm` on desktop before trusting it's unchanged.
