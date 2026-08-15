@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
+	"github.com/preston-bernstein/resource-broker/internal/queue"
 )
 
 // Gate is the scheduler surface the worker needs: a batch slot, plus the signal

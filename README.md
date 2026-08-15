@@ -1,6 +1,6 @@
-# Ollama Resource Broker
+# Resource Broker
 
-The Ollama Resource Broker (called "the Broker" throughout this repo) decides who gets the GPU on a home PC. Three things compete for it: gaming, Plex video transcoding, and Ollama inference (AI model requests). Gaming and Plex always win. The Broker queues inference requests, pauses them, and resumes them around gaming and Plex.
+The Resource Broker (called "the Broker" throughout this repo) decides who gets the GPU on a home PC. Three things compete for it: gaming, Plex video transcoding, and Ollama inference (AI model requests). Gaming and Plex always win. The Broker queues inference requests, pauses them, and resumes them around gaming and Plex.
 
 This is the **v2 Go HTTP-fronting broker**: a single program, written in Go, that sits between every inference Consumer (a service that sends Ollama requests, such as internal-monitor-app or LightRAG) and Ollama itself. Consumers point at the Broker instead of Ollama directly, so no Consumer needs custom code to cooperate with gaming or Plex. The original Bash version of this idea lives in [`legacy/`](legacy/) for reference only — do not run it alongside the Broker.
 
@@ -127,9 +127,9 @@ synchronous work:
 ## Deploy
 
 ```sh
-sudo install -m755 bin/ollama-broker /usr/local/bin/ollama-broker
-sudo install -m644 deploy/broker.service /etc/systemd/system/broker.service
-sudo systemctl daemon-reload && sudo systemctl enable --now broker
+sudo install -m755 bin/resource-broker /usr/local/bin/resource-broker
+sudo install -m644 deploy/broker.service /etc/systemd/system/resource-broker.service
+sudo systemctl daemon-reload && sudo systemctl enable --now resource-broker
 ```
 
 Install and run the Broker on ports that don't conflict with the legacy V3
@@ -144,16 +144,16 @@ source rather than a binary copy), a broken remote or stale credentials on
 that checkout can go unnoticed for a long time — it did, once, for 30+
 commits (see `deploy/check-deploy-drift.sh`'s own comment for the root
 cause). `deploy/check-deploy-drift.sh` writes Prometheus textfile metrics
-(`ollama_broker_deploy_git_fetch_success`, `ollama_broker_deploy_checkout_behind_commits`,
-`ollama_broker_deploy_checkout_dirty`) so this shows up on a dashboard
+(`resource_broker_deploy_git_fetch_success`, `resource_broker_deploy_checkout_behind_commits`,
+`resource_broker_deploy_checkout_dirty`) so this shows up on a dashboard
 instead of silently sitting there. Wire it up with:
 
 ```sh
-sudo install -m644 deploy/ollama-broker-deploy-drift-watch.service /etc/systemd/system/
-sudo install -m644 deploy/ollama-broker-deploy-drift-watch.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ollama-broker-deploy-drift-watch.timer
+sudo install -m644 deploy/resource-broker-deploy-drift-watch.service /etc/systemd/system/
+sudo install -m644 deploy/resource-broker-deploy-drift-watch.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now resource-broker-deploy-drift-watch.timer
 ```
 
-Edit the two paths in `ollama-broker-deploy-drift-watch.service`'s `ExecStart`
+Edit the two paths in `resource-broker-deploy-drift-watch.service`'s `ExecStart`
 if this host's checkout or textfile-collector directory differs from the
 defaults.
