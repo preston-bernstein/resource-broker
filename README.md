@@ -47,6 +47,8 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | `BROKER_ROUTE_<N>_URL` | _(required per route)_ | Base URL for route `N`'s upstream instance. Must not duplicate the default backend's URL or any other route's URL |
 | `BROKER_ROUTE_<N>_API_KEY` | _(unset)_ | Bearer token sent to route `N`'s upstream, if it requires auth (`openai` family only). Never logged. Must not contain CR/LF |
 | `BROKER_ROUTE_<N>_UNIT_NAME` | _(unset)_ | Systemd unit name to stop/start on yield for route `N`'s instance, independent of the default backend's `UPSTREAM_UNIT_NAME` and every other route's unit. Unset/empty disables the Unloader for this instance only; must not duplicate any other configured unit name |
+| `UPSTREAM_IDLE_TIMEOUT` | _(unset)_ | Idle duration (e.g. `1h`) for the default backend before its VRAM is freed via the same systemctl-based Unloader mechanism `UPSTREAM_UNIT_NAME` already uses (symmetric to Ollama's own `OLLAMA_KEEP_ALIVE`). Disabled when unset. Requires `UPSTREAM_UNIT_NAME` to be set; config.Load() fails otherwise |
+| `BROKER_ROUTE_<N>_IDLE_TIMEOUT` | _(unset)_ | Idle duration (e.g. `20m`) for route `N`'s backend instance before its VRAM is freed via the same systemctl-based Unloader mechanism `BROKER_ROUTE_<N>_UNIT_NAME` already uses. Disabled when unset. Requires `BROKER_ROUTE_<N>_UNIT_NAME` to be set for that same route index; config.Load() fails otherwise |
 | `BROKER_ROUTE_<N>_LANE` | _(unset, both lanes)_ | Optionally scopes route `N` to one lane: `interactive` or `batch`. Empty applies the rule on both lanes |
 | `INFINITY_URL` | _(unset)_ | Upstream Infinity image-embedding server. Unset disables the embed lane (ADR-0008) |
 | `BROKER_INTERACTIVE_ADDR` | `:11435` | Interactive (high-priority) port |

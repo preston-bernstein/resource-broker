@@ -2,10 +2,12 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +37,7 @@ func newMux(c Controller, token string) http.Handler {
 func newMuxWithHealth(c Controller, health HealthCheck, token string) http.Handler {
 	return Mux(c, fakeStats{}, health, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "metrics")
-	}), nil, nil, nil, nil, token)
+	}), nil, nil, nil, nil, nil, token)
 }
 
 // loopbackReq is httptest.NewRequest with RemoteAddr overridden to loopback
@@ -157,12 +159,140 @@ func TestControlMethodNotAllowed(t *testing.T) {
 	}
 }
 
+// TestStatusBaselineFixture pins testdata/status_baseline.json as the
+// pre-feature /status shape: newMux (see above) builds Mux with jobStatus,
+// tdarrStatus, and routingStatus all nil — exactly the base case a future
+// idleStatus parameter (added by a later task) will also default to when its
+// config vars are unset. AC1 for the idle-unload feature is that /status is
+// byte-for-byte unchanged in that unset case; this fixture is the "before"
+// side of that diff.
+//
+// The "schedule" section is the one part of /status that is NOT deterministic
+// across captures: schedule.TakeSnapshot(time.Now()) reflects the real wall
+// clock against internal/schedule's weekly window table (see
+// internal/schedule/schedule.go), so active_windows/safe_for_tdarr legitimately
+// differ depending on when the test runs. A future byte-for-byte AC1
+// comparison test must normalize or exclude "schedule" before diffing; this
+// test only checks its shape, not its value, for that reason.
+func TestStatusBaselineFixture(t *testing.T) {
+	fixtureBytes, err := os.ReadFile("testdata/status_baseline.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var fixture map[string]any
+	if err := json.Unmarshal(fixtureBytes, &fixture); err != nil {
+		t.Fatalf("fixture is not valid JSON: %v", err)
+	}
+
+	if _, ok := fixture["idle"]; ok {
+		t.Fatal(`fixture must not contain an "idle" key — it must represent the pre-feature /status shape`)
+	}
+	for _, k := range []string{"jobs", "tdarr", "routing"} {
+		if _, ok := fixture[k]; ok {
+			t.Fatalf("fixture must not contain optional key %q — newMux's base case is jobStatus/tdarrStatus/routingStatus all nil", k)
+		}
+	}
+	wantKeys := map[string]bool{"yield": true, "queue": true, "schedule": true}
+	for k := range fixture {
+		if !wantKeys[k] {
+			t.Fatalf("fixture has unexpected top-level key %q", k)
+		}
+	}
+	for k := range wantKeys {
+		if _, ok := fixture[k]; !ok {
+			t.Fatalf("fixture is missing expected top-level key %q", k)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var live map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &live); err != nil {
+		t.Fatalf("live /status body is not valid JSON: %v", err)
+	}
+
+	// "schedule" is time-dependent (see comment above); check shape only.
+	sched, ok := live["schedule"].(map[string]any)
+	if !ok {
+		t.Fatal(`live "schedule" is not an object`)
+	}
+	if _, ok := sched["active_windows"]; !ok {
+		t.Fatal(`live "schedule" missing "active_windows"`)
+	}
+	if _, ok := sched["safe_for_tdarr"]; !ok {
+		t.Fatal(`live "schedule" missing "safe_for_tdarr"`)
+	}
+	delete(live, "schedule")
+	delete(fixture, "schedule")
+
+	liveNorm, err := json.Marshal(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureNorm, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var liveCanon, fixtureCanon map[string]any
+	json.Unmarshal(liveNorm, &liveCanon)
+	json.Unmarshal(fixtureNorm, &fixtureCanon)
+	liveCanonJSON, _ := json.Marshal(liveCanon)
+	fixtureCanonJSON, _ := json.Marshal(fixtureCanon)
+	if string(liveCanonJSON) != string(fixtureCanonJSON) {
+		t.Fatalf("live /status (minus schedule) does not match testdata/status_baseline.json:\nlive:    %s\nfixture: %s", liveCanonJSON, fixtureCanonJSON)
+	}
+}
+
 func TestStatus(t *testing.T) {
 	rec := httptest.NewRecorder()
 	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
 	body := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(body, `"queue"`) || !strings.Contains(body, `"yield"`) {
 		t.Fatalf("status: %d %q", rec.Code, body)
+	}
+}
+
+// TestStatusWithIdleStatus verifies that idleStatus is wired into /status
+// when provided.
+func TestStatusWithIdleStatus(t *testing.T) {
+	rec := httptest.NewRecorder()
+	idleStatus := func() any { return []string{"fake"} }
+	mux := Mux(&fakeCtrl{}, fakeStats{}, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "metrics")
+	}), nil, nil, nil, nil, idleStatus, "")
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var live map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &live); err != nil {
+		t.Fatalf("live /status body is not valid JSON: %v", err)
+	}
+	if _, ok := live["idle"]; !ok {
+		t.Fatal(`live /status missing "idle" key when idleStatus is provided`)
+	}
+}
+
+// TestStatusWithoutIdleStatus verifies that /status does not contain an
+// "idle" key when idleStatus is nil.
+func TestStatusWithoutIdleStatus(t *testing.T) {
+	rec := httptest.NewRecorder()
+	mux := Mux(&fakeCtrl{}, fakeStats{}, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "metrics")
+	}), nil, nil, nil, nil, nil, "")
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var live map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &live); err != nil {
+		t.Fatalf("live /status body is not valid JSON: %v", err)
+	}
+	if _, ok := live["idle"]; ok {
+		t.Fatal(`live /status should not contain "idle" key when idleStatus is nil`)
 	}
 }
 
