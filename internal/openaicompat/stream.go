@@ -107,6 +107,18 @@ func parseSSEStreamChunks(ctx context.Context, body io.Reader, onChunk func(delt
 	}
 
 	for sc.Scan() {
+		// A caller-side context cancellation doesn't necessarily tear down
+		// the underlying connection instantly — sc.Scan() can still return
+		// an already-buffered event that arrived before cancellation. Without
+		// this check, that event would still reach onChunk/onTokens after
+		// the caller has already moved on from a canceled stream (2026-08-15:
+		// this is exactly what made TestGenerate_ContextCancellationMidStream
+		// flaky under CI's slower/busier runners — the mock's post-pause
+		// write could still be scanned before the connection actually broke).
+		if err := ctx.Err(); err != nil {
+			return "", tokens, err
+		}
+
 		line := sc.Text()
 		trimmed := strings.TrimSpace(line)
 
