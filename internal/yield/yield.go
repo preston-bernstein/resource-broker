@@ -6,6 +6,7 @@ package yield
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"sync"
@@ -82,7 +83,8 @@ type GPUManager interface {
 // Controller holds the effective yield state, refreshed by a polling loop.
 type Controller struct {
 	det          Detector
-	unloader     Unloader
+	unloaders    []Unloader // non-nil only; filtered at construction, see newMulti
+	labels       []string   // labels[i] identifies unloaders[i] in log lines; same length as unloaders
 	gpuMgr       GPUManager // optional; nil = disabled
 	interval     time.Duration
 	confirmPolls int // consecutive same-reason detections required to enter yield
@@ -102,13 +104,13 @@ type Controller struct {
 	serveCtx    context.Context
 	serveCancel context.CancelFunc
 
-	// actionDone, when non-nil, is closed once the most recently spawned
-	// doUnload/doReload goroutine has finished its Unload/Reload call. Each
-	// new spawn (in applyLocked, via startAction) captures the current value
-	// as its own predecessor-wait channel before replacing it with a fresh
-	// one. This is read and written only while holding mu (both here in
-	// startAction and by applyLocked's caller), so there is no race on the
-	// field itself.
+	// actionDone[i], when non-nil, is closed once the most recently spawned
+	// doUnload/doReload goroutine for unloaders[i] has finished its
+	// Unload/Reload call. Each new spawn (in applyLocked, via startAction)
+	// captures the current value as its own predecessor-wait channel before
+	// replacing it with a fresh one. This is read and written only while
+	// holding mu (both here in startAction and by applyLocked's caller), so
+	// there is no race on the slice or its elements.
 	//
 	// It exists to fix a real ordering gap: systemdUnitController's own
 	// mutex only prevents Unload and Reload from *overlapping* on the same
@@ -123,7 +125,12 @@ type Controller struct {
 	// controller's effective state is "not yielding". Chaining each action
 	// on its predecessor's completion (see startAction, doUnload, doReload)
 	// removes that race without making applyLocked itself block.
-	actionDone chan struct{}
+	//
+	// One chain per configured instance (index i) so a slow or permanently
+	// failing instance never blocks or reorders another instance's chain —
+	// each unloaders[i] gets its own fully independent ADR-0014 ordering
+	// guarantee.
+	actionDone []chan struct{}
 }
 
 // New returns a Controller in ModeAuto, not yielding, that acts on the first
@@ -142,7 +149,52 @@ func New(det Detector, unloader Unloader, interval time.Duration) *Controller {
 // confirmed real. Clearing contention is never debounced: recovery only
 // benefits inference and never risks starving gaming/Plex, so it should be
 // as fast as detection allows. confirmPolls < 1 is treated as 1.
+//
+// New/NewWithConfirm are thin one-element wrappers around NewMulti/
+// NewWithConfirmMulti (see those for the general N-instance form used by
+// per-model backend routing) — they exist so every pre-existing
+// single-instance caller and test keeps compiling and behaving identically.
 func NewWithConfirm(det Detector, unloader Unloader, interval time.Duration, confirmPolls int) *Controller {
+	var unloaders []Unloader
+	if unloader != nil {
+		unloaders = []Unloader{unloader}
+	}
+	return NewWithConfirmMulti(det, unloaders, nil, interval, confirmPolls)
+}
+
+// NewMulti is NewWithConfirmMulti with confirmPolls=1 (the historical,
+// pre-debounce behavior) — the multi-instance counterpart to New.
+func NewMulti(det Detector, unloaders []Unloader, labels []string, interval time.Duration) *Controller {
+	return NewWithConfirmMulti(det, unloaders, labels, interval, 1)
+}
+
+// NewWithConfirmMulti generalizes NewWithConfirm to N independently-ordered
+// Unloader instances — one per configured backend route. Each unloaders[i]
+// gets its own ADR-0014 doUnload/doReload ordering chain (see actionDone's
+// doc comment): a slow or permanently failing instance never blocks or
+// reorders another instance's actions.
+//
+// unloaders is filtered at construction using the same direct
+// interface-nil check ADR-0014 documents (`u != nil`), applied per element:
+// a literal nil entry is dropped, since it carries nothing to act on. A
+// typed nil (an interface value wrapping a nil concrete pointer) is
+// deliberately NOT filtered here — it does not compare equal to nil, so it
+// passes this check exactly as the old single-instance `c.unloader != nil`
+// guard in applyLocked always did, and is left for doUnload/doReload's own
+// recover() to catch if it ever panics on a nil receiver. This preserves
+// the existing typed-nil-Unloader regression behavior unchanged (see
+// internal/backend's TestOpenAIBackendUnloader* tests).
+//
+// labels[i] identifies unloaders[i] in doUnload/doReload's log lines, so an
+// operator can tell which configured instance failed to unload/reload
+// during an incident. labels is caller-supplied opaque data (e.g. a unit
+// name, upstream URL, or route index) and may be nil, shorter than
+// unloaders, or contain empty entries; any label missing or empty defaults
+// to fmt.Sprintf("instance[%d]", i), where i is the position in the
+// (pre-filter) unloaders argument — the position the caller configured it
+// at, which stays stable even if an earlier entry gets filtered out.
+// confirmPolls < 1 is treated as 1 (see NewWithConfirm).
+func NewWithConfirmMulti(det Detector, unloaders []Unloader, labels []string, interval time.Duration, confirmPolls int) *Controller {
 	// `< 1` vs `<= 1` is an equivalent mutant here (verified 2026-08-15,
 	// gremlins mutation testing): the clamp target is 1, so confirmPolls=1
 	// produces c.confirmPolls=1 whether or not this branch is taken — no
@@ -152,14 +204,34 @@ func NewWithConfirm(det Detector, unloader Unloader, interval time.Duration, con
 	if confirmPolls < 1 {
 		confirmPolls = 1
 	}
+
+	var filteredUnloaders []Unloader
+	var filteredLabels []string
+	for i, u := range unloaders {
+		if u == nil {
+			continue
+		}
+		label := ""
+		if i < len(labels) {
+			label = labels[i]
+		}
+		if label == "" {
+			label = fmt.Sprintf("instance[%d]", i)
+		}
+		filteredUnloaders = append(filteredUnloaders, u)
+		filteredLabels = append(filteredLabels, label)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Controller{
 		det:          det,
-		unloader:     unloader,
+		unloaders:    filteredUnloaders,
+		labels:       filteredLabels,
 		interval:     interval,
 		confirmPolls: confirmPolls,
 		serveCtx:     ctx,
 		serveCancel:  cancel,
+		actionDone:   make([]chan struct{}, len(filteredUnloaders)),
 	}
 }
 
@@ -242,9 +314,12 @@ func (c *Controller) SetMode(m Mode) {
 }
 
 // applyLocked recomputes the effective state and acts on a transition, doing
-// only the non-blocking work (serve-context swap, unload spawn) under the lock
-// and returning the transition so the caller can log it after unlocking.
-// Caller holds c.mu.
+// only the non-blocking work (serve-context swap, unload spawns) under the
+// lock and returning the transition so the caller can log it after
+// unlocking. Every configured instance is spawned independently — each
+// unloaders[i] gets its own doUnload/doReload goroutine chained only to its
+// own actionDone[i] predecessor, so no instance can block or reorder
+// another's actions (see actionDone's doc comment). Caller holds c.mu.
 func (c *Controller) applyLocked() (event, reason string) {
 	eff, r := c.computeLocked()
 	if eff == c.effective {
@@ -254,8 +329,9 @@ func (c *Controller) applyLocked() (event, reason string) {
 	mgr := c.gpuMgr
 	if eff {
 		c.serveCancel() // abort in-flight inference
-		if c.unloader != nil {
-			go c.doUnload(c.startAction())
+		for i := range c.unloaders {
+			wait, done := c.startAction(i)
+			go c.doUnload(i, wait, done)
 		}
 		if mgr != nil {
 			go c.pauseGPUMgr(mgr)
@@ -263,8 +339,9 @@ func (c *Controller) applyLocked() (event, reason string) {
 		return "start", r
 	}
 	c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
-	if c.unloader != nil {
-		go c.doReload(c.startAction())
+	for i := range c.unloaders {
+		wait, done := c.startAction(i)
+		go c.doReload(i, wait, done)
 	}
 	if mgr != nil {
 		go c.resumeGPUMgr(mgr)
@@ -272,17 +349,18 @@ func (c *Controller) applyLocked() (event, reason string) {
 	return "stop", ""
 }
 
-// startAction records a new pending unload/reload action and hands back the
-// two channels doUnload/doReload need: wait (the previous action's done
-// channel, nil if this is the first action ever) and done (this action's own
-// completion channel, which the caller must close when finished). Must only
-// be called from applyLocked, while c.mu is held, so the handoff chain it
-// builds matches applyLocked's own call order exactly — see actionDone's doc
+// startAction records a new pending unload/reload action for unloaders[i]
+// and hands back the two channels doUnload/doReload need: wait (that
+// instance's previous action's done channel, nil if this is the first
+// action ever for instance i) and done (this action's own completion
+// channel, which the caller must close when finished). Must only be called
+// from applyLocked, while c.mu is held, so the handoff chain it builds
+// matches applyLocked's own call order exactly — see actionDone's doc
 // comment for why this ordering matters.
-func (c *Controller) startAction() (wait <-chan struct{}, done chan struct{}) {
-	wait = c.actionDone
+func (c *Controller) startAction(i int) (wait <-chan struct{}, done chan struct{}) {
+	wait = c.actionDone[i]
 	done = make(chan struct{})
-	c.actionDone = done
+	c.actionDone[i] = done
 	return wait, done
 }
 
@@ -304,21 +382,25 @@ func logTransition(event, reason string) {
 
 // doUnload runs in its own goroutine (see applyLocked), so a panic here would
 // otherwise crash the whole broker process — e.g. a typed-nil Unloader (an
-// interface value that passes the `c.unloader != nil` check in applyLocked
-// but wraps a nil concrete pointer, see docs/openai-compatible-upstream-backend/plan.md's
+// interface value that passes NewWithConfirmMulti's `u != nil` filter at
+// construction but wraps a nil concrete pointer, see docs/openai-compatible-upstream-backend/plan.md's
 // "Typed-nil safety" note) invoking Unload on a nil receiver. The recover
 // here is cheap defense-in-depth against exactly that unrecovered-goroutine
 // panic path.
 //
-// wait/done chain this action to its neighbors (see actionDone's doc
-// comment and startAction): doUnload waits for the previous action to
-// finish before calling Unload, and always closes done on the way out
-// (even on panic/recover) so the next action isn't stuck waiting forever.
-func (c *Controller) doUnload(wait <-chan struct{}, done chan struct{}) {
+// i identifies which configured instance this call belongs to; c.unloaders
+// and c.labels are only ever read here (never mutated after construction),
+// so indexing them without holding c.mu is safe. wait/done chain this
+// action to its same-instance neighbors (see actionDone's doc comment and
+// startAction): doUnload waits for instance i's previous action to finish
+// before calling Unload, and always closes done on the way out (even on
+// panic/recover) so instance i's next action isn't stuck waiting forever —
+// this has no effect on any other instance's chain.
+func (c *Controller) doUnload(i int, wait <-chan struct{}, done chan struct{}) {
 	defer close(done)
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("panic in vram unload", "recover", r)
+			slog.Error("panic in vram unload", "instance", c.labels[i], "recover", r)
 		}
 	}()
 	if wait != nil {
@@ -326,22 +408,22 @@ func (c *Controller) doUnload(wait <-chan struct{}, done chan struct{}) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), unloadReloadTimeout)
 	defer cancel()
-	if err := c.unloader.Unload(ctx); err != nil {
-		slog.Warn("vram unload failed", "err", err)
+	if err := c.unloaders[i].Unload(ctx); err != nil {
+		slog.Warn("vram unload failed", "instance", c.labels[i], "err", err)
 	} else {
-		slog.Info("vram unload requested")
+		slog.Info("vram unload requested", "instance", c.labels[i])
 	}
 }
 
 // doReload runs in its own goroutine (see applyLocked), so a panic here
 // would otherwise crash the whole broker process — see doUnload's comment
-// for the typed-nil Unloader hazard this guards against and for what
-// wait/done do.
-func (c *Controller) doReload(wait <-chan struct{}, done chan struct{}) {
+// for the typed-nil Unloader hazard this guards against and for what i,
+// wait, and done do.
+func (c *Controller) doReload(i int, wait <-chan struct{}, done chan struct{}) {
 	defer close(done)
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("panic in vram reload", "recover", r)
+			slog.Error("panic in vram reload", "instance", c.labels[i], "recover", r)
 		}
 	}()
 	if wait != nil {
@@ -349,10 +431,10 @@ func (c *Controller) doReload(wait <-chan struct{}, done chan struct{}) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), unloadReloadTimeout)
 	defer cancel()
-	if err := c.unloader.Reload(ctx); err != nil {
-		slog.Warn("vram reload failed", "err", err)
+	if err := c.unloaders[i].Reload(ctx); err != nil {
+		slog.Warn("vram reload failed", "instance", c.labels[i], "err", err)
 	} else {
-		slog.Info("vram reload requested")
+		slog.Info("vram reload requested", "instance", c.labels[i])
 	}
 }
 

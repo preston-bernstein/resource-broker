@@ -79,7 +79,43 @@ func main() {
 		detector.SetPlexChecker(plex.New(cfg.PlexURL, cfg.PlexToken))
 		slog.Info("plex session corroboration enabled", "url", cfg.PlexURL)
 	}
-	ctrl := yield.NewWithConfirm(detector, be.Unloader(), cfg.DetectInterval, cfg.YieldConfirmPolls)
+	// Per-model backend routing (docs/adr/0015-per-model-backend-routing.md):
+	// when no routes are configured (the default, and today's exact
+	// pre-feature behavior), router stays nil and every call site below uses
+	// be directly — zero Router construction, zero body-peeking, byte-for-
+	// byte identical to before this feature existed. When one or more routes
+	// are configured, router fronts both Gates via ProxyForLane (never via
+	// its own Proxy(), which has no lane context) and activeBackend becomes
+	// router for the Job worker and healthCheck, since Router.Generate/
+	// Reachable already dispatch/check correctly on its own.
+	var router *backend.Router
+	var activeBackend backend.Backend = be
+	var ctrl *yield.Controller
+	if len(cfg.Routes) == 0 {
+		ctrl = yield.NewWithConfirm(detector, be.Unloader(), cfg.DetectInterval, cfg.YieldConfirmPolls)
+	} else {
+		routeBackends, routeUnloaders, labels, err := buildRoutes(cfg)
+		if err != nil {
+			slog.Error("route construction", "err", err)
+			os.Exit(1)
+		}
+		r := backend.NewRouter(be)
+		for i, rb := range cfg.Routes {
+			for _, model := range rb.Models {
+				r.AddRoute(model, rb.Lane, routeBackends[i])
+			}
+		}
+		router = r
+		activeBackend = router
+		unloaders := append([]yield.Unloader{be.Unloader()}, routeUnloaders...)
+		labels = append([]string{"default"}, labels...)
+		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
+		var routeSummary []string
+		for _, rb := range cfg.Routes {
+			routeSummary = append(routeSummary, fmt.Sprintf("%v->%s(%s)", rb.Models, rb.Backend, rb.URL.String()))
+		}
+		slog.Info("routing configured", "routes", routeSummary)
+	}
 	// yieldingFn adapts ctrl.Yielding()'s (bool, string) signature to the
 	// plain closure RunParkDrain expects (ADR-0009's Core redesign: the park
 	// drain loop is a plain ticker poll, not a yield.Controller broadcast).
@@ -137,7 +173,7 @@ func main() {
 		slog.Error("job recovery", "err", err)
 		os.Exit(1)
 	}
-	worker := job.NewWorker(jobSvc, sched, ctrl, be, cfg.BatchQuantum, 0)
+	worker := job.NewWorker(jobSvc, sched, ctrl, activeBackend, cfg.BatchQuantum, 0)
 	go worker.Run(ctx)
 	go jobSvc.RunPrune(ctx, cfg.JobPruneInterval, cfg.JobFetchedGrace, cfg.JobHardCap)
 
@@ -179,7 +215,7 @@ func main() {
 	// 2026-08-01 audit flagged against the old hardcoded "ok".
 	const detectStaleFactor = 3 // see ADR-0010: >3 missed polls is a stalled loop, not a slow one
 	healthCheck := func(ctx context.Context) error {
-		if err := be.Reachable(ctx); err != nil {
+		if err := activeBackend.Reachable(ctx); err != nil {
 			return fmt.Errorf("upstream unreachable: %w", err)
 		}
 		if _, err := store.HasQueued(ctx); err != nil {
@@ -211,13 +247,33 @@ func main() {
 	// handshake is negligible on a LAN but this trades a little latency for
 	// eliminating an entire failure class — not worth paying on the
 	// low-latency interactive lane where the race hasn't been observed.
-	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, be.Proxy()))
+	// interactiveProxy/batchProxy: router.ProxyForLane's own doc comment notes
+	// Proxy() (no lane context) is not what production wiring should call —
+	// these two lines are that production wiring, always passing a real lane
+	// (queue.Class.String()) when routes are configured. When router is nil
+	// (zero routes), be.Proxy() is the exact pre-feature code path: no
+	// Router construction, no body-peeking, byte-for-byte unchanged.
+	var interactiveProxy, batchProxy http.Handler
+	if router != nil {
+		interactiveProxy = router.ProxyForLane(queue.Interactive.String())
+		batchProxy = router.ProxyForLane(queue.Batch.String())
+	} else {
+		interactiveProxy = be.Proxy()
+		batchProxy = be.Proxy()
+	}
+
+	var routingStatus func() any
+	if router != nil {
+		routingStatus = router.RoutingSummary
+	}
+
+	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, batchProxy))
 	batchServer.SetKeepAlivesEnabled(false)
 
 	servers := []*http.Server{
-		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, be.Proxy())),
+		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, interactiveProxy)),
 		batchServer,
-		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, cfg.ControlToken)),
+		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, routingStatus, cfg.ControlToken)),
 	}
 
 	// Image-embedding lane (optional): fronts an Infinity SigLIP server on CPU
@@ -291,6 +347,28 @@ func main() {
 		}
 	}
 	wg.Wait()
+}
+
+// buildRoutes constructs one Backend per cfg.Routes[i] via backend.NewInstance
+// and returns it alongside that instance's own yield.Unloader() and a log
+// label, all index-aligned by construction in a single pass — not three
+// independently-built slices trusted to correlate by convention, since a
+// silent mismatch would route request bodies through one instance while
+// unloading a different one (docs/adr/0015-per-model-backend-routing.md).
+func buildRoutes(cfg *config.Config) (backends []backend.Backend, unloaders []yield.Unloader, labels []string, err error) {
+	backends = make([]backend.Backend, len(cfg.Routes))
+	unloaders = make([]yield.Unloader, len(cfg.Routes))
+	labels = make([]string, len(cfg.Routes))
+	for i, rb := range cfg.Routes {
+		b, err := backend.NewInstance(rb.Backend, rb.URL, rb.APIKey, rb.UnitName)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("route %d (%v): %w", i, rb.Models, err)
+		}
+		backends[i] = b
+		unloaders[i] = b.Unloader()
+		labels[i] = rb.URL.String()
+	}
+	return backends, unloaders, labels, nil
 }
 
 // runTdarrSchedule pauses Tdarr GPU workers during the internal-scraper-service window

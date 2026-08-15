@@ -1,0 +1,29 @@
+# Spec Challenge Notes
+
+## Agents run
+- Requirements Auditor (haiku): 12 issues found, 8 accepted
+- Scope & Dependency Auditor (sonnet): 7 issues found, 7 accepted
+- Design Devil's Advocate (sonnet): 11 issues found, 10 accepted
+- Implementation Realist (sonnet): 14 issues found, 14 accepted
+- Steps & Sequencing Critic (sonnet): 16 issues found, 16 accepted
+- Data Model Critic (sonnet): 8 issues found, 8 accepted
+- Security/Threat Auditor (haiku): 5 issues found, 4 accepted
+
+## Changes made
+- **Fixed a compile-breaking type mismatch**: the plan's Architecture diagram called `router.ProxyForLane(queue.Interactive)` implying a `queue.Class`-typed argument, but `ProxyForLane` is declared `(lane string)` — `queue.Class` is an `int8`, not a `string`, so this would not compile. Fixed by requiring `.String()` at every call site and updating the diagram.
+- **Closed a real AC-1 violation, independently caught by four separate reviewers**: as originally designed, every request — including large base64 vision payloads — got its body buffered to check the routing table, even with zero routes configured. Fixed with an explicit zero-route fast path (bypass `Router` entirely, wire the default backend directly) plus a size-capped/streaming model-peek for the case routes *are* configured.
+- **Closed a latent safety-critical race**: nothing stopped two configured backend instances (default + a route, or two routes) from pointing at the same systemd unit or URL. If that happened, each would get its own independent `yield.Controller` ordering chain, reintroducing the exact out-of-order `systemctl stop`/`start` race ADR-0014's flap-ordering fix was built to prevent — just triggered by a config mistake instead of goroutine scheduling. Added an explicit startup-time validation rejecting any two instances sharing the same unit/URL.
+- **Surfaced a silent-test-suite-invalidation risk nobody had named**: `internal/acceptance_test.go` (1644 lines) hand-duplicates `main.go`'s pre-feature wiring in its `newRig` helper and its own doc comment claims to mirror production wiring — once `main.go` changes to route through `Router`, that claim goes false and the acceptance suite silently stops testing the real code path, with no test failure to signal it. Added a dedicated step to update `newRig` alongside the `main.go` wiring change.
+- **Fixed self-contradicting Job-path lane semantics**: a lane-scoped route rule (e.g. `_LANE=interactive`) was going to apply on the Job path too, which has no lane concept at all — meaning `_LANE=interactive` would silently *not* exclude batch Jobs, the opposite of what the field name implies. Made this explicit in a new requirement rather than leaving it as an undocumented surprise.
+- **Split the two largest, highest-risk steps**: Step 3 (Router: dispatch + peeking + lane scoping + error passthrough + summary, 7 concerns in one step) and Step 6 (main.go: N backend construction + unloader wiring + gate swap + Job/health wiring + logging, also touching the single highest-blast-radius file) were each too large to review or verify as one unit. Split into 3a/3b/3c and 6a–6e, with Step 6 now explicitly gated behind Step 5's flap-ordering test passing first — production code shouldn't wire around an unproven multi-instance safety property.
+- **Retitled the spec from "Per-Consumer/Per-Model" to "Per-Model"**: the actual design only ever routed by model name; there's no consumer/source dimension anywhere in the implementation. The title was stale relative to what got designed.
+
+## Critiques rejected
+- A finding suggesting `Router` should drop the `Backend` interface entirely in favor of a narrower custom interface (to eliminate the `Unloader()` nil-stub "wart") was not applied — redesigning `Router`'s public shape this late is a bigger, more debatable change than the finding's actual cost (one documented no-op method). Instead, the trade-off is now explicitly recorded in the plan and will be recorded again in ADR-0015, rather than either silently shipping it or forcing a redesign.
+- A finding proposing per-lane multi-target routing for the same model (e.g. interactive→fast instance, batch→cheap instance for the same model name) was not built now — it's a real, natural extension (the `_LANE` field even anticipates it), but expanding the routing table's key from `model` to `(model, lane)` is a larger design change than this pass should make unprompted. Instead, requirements.md now documents it as an explicit, deliberate scope cut rather than a silent foreclosure, so it isn't rediscovered as "was this ever considered?" later.
+- A finding suggesting a response-side debug header naming which backend served a request was rejected — it directly conflicts with FR-17 ("Consumers never see backend-specific request/response formats"). The same operator-debugging need is already met by the accepted instance-identity-in-logs fix, without touching the wire contract.
+- A finding suggesting `Router.Reachable()` aggregate-check all configured instances (flip `/healthz` unhealthy if any alternate backend is down) was resolved with a narrower fix instead: keep `/healthz` bound to the default backend only (one optional route being down shouldn't trigger broker-wide unhealthy status / potential restarts), but add per-route liveness visibility to `/status` instead.
+- Minor untestable-NFR findings around "low single digits" and "fast contention flap" were accepted only where a concrete number could be substituted (capped alternate instances at 16); the "fast flap" language was left matching ADR-0014's own existing test semantics (rapid transitions, no literal ms threshold) rather than inventing a number ADR-0014 itself never used.
+
+## Open questions requiring human input
+None — every finding either had a concrete resolution applied to the spec, or was explicitly deferred with reasoning recorded above (not left ambiguous).

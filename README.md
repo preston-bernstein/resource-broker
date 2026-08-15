@@ -42,6 +42,12 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | `UPSTREAM_URL` | _(unset)_ | Upstream OpenAI-compatible server base URL (e.g. a vLLM instance). Required when `UPSTREAM_BACKEND=openai` |
 | `UPSTREAM_API_KEY` | _(unset)_ | Bearer token sent to the OpenAI-compatible upstream, if it requires auth. Ignored when `UPSTREAM_BACKEND=ollama`. Never logged |
 | `UPSTREAM_UNIT_NAME` | _(unset)_ | Systemd unit name to `systemctl stop` on yield-start and `systemctl start` on yield-clear (openai backend only). Unset/empty (or whitespace-only) disables the Unloader entirely — the pre-existing no-op behavior |
+| `BROKER_ROUTE_<N>_MODELS` | _(unset)_ | Comma-separated model names routed to a second upstream instance instead of the default (`OLLAMA_URL`/`UPSTREAM_URL`), `N` = `1..32`. Unset/empty at `N=1` disables all routing — Broker behavior is then byte-for-byte identical to no-routing (ADR-0015). Each model name may appear in at most one route; indices must be contiguous starting at 1 (no gaps); at most 16 routes total |
+| `BROKER_ROUTE_<N>_BACKEND` | `openai` | Upstream API family for route `N`: `ollama` or `openai`. Note the default differs from `UPSTREAM_BACKEND` (which defaults to `ollama`) — a route with no `_BACKEND` set is assumed to be an alternate OpenAI-compatible instance such as a second vLLM process |
+| `BROKER_ROUTE_<N>_URL` | _(required per route)_ | Base URL for route `N`'s upstream instance. Must not duplicate the default backend's URL or any other route's URL |
+| `BROKER_ROUTE_<N>_API_KEY` | _(unset)_ | Bearer token sent to route `N`'s upstream, if it requires auth (`openai` family only). Never logged. Must not contain CR/LF |
+| `BROKER_ROUTE_<N>_UNIT_NAME` | _(unset)_ | Systemd unit name to stop/start on yield for route `N`'s instance, independent of the default backend's `UPSTREAM_UNIT_NAME` and every other route's unit. Unset/empty disables the Unloader for this instance only; must not duplicate any other configured unit name |
+| `BROKER_ROUTE_<N>_LANE` | _(unset, both lanes)_ | Optionally scopes route `N` to one lane: `interactive` or `batch`. Empty applies the rule on both lanes |
 | `INFINITY_URL` | _(unset)_ | Upstream Infinity image-embedding server. Unset disables the embed lane (ADR-0008) |
 | `BROKER_INTERACTIVE_ADDR` | `:11435` | Interactive (high-priority) port |
 | `BROKER_BATCH_ADDR` | `:11436` | Batch (low-priority) port |
