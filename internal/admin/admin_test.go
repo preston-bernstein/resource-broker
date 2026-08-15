@@ -35,7 +35,7 @@ func newMux(c Controller, token string) http.Handler {
 func newMuxWithHealth(c Controller, health HealthCheck, token string) http.Handler {
 	return Mux(c, fakeStats{}, health, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "metrics")
-	}), nil, nil, nil, token)
+	}), nil, nil, nil, nil, token)
 }
 
 // loopbackReq is httptest.NewRequest with RemoteAddr overridden to loopback
