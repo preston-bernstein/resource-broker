@@ -1,6 +1,6 @@
 ---
 name: broker-cutover-hardening-campaign
-description: The executable, decision-gated campaign to finish the ollama-resource-broker v2 cutover and hardening — fix the test suite broken at HEAD, reconcile deploy/README drift, implement ADR-0005 control-plane auth, retire the legacy resource-manager.service still running on the desktop, and close the v2-go/main branch question. Load when asked to "finish the cutover", "retire the legacy daemon/resource-manager", "implement ADR-0005 / BROKER_CONTROL_TOKEN", "fix the failing admin test", "reconcile deploy drift", or to plan/execute any multi-step hardening of the deployed broker. Every phase has exact commands, expected observations, branch-on-mismatch instructions, and STOP gates for anything touching the live desktop. NOT for routine operations (broker-run-and-operate) or one-off debugging (broker-debugging-playbook).
+description: The executable, decision-gated campaign to finish the resource-broker v2 cutover and hardening — fix the test suite broken at HEAD, reconcile deploy/README drift, implement ADR-0005 control-plane auth, retire the legacy resource-manager.service still running on the desktop, and close the v2-go/main branch question. Load when asked to "finish the cutover", "retire the legacy daemon/resource-manager", "implement ADR-0005 / BROKER_CONTROL_TOKEN", "fix the failing admin test", "reconcile deploy drift", or to plan/execute any multi-step hardening of the deployed broker. Every phase has exact commands, expected observations, branch-on-mismatch instructions, and STOP gates for anything touching the live desktop. NOT for routine operations (broker-run-and-operate) or one-off debugging (broker-debugging-playbook).
 ---
 
 # Broker cutover and hardening campaign
@@ -14,11 +14,11 @@ Rules of engagement: all changes route through `broker-change-control` (classifi
 ## P0 — Baseline snapshot (read-only, do first, every time)
 
 ```sh
-cd /Users/prestonbernstein/dev/ollama-resource-broker
+cd /Users/prestonbernstein/dev/resource-broker
 git status --short && git log --oneline -3          # expect: clean tree on v2-go
 go test ./... 2>&1 | tail -8
 go vet ./... 2>&1 | tail -4
-ssh desktop-agent 'systemctl is-active ollama-broker resource-manager; curl -s localhost:11437/status'
+ssh desktop-agent 'systemctl is-active resource-broker resource-manager; curl -s localhost:11437/status'
 ```
 
 Expected (2026-07-02): test+vet FAIL only in `internal/admin` (`admin_test.go` `Mux` arity — `have (Controller, fakeStats, http.HandlerFunc, nil, nil)` / `want (..., func() any, TdarrStatusFn)`); both services `active`; `/status` returns the five-section JSON (see `broker-diagnostics-and-tooling`).
@@ -43,7 +43,7 @@ Goal: one source of truth; a fresh deploy from the repo must not silently change
 
 1. `deploy/broker.service`: add the three missing Tdarr lines with a comment block (pattern: the existing INFINITY comment):
    `Environment=BROKER_TDARR_URL=http://localhost:8265`, `Environment=BROKER_TDARR_NODE_ID=<node-id>`, `Environment=BROKER_TDARR_GPU_WORKERS=2` — keep `<node-id>` a placeholder in the repo (machine-specific; live value is set on the desktop unit).
-2. `README.md` config table: add the three Tdarr rows (defaults from `internal/config/config.go`: "", "", 1); fix the deploy section to install/enable `ollama-broker.service` (the live unit name) instead of `broker.service`, or explicitly document the rename step.
+2. `README.md` config table: add the three Tdarr rows (defaults from `internal/config/config.go`: "", "", 1); fix the deploy section to install/enable `resource-broker.service` (the live unit name) instead of `broker.service`, or explicitly document the rename step.
 3. Decide the `BROKER_BATCH_WAIT` question EXPLICITLY (do not bury it): code default 5s vs repo-unit/live 300s. Options: (a) leave as-is with a README note (unit overrides are the tuning layer) — cheapest, recommended; (b) raise the code default via ADR. Do NOT silently change the code default (fenced below).
 4. Note for next deploy: the LIVE unit has duplicated `INFINITY_URL`/`BROKER_EMBED_ADDR` Environment lines (last-wins, harmless) — clean up when the unit is next reinstalled, not before.
 5. Consistency check + gate:
@@ -71,7 +71,7 @@ DEPLOY sub-phase (desktop, STOP — confirm with Preston):
 1. Build `GOOS=linux GOARCH=amd64 CGO_ENABLED=0` (see `broker-build-and-env`), stage alongside a dated backup of the current binary.
 2. Pick a safe window (idle, not Friday early morning; check `/status` busy=false and no yield).
 3. Install + restart; verify: `curl -s localhost:11437/status` OK from the box; from the Mac WITHOUT token: `curl -XPOST http://10.0.0.243:11437/control -d '{"mode":"auto"}'` → expect 401/403; loopback without token still works (if token unset) or with token works.
-4. Rollback line: reinstall backed-up binary, `sudo systemctl restart ollama-broker`.
+4. Rollback line: reinstall backed-up binary, `sudo systemctl restart resource-broker`.
 5. If a token is provisioned, it lives in a systemd drop-in or environment file on the desktop — NEVER in this repo or any skill file.
 
 ## P4 — Retire resource-manager.service (desktop, MOST DANGEROUS, STOP-gated)
@@ -123,8 +123,8 @@ ssh desktop-agent 'sudo systemctl cat resource-manager; echo ---; sudo cat /usr/
 Baseline verified 2026-07-02 (repo at `ad07905`; live desktop read-only). This skill's claims go stale fastest of any in the library. Re-verify before each phase:
 
 ```sh
-cd /Users/prestonbernstein/dev/ollama-resource-broker && go test ./... 2>&1 | tail -3
-grep -rn BROKER_CONTROL_TOKEN /Users/prestonbernstein/dev/ollama-resource-broker/internal /Users/prestonbernstein/dev/ollama-resource-broker/cmd
-grep -n TDARR /Users/prestonbernstein/dev/ollama-resource-broker/deploy/broker.service
-ssh desktop-agent 'systemctl is-active ollama-broker resource-manager'
+cd /Users/prestonbernstein/dev/resource-broker && go test ./... 2>&1 | tail -3
+grep -rn BROKER_CONTROL_TOKEN /Users/prestonbernstein/dev/resource-broker/internal /Users/prestonbernstein/dev/resource-broker/cmd
+grep -n TDARR /Users/prestonbernstein/dev/resource-broker/deploy/broker.service
+ssh desktop-agent 'systemctl is-active resource-broker resource-manager'
 ```

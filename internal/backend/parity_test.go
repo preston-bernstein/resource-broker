@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/proxy"
 )
 
 // withEnv sets key to value for the duration of the test (or unsets it, when

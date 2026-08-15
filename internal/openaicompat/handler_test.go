@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
+	"github.com/preston-bernstein/resource-broker/internal/queue"
 )
 
 // readLineWithin mirrors internal/proxy/proxy_test.go's helper of the same

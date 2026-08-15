@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# broker-snapshot.sh — one-shot read-only health snapshot of the Ollama Resource Broker.
+# broker-snapshot.sh — one-shot read-only health snapshot of the Resource Broker.
 # Usage: BROKER_HOST=http://10.0.0.243 ./broker-snapshot.sh   (default host below)
 # Read-only: GETs only. Never POSTs, never restarts anything.
 set -u
@@ -14,7 +14,7 @@ say "== broker snapshot: $CTRL $(date '+%Y-%m-%d %H:%M:%S') =="
 
 hz=$(curl -s --max-time $T "$CTRL/healthz" 2>/dev/null)
 if [ "$hz" != "ok" ]; then
-  warn "healthz unreachable or not 'ok' (got: '${hz:-<no response>}') — is the broker up? (systemctl status ollama-broker)"
+  warn "healthz unreachable or not 'ok' (got: '${hz:-<no response>}') — is the broker up? (systemctl status resource-broker)"
   exit 1
 fi
 say "healthz: ok"
