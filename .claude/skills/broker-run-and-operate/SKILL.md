@@ -1,14 +1,14 @@
 ---
 name: broker-run-and-operate
 description: >
-  Operate the deployed ollama-resource-broker on the desktop (desktop.example.internal):
+  Operate the deployed resource-broker on the desktop (desktop.example.internal):
   systemd unit anatomy, deploy/upgrade steps, control plane (/healthz, /metrics,
   /status, /control), durable Job API cookbook (POST /jobs, Idempotency-Key,
   states, SSE events, cancel), consumer port map (:11435/:11436/:11437/:11438),
   restart blast radius, safe operating windows, and Tdarr coexistence. Load this
   when asked to deploy or restart the Broker, submit or inspect a Job, force
   yield/serve, wire a new Consumer to a port, read broker journalctl logs, or
-  when someone mentions ollama-broker.service, jobs.db, "GPU busy: wait budget
+  when someone mentions resource-broker.service, jobs.db, "GPU busy: wait budget
   exceeded", or the Friday internal-scraper-service window.
 ---
 
@@ -41,17 +41,17 @@ the Fronting Proxy), **Embed lane** (the :11438 Infinity path).
 | Item | Value |
 |---|---|
 | Host | desktop, desktop.example.internal (Linux) |
-| Live systemd unit | `ollama-broker.service` — **NOT** `broker.service` (see mismatch below) |
+| Live systemd unit | `resource-broker.service` — **NOT** `broker.service` (see mismatch below) |
 | User/Group | `ollama-broker` (dedicated service user — house rule, see note) |
-| Binary | `/usr/local/bin/ollama-broker` (dated Jun 30) |
+| Binary | `/usr/local/bin/resource-broker` (dated Jun 30) |
 | Unit source in repo | `deploy/broker.service` (drifted vs live — see Standing warnings) |
 | Job DB | `/var/lib/ollama-broker/jobs.db` via `Environment=BROKER_JOB_DB=...` + `StateDirectory=ollama-broker` |
 | Logs | journald, JSON (`slog` JSONHandler on stdout) |
 
 **Unit-name mismatch.** README's deploy section installs the unit as
-`broker.service`, but the live unit is named `ollama-broker.service`.
+`broker.service`, but the live unit is named `resource-broker.service`.
 Following the README verbatim on the live host would create a *second* unit
-beside the running one. Always target `ollama-broker` in `systemctl` /
+beside the running one. Always target `resource-broker` in `systemctl` /
 `journalctl` commands on the desktop.
 
 **Service user (house rule, assumption A3 — unwritten, suspected, not yet
@@ -90,20 +90,20 @@ desktop. README's steps, corrected for the live unit name:
 
 ```sh
 # on the desktop, with the freshly built linux binary at hand
-sudo install -m755 ollama-broker /usr/local/bin/ollama-broker
+sudo install -m755 resource-broker /usr/local/bin/resource-broker
 # CAUTION: do NOT blindly install deploy/broker.service — the repo unit is
 # missing the live Tdarr env vars (see Standing warnings). Diff first:
-diff <(systemctl cat ollama-broker) deploy/broker.service
+diff <(systemctl cat resource-broker) deploy/broker.service
 sudo systemctl daemon-reload
-sudo systemctl restart ollama-broker        # upgrade path
+sudo systemctl restart resource-broker        # upgrade path
 # first-time install only:
-# sudo systemctl enable --now ollama-broker
+# sudo systemctl enable --now resource-broker
 ```
 
 Verify after any deploy:
 
 ```sh
-systemctl status ollama-broker
+systemctl status resource-broker
 curl -s localhost:11437/healthz     # -> ok
 curl -s localhost:11437/status | python3 -m json.tool
 ```
@@ -321,8 +321,8 @@ restarts during one long Job kills it.
 ### Logs
 
 ```sh
-journalctl -u ollama-broker -f          # follow
-journalctl -u ollama-broker --since -1h -o cat | python3 -m json.tool --json-lines
+journalctl -u resource-broker -f          # follow
+journalctl -u resource-broker --since -1h -o cat | python3 -m json.tool --json-lines
 ```
 
 Logs are JSON (one object per line). Key messages (verified in source,
@@ -347,8 +347,8 @@ For metric-level measurement (`/metrics` counters, headers/trailers) see
 ### Restart procedure and blast radius
 
 ```sh
-sudo systemctl restart ollama-broker
-journalctl -u ollama-broker -n 20 -o cat     # expect "broker up" + "listening" x4
+sudo systemctl restart resource-broker
+journalctl -u resource-broker -n 20 -o cat     # expect "broker up" + "listening" x4
 curl -s localhost:11437/status | python3 -m json.tool
 ```
 
@@ -436,7 +436,7 @@ active before touching Tdarr itself.
    management. The live unit also carries duplicated
    `INFINITY_URL`/`BROKER_EMBED_ADDR` `Environment=` lines (harmless —
    systemd last-wins — but drift). Always `diff <(systemctl cat
-   ollama-broker) deploy/broker.service` before installing.
+   resource-broker) deploy/broker.service` before installing.
 3. **`POST /control` is unauthenticated** on an all-interfaces port
    (ADR-0005 pending) — see section 3.
 4. **Raw Ollama `:11434` listens on all interfaces** — the "nothing talks to
@@ -448,7 +448,7 @@ active before touching Tdarr itself.
 
 - Live unit/env facts, listener map, and resource-manager status: read-only
   ssh audit dated 2026-07-02 (authoring brief). Re-verify: `systemctl cat
-  ollama-broker`, `systemctl status resource-manager`, `ss -ltnp | grep -E
+  resource-broker`, `systemctl status resource-manager`, `ss -ltnp | grep -E
   '1143[4-8]|7997'` on the desktop.
 - Control-plane endpoints/JSON: `internal/admin/admin.go` (re-check `Mux`).
 - Job API/behavior: `internal/job/api.go`, `events.go`, `job.go`,

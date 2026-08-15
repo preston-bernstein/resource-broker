@@ -1,4 +1,4 @@
-BINARY := ollama-broker
+BINARY := resource-broker
 PKG := ./cmd/broker
 
 .PHONY: build test race vet fmt clean

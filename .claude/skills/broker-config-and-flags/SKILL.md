@@ -43,7 +43,7 @@ config.go is the whole story.
 
 Ground truth: `internal/config/config.go` `Load()` (defaults come from **code**,
 not the README — the README table is incomplete, see the drift map below).
-"Live override" = the running `ollama-broker.service` unit on the desktop as
+"Live override" = the running `resource-broker.service` unit on the desktop as
 observed 2026-07-02 (from the shared authoring brief; do not re-probe).
 
 Parsers (see section 2 for their gotchas):
@@ -152,7 +152,7 @@ nowhere in code as of 2026-07-02.
 | 1 | Code default vs deployed `BROKER_BATCH_WAIT` | Code (and README) say `5s`; **both** the repo `deploy/broker.service` and the live unit set `300s`. Rationale (commit `ad07905`, 2026-07-01, quoted in the unit comment): a 5s budget made bulk RAG/embedding ingestion fast-fail with "GPU busy: wait budget exceeded" whenever an interactive generation was mid-flight; batch must wait patiently, not fast-fail. | Anyone "resetting to defaults" reintroduces the ingestion failure. The code default was deliberately left at 5s; the fix lives in deployment config. |
 | 2 | Repo unit vs live unit: Tdarr vars | `deploy/broker.service` in the repo has **no** Tdarr `Environment=` lines. The live unit sets `BROKER_TDARR_URL=http://localhost:8265`, `BROKER_TDARR_NODE_ID=<node-id>`, `BROKER_TDARR_GPU_WORKERS=2`. | **Reinstalling from the repo unit would silently disable Tdarr cooperative GPU management** (silent per gotcha 6). Repo unit needs the lines added before any redeploy. |
 | 3 | Duplicated lines in live unit | Live unit repeats the `INFINITY_URL` and `BROKER_EMBED_ADDR` `Environment=` lines. systemd applies last-wins; values are identical, so harmless — but it is drift and invites a future divergent edit. | Cosmetic today; clean up on next unit change. |
-| 4 | Unit name mismatch | README's deploy section installs `broker.service`; the live unit is named **`ollama-broker.service`** (User/Group `ollama-broker`, binary `/usr/local/bin/ollama-broker`). | `systemctl status broker` on the desktop finds nothing; scripts following the README target the wrong unit name. Deploy mechanics → `broker-run-and-operate`. |
+| 4 | Unit name mismatch | README's deploy section installs `broker.service`; the live unit is named **`resource-broker.service`** (User/Group `ollama-broker`, binary `/usr/local/bin/resource-broker`). | `systemctl status broker` on the desktop finds nothing; scripts following the README target the wrong unit name. Deploy mechanics → `broker-run-and-operate`. |
 | 5 | README table missing Tdarr vars | See section 1. | Readers of the README believe Tdarr is not configurable. |
 | 6 | Live `BROKER_TDARR_GPU_WORKERS=2` vs default `1` | Deliberate live tuning; not reflected anywhere in the repo. | Same reinstall hazard as #2. |
 
@@ -208,23 +208,23 @@ snapshot:
 
 ```sh
 # Every parser call = every env var the Broker reads, with defaults:
-grep -n 'getenv\|getint\|getdur' /Users/prestonbernstein/dev/ollama-resource-broker/internal/config/config.go
+grep -n 'getenv\|getint\|getdur' /Users/prestonbernstein/dev/resource-broker/internal/config/config.go
 
 # Confirm config.go is the ONLY production env-read site:
-grep -rn 'os.Getenv\|os.LookupEnv' /Users/prestonbernstein/dev/ollama-resource-broker --include='*.go' | grep -v _test.go | grep -v /legacy/
+grep -rn 'os.Getenv\|os.LookupEnv' /Users/prestonbernstein/dev/resource-broker --include='*.go' | grep -v _test.go | grep -v /legacy/
 
 # README table rows vs config.go vars (any var in the 2nd list but not the 1st is doc drift):
-grep -oE 'OLLAMA_URL|INFINITY_URL|BROKER_[A-Z_]+' /Users/prestonbernstein/dev/ollama-resource-broker/README.md | sort -u
-grep -oE '"(OLLAMA_URL|INFINITY_URL|BROKER_[A-Z_]+)"' /Users/prestonbernstein/dev/ollama-resource-broker/internal/config/config.go | tr -d '"' | sort -u
+grep -oE 'OLLAMA_URL|INFINITY_URL|BROKER_[A-Z_]+' /Users/prestonbernstein/dev/resource-broker/README.md | sort -u
+grep -oE '"(OLLAMA_URL|INFINITY_URL|BROKER_[A-Z_]+)"' /Users/prestonbernstein/dev/resource-broker/internal/config/config.go | tr -d '"' | sort -u
 
 # Repo unit's env lines (compare against the live unit via broker-run-and-operate procedures):
-grep -n '^Environment=' /Users/prestonbernstein/dev/ollama-resource-broker/deploy/broker.service
+grep -n '^Environment=' /Users/prestonbernstein/dev/resource-broker/deploy/broker.service
 
 # Where each Config field is consumed:
-grep -n 'cfg\.' /Users/prestonbernstein/dev/ollama-resource-broker/cmd/broker/main.go
+grep -n 'cfg\.' /Users/prestonbernstein/dev/resource-broker/cmd/broker/main.go
 
 # Config package tests still green:
-go test /Users/prestonbernstein/dev/ollama-resource-broker/internal/config/
+go test /Users/prestonbernstein/dev/resource-broker/internal/config/
 ```
 
 ## Provenance and maintenance

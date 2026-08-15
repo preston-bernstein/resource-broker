@@ -1,7 +1,7 @@
 ---
 name: broker-architecture-contract
 description: >
-  Load before changing, reviewing, or reasoning about the ollama-resource-broker's
+  Load before changing, reviewing, or reasoning about the resource-broker's
   design: scheduler/queue behavior, yield/preemption semantics, the durable Job
   system, the embed lane, priority classes, or anything an ADR governs. Answers
   "why is it built this way", "can I change X without breaking the contract",
@@ -16,7 +16,7 @@ description: >
 
 # Broker architecture contract
 
-The load-bearing decisions of the ollama-resource-broker (`/Users/prestonbernstein/dev/ollama-resource-broker`, branch `v2-go`), the invariants that must survive any change, and the known-weak points as of 2026-07-02.
+The load-bearing decisions of the resource-broker (`/Users/prestonbernstein/dev/resource-broker`, branch `v2-go`), the invariants that must survive any change, and the known-weak points as of 2026-07-02.
 
 The Broker is a single Go binary that fronts Ollama (and optionally an Infinity embedding server) so that one GPU can be shared, in strict priority order: **gaming/Plex > interactive inference > batch inference**. Vocabulary is enforced by `CONTEXT.md` at the repo root (Broker, Contention, Yield, Preemption, Job, Queue, Position, Fronting Proxy, Synchronous request, Embed lane, Consumer — each with an Avoid list). Use those terms exactly; a review will flag "gateway", "pause", "kill", "task", "client".
 
@@ -90,7 +90,7 @@ State these in any design review; do not design around them silently.
 Written 2026-07-02 against `v2-go` HEAD; every invariant verified in source that day. Re-verify an anchor before trusting a row:
 
 ```sh
-cd /Users/prestonbernstein/dev/ollama-resource-broker
+cd /Users/prestonbernstein/dev/resource-broker
 
 # Inv 1: "not a law" wording still in ADR-0004
 grep -n "conservative default, not a law" docs/adr/0004-gpu-scheduling-policy.md

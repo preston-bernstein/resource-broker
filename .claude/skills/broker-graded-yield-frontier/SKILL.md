@@ -1,6 +1,6 @@
 ---
 name: broker-graded-yield-frontier
-description: The research frontier for the ollama-resource-broker — hybrid graded yield (run inference concurrently with light games, full-yield heavy games) plus the project's external positioning (what is novel vs known, what must be proven before any public claim). Load when asked "can inference run while gaming", "graded/partial/hybrid yield", "GPU utilization detection", "per-process GPU attribution", "what should this project research next", "is this novel / can we blog about it", or before designing any experiment that touches yield behavior. Everything here is OPEN/CANDIDATE — adoption requires an ADR through broker-change-control. NOT for how yield works today (broker-architecture-contract) or the history of why GPU-% detection failed (broker-failure-archaeology).
+description: The research frontier for the resource-broker — hybrid graded yield (run inference concurrently with light games, full-yield heavy games) plus the project's external positioning (what is novel vs known, what must be proven before any public claim). Load when asked "can inference run while gaming", "graded/partial/hybrid yield", "GPU utilization detection", "per-process GPU attribution", "what should this project research next", "is this novel / can we blog about it", or before designing any experiment that touches yield behavior. Everything here is OPEN/CANDIDATE — adoption requires an ADR through broker-change-control. NOT for how yield works today (broker-architecture-contract) or the history of why GPU-% detection failed (broker-failure-archaeology).
 ---
 
 # Graded yield: the research frontier
@@ -72,9 +72,9 @@ Honest ledger as of 2026-07-02:
 Written 2026-07-02 against branch `v2-go`. Repo-anchored claims re-verify with:
 
 ```sh
-grep -n "Hybrid graded yield" /Users/prestonbernstein/dev/ollama-resource-broker/docs/DESIGN.md
-grep -n "V1\|V2\|circular" /Users/prestonbernstein/dev/ollama-resource-broker/legacy/GO-MIGRATION-HANDOFF.md | head -5
-grep -rn "BROKER_GPU_SAMPLE_INTERVAL\|ModeGraded" /Users/prestonbernstein/dev/ollama-resource-broker/internal  # empty until Step 1/3 land
+grep -n "Hybrid graded yield" /Users/prestonbernstein/dev/resource-broker/docs/DESIGN.md
+grep -n "V1\|V2\|circular" /Users/prestonbernstein/dev/resource-broker/legacy/GO-MIGRATION-HANDOFF.md | head -5
+grep -rn "BROKER_GPU_SAMPLE_INTERVAL\|ModeGraded" /Users/prestonbernstein/dev/resource-broker/internal  # empty until Step 1/3 land
 ```
 
 Hardware/driver claims (fdinfo fields, rocm-smi per-process support, Ollama VRAM knobs) are background knowledge, date-stamped 2026-07-02, and MUST be re-verified on the desktop before Step 1 is designed.

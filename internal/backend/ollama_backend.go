@@ -4,10 +4,10 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/ollama"
+	"github.com/preston-bernstein/resource-broker/internal/proxy"
+	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
 // ollamaBackend is the Backend implementation for a real upstream Ollama

@@ -83,7 +83,7 @@ type ErrorRecorder interface {
 // session, as opposed to background maintenance (Skip Intro/Credits
 // detection, chapter-thumbnail generation) that runs the same "Plex
 // Transcoder" binary independent of playback. See package
-// github.com/preston-bernstein/ollama-resource-broker/internal/plex.
+// github.com/preston-bernstein/resource-broker/internal/plex.
 type PlexSessionChecker interface {
 	ActiveSession() (bool, error)
 }

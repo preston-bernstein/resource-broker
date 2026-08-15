@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/httpx"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/schedule"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
+	"github.com/preston-bernstein/resource-broker/internal/httpx"
+	"github.com/preston-bernstein/resource-broker/internal/queue"
+	"github.com/preston-bernstein/resource-broker/internal/schedule"
+	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
 // HealthCheck reports whether the broker can actually do its job right now —

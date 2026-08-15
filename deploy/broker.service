@@ -1,5 +1,5 @@
 [Unit]
-Description=Ollama Resource Broker (HTTP-fronting GPU arbiter)
+Description=Resource Broker (HTTP-fronting GPU arbiter)
 After=network-online.target ollama.service
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=ollama-broker
 Group=ollama-broker
-ExecStart=/usr/local/bin/ollama-broker
+ExecStart=/usr/local/bin/resource-broker
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=60

@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
+	"github.com/preston-bernstein/resource-broker/internal/proxy"
 )
 
 // NewHandler returns an http.Handler that presents Ollama's Synchronous wire

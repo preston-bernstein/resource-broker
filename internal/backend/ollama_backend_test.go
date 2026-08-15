@@ -9,8 +9,8 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/ollama"
 )
 
 // newTestOllamaBackend builds an *ollamaBackend pointed at the given mock

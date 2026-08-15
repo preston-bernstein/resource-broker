@@ -1,6 +1,6 @@
-# Ollama Resource Broker
+# Resource Broker
 
-The Ollama Resource Broker (called "the Broker" throughout this repo) controls who gets the GPU on a home PC that gaming, Plex video transcoding, and Ollama inference all share. Gaming and Plex always win the GPU; the Broker queues, pauses, and resumes inference work around them.
+The Resource Broker (called "the Broker" throughout this repo) controls who gets the GPU on a home PC that gaming, Plex video transcoding, and Ollama inference all share. Gaming and Plex always win the GPU; the Broker queues, pauses, and resumes inference work around them.
 
 This file is the glossary for this repo. Every term below has exactly one meaning here — using a different word for the same concept, or the same word for a different concept, causes real confusion in code, docs, and conversation. Each term's *Avoid* list names close-sounding words people might reach for instead; don't use those instead, because they either mean something more general or blur two ideas this repo needs kept separate.
 

@@ -1,11 +1,11 @@
 ---
 name: broker-docs-and-writing
-description: The ollama-resource-broker repo's docs of record, enforced vocabulary, and writing templates. Load BEFORE writing or editing any prose in this repo — an ADR, CONTEXT.md entry, DESIGN doc, README section, commit message, or a new .claude/skills/ file — and whenever you are asked "where does this get documented?", "what's the ADR format here?", "how do I mark an ADR superseded?", "what do I call this thing?" (naming a component/state/request), "update the README config table", or you catch yourself typing gateway, task, kill, pause, client, or passthrough. Contains the full CONTEXT.md Avoid-list vocabulary, the ADR template derived from the 8 real ADRs, and the commit-message house style.
+description: The resource-broker repo's docs of record, enforced vocabulary, and writing templates. Load BEFORE writing or editing any prose in this repo — an ADR, CONTEXT.md entry, DESIGN doc, README section, commit message, or a new .claude/skills/ file — and whenever you are asked "where does this get documented?", "what's the ADR format here?", "how do I mark an ADR superseded?", "what do I call this thing?" (naming a component/state/request), "update the README config table", or you catch yourself typing gateway, task, kill, pause, client, or passthrough. Contains the full CONTEXT.md Avoid-list vocabulary, the ADR template derived from the 8 real ADRs, and the commit-message house style.
 ---
 
 # Broker docs and writing
 
-How prose is written in `/Users/prestonbernstein/dev/ollama-resource-broker` (branch `v2-go`): which document owns which kind of fact, the enforced vocabulary, and fill-in templates for ADRs, design docs, README maintenance, commit messages, and skill files. Everything below is verified against the repo as of 2026-07-02 unless labeled otherwise.
+How prose is written in `/Users/prestonbernstein/dev/resource-broker` (branch `v2-go`): which document owns which kind of fact, the enforced vocabulary, and fill-in templates for ADRs, design docs, README maintenance, commit messages, and skill files. Everything below is verified against the repo as of 2026-07-02 unless labeled otherwise.
 
 ## When NOT to use this skill
 
@@ -150,7 +150,7 @@ A dash in the ADR column is meaningful: either the decision was too small for an
 
 1. **The config table (`### Configuration (env)`, ~lines 52–70) MUST match `internal/config/config.go`** — every var `Load()` reads, its real default, one-line meaning. Known drift, verified 2026-07-02: three Tdarr vars (`BROKER_TDARR_URL`, `BROKER_TDARR_NODE_ID`, `BROKER_TDARR_GPU_WORKERS`) are read by `config.go` (lines ~127, 150–151) but missing from the table — commit `dd39d20` never updated it. **Fixing this drift belongs to the cutover campaign** (`broker-cutover-hardening-campaign`); do not drive-by-fix it inside an unrelated change. Going forward, a new env var updates the table in the same commit (the five-touchpoint rule in `broker-change-control`).
 2. **The consumer table (`## Consumer integration`) must match reality** — which Consumer points at which port/path. When a Consumer is added, retired, or moved between the interactive port, batch port, Embed lane, or Job API, this table changes in the same breath. It is the only place an operator can see the whole port map at a glance.
-3. **The deploy section carries a unit-name caveat**: README says install `deploy/broker.service` as `broker.service`, but the live desktop unit is named `ollama-broker.service` (dated live finding, 2026-07-02 — see `broker-run-and-operate`). Until the cutover campaign reconciles this, anyone editing the deploy section must not "correct" it in either direction without checking the live unit name first; anyone *following* it must know the discrepancy exists.
+3. **The deploy section carries a unit-name caveat**: README says install `deploy/broker.service` as `broker.service`, but the live desktop unit is named `resource-broker.service` (dated live finding, 2026-07-02 — see `broker-run-and-operate`). Until the cutover campaign reconciles this, anyone editing the deploy section must not "correct" it in either direction without checking the live unit name first; anyone *following* it must know the discrepancy exists.
 
 What never goes in README: decision rationale (one-line ADR pointers only — the existing table cells say "(ADR-0004)", "(ADR-0008)" and stop), vocabulary definitions (it links CONTEXT.md as "the glossary"), and unimplemented plans presented as behavior.
 
@@ -197,13 +197,13 @@ Conventions for `.claude/skills/<skill-name>/SKILL.md` in this repo (self-refere
 
 Re-verify before trusting; all facts above dated 2026-07-02.
 
-- Vocabulary table still matches: `grep -n '^\*\*\|_Avoid_' /Users/prestonbernstein/dev/ollama-resource-broker/CONTEXT.md`
-- ADR set and status lines: `for f in /Users/prestonbernstein/dev/ollama-resource-broker/docs/adr/*.md; do echo "== $f"; head -3 "$f"; done`
-- ADR-0002 supersession quote intact: `grep -n 'superseded for long batch' /Users/prestonbernstein/dev/ollama-resource-broker/docs/adr/0002-stateless-http-bounded-wait.md`
-- ADR-0005 still pending: `grep -rn 'BROKER_CONTROL_TOKEN' /Users/prestonbernstein/dev/ollama-resource-broker/internal /Users/prestonbernstein/dev/ollama-resource-broker/cmd` (no hits = still pending)
-- DESIGN.md status still stale: `head -3 /Users/prestonbernstein/dev/ollama-resource-broker/docs/DESIGN.md` ("Planned" = still stale)
-- README config table still missing Tdarr vars: `grep -c BROKER_TDARR /Users/prestonbernstein/dev/ollama-resource-broker/README.md` (0 = still drifted)
-- Config ground truth for the table: `grep -n 'getenv\|getint\|getdur' /Users/prestonbernstein/dev/ollama-resource-broker/internal/config/config.go`
-- Commit-style exemplars: `git -C /Users/prestonbernstein/dev/ollama-resource-broker log --format='--- %h%n%s%n%b' -8 v2-go`
-- AI-attribution trailer count (should not grow): `git -C /Users/prestonbernstein/dev/ollama-resource-broker log v2-go --format='%(trailers:key=Co-Authored-By,valueonly)' | grep -c Claude` (15 as of 2026-07-02)
-- BUILD-PLAN.md still local-only: `git -C /Users/prestonbernstein/dev/ollama-resource-broker check-ignore docs/BUILD-PLAN.md` (prints the path = still ignored)
+- Vocabulary table still matches: `grep -n '^\*\*\|_Avoid_' /Users/prestonbernstein/dev/resource-broker/CONTEXT.md`
+- ADR set and status lines: `for f in /Users/prestonbernstein/dev/resource-broker/docs/adr/*.md; do echo "== $f"; head -3 "$f"; done`
+- ADR-0002 supersession quote intact: `grep -n 'superseded for long batch' /Users/prestonbernstein/dev/resource-broker/docs/adr/0002-stateless-http-bounded-wait.md`
+- ADR-0005 still pending: `grep -rn 'BROKER_CONTROL_TOKEN' /Users/prestonbernstein/dev/resource-broker/internal /Users/prestonbernstein/dev/resource-broker/cmd` (no hits = still pending)
+- DESIGN.md status still stale: `head -3 /Users/prestonbernstein/dev/resource-broker/docs/DESIGN.md` ("Planned" = still stale)
+- README config table still missing Tdarr vars: `grep -c BROKER_TDARR /Users/prestonbernstein/dev/resource-broker/README.md` (0 = still drifted)
+- Config ground truth for the table: `grep -n 'getenv\|getint\|getdur' /Users/prestonbernstein/dev/resource-broker/internal/config/config.go`
+- Commit-style exemplars: `git -C /Users/prestonbernstein/dev/resource-broker log --format='--- %h%n%s%n%b' -8 v2-go`
+- AI-attribution trailer count (should not grow): `git -C /Users/prestonbernstein/dev/resource-broker log v2-go --format='%(trailers:key=Co-Authored-By,valueonly)' | grep -c Claude` (15 as of 2026-07-02)
+- BUILD-PLAN.md still local-only: `git -C /Users/prestonbernstein/dev/resource-broker check-ignore docs/BUILD-PLAN.md` (prints the path = still ignored)

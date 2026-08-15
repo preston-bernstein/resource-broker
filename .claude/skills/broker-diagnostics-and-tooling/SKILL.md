@@ -1,6 +1,6 @@
 ---
 name: broker-diagnostics-and-tooling
-description: How to MEASURE the ollama-resource-broker instead of eyeballing it — the complete /metrics inventory with interpretation guides, the /status JSON field guide, per-request signals (X-Broker-Wait-Ms, the X-Broker-Status header vs authoritative trailer), journalctl log-field recipes, and four runnable read-only probe scripts (broker-snapshot.sh, probe-wait.sh, embed-sanity.sh, watch-jobs.sh). Load when asked "is the broker healthy", "why is this slow", "how long are requests waiting", "did that request get preempted", "are embeddings correct", to set up Grafana panels, or before/after any performance-affecting change. NOT for deciding what a bad measurement means causally — that is broker-debugging-playbook.
+description: How to MEASURE the resource-broker instead of eyeballing it — the complete /metrics inventory with interpretation guides, the /status JSON field guide, per-request signals (X-Broker-Wait-Ms, the X-Broker-Status header vs authoritative trailer), journalctl log-field recipes, and four runnable read-only probe scripts (broker-snapshot.sh, probe-wait.sh, embed-sanity.sh, watch-jobs.sh). Load when asked "is the broker healthy", "why is this slow", "how long are requests waiting", "did that request get preempted", "are embeddings correct", to set up Grafana panels, or before/after any performance-affecting change. NOT for deciding what a bad measurement means causally — that is broker-debugging-playbook.
 ---
 
 # Broker diagnostics and tooling
@@ -85,7 +85,7 @@ curl -sN --raw http://desktop.example.internal:11435/api/generate \
 
 ## 4. Log field guide (journalctl)
 
-Structured JSON on stdout (`log/slog`). On the desktop: `sudo journalctl -u ollama-broker -o cat`.
+Structured JSON on stdout (`log/slog`). On the desktop: `sudo journalctl -u resource-broker -o cat`.
 
 | Message | Fields | Fired when |
 |---|---|---|
@@ -102,9 +102,9 @@ Useful recipes:
 
 ```sh
 # Yield transitions in the last day (how often did gaming/Plex interrupt?)
-sudo journalctl -u ollama-broker --since yesterday -o cat | grep -E '"msg":"yield (start|stop)"'
+sudo journalctl -u resource-broker --since yesterday -o cat | grep -E '"msg":"yield (start|stop)"'
 # Deferred storm analysis: reasons histogram
-sudo journalctl -u ollama-broker --since -6h -o cat | grep '"outcome":"deferred"' | grep -o '"reason":"[^"]*"' | sort | uniq -c
+sudo journalctl -u resource-broker --since -6h -o cat | grep '"outcome":"deferred"' | grep -o '"reason":"[^"]*"' | sort | uniq -c
 # Detection latency: timestamp delta between game launch (known) and "yield start"
 ```
 
@@ -131,13 +131,13 @@ Facts verified 2026-07-02 against branch `v2-go` and the live desktop (read-only
 
 ```sh
 # Metric names still exact
-grep -o 'broker_[a-z_]*' /Users/prestonbernstein/dev/ollama-resource-broker/internal/metrics/metrics.go | sort -u
+grep -o 'broker_[a-z_]*' /Users/prestonbernstein/dev/resource-broker/internal/metrics/metrics.go | sort -u
 # /status shape
-grep -n '"yield"\|"queue"\|"jobs"\|"tdarr"\|"schedule"' /Users/prestonbernstein/dev/ollama-resource-broker/internal/admin/admin.go
+grep -n '"yield"\|"queue"\|"jobs"\|"tdarr"\|"schedule"' /Users/prestonbernstein/dev/resource-broker/internal/admin/admin.go
 # Header/trailer names
-grep -n 'X-Broker' /Users/prestonbernstein/dev/ollama-resource-broker/internal/queue/gate.go
+grep -n 'X-Broker' /Users/prestonbernstein/dev/resource-broker/internal/queue/gate.go
 # Log messages
-grep -rn 'slog\.\(Info\|Warn\|Error\)' /Users/prestonbernstein/dev/ollama-resource-broker/internal /Users/prestonbernstein/dev/ollama-resource-broker/cmd | grep -o '"[a-z][^"]*"' | sort -u | head -30
+grep -rn 'slog\.\(Info\|Warn\|Error\)' /Users/prestonbernstein/dev/resource-broker/internal /Users/prestonbernstein/dev/resource-broker/cmd | grep -o '"[a-z][^"]*"' | sort -u | head -30
 # Job list JSON shape assumed by watch-jobs.sh
-grep -n 'json:' /Users/prestonbernstein/dev/ollama-resource-broker/internal/job/job.go
+grep -n 'json:' /Users/prestonbernstein/dev/resource-broker/internal/job/job.go
 ```

@@ -17,18 +17,18 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/admin"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/backend"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/detect"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/job"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/metrics"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/plex"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/schedule"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/tdarr"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
+	"github.com/preston-bernstein/resource-broker/internal/admin"
+	"github.com/preston-bernstein/resource-broker/internal/backend"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/detect"
+	"github.com/preston-bernstein/resource-broker/internal/job"
+	"github.com/preston-bernstein/resource-broker/internal/metrics"
+	"github.com/preston-bernstein/resource-broker/internal/plex"
+	"github.com/preston-bernstein/resource-broker/internal/proxy"
+	"github.com/preston-bernstein/resource-broker/internal/queue"
+	"github.com/preston-bernstein/resource-broker/internal/schedule"
+	"github.com/preston-bernstein/resource-broker/internal/tdarr"
+	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
 // newLogger builds the process-default structured logger, aligned to
@@ -52,7 +52,7 @@ func newLogger() *slog.Logger {
 			return a
 		},
 	})
-	return slog.New(h).With("schema_version", 1, "service", "ollama-resource-broker")
+	return slog.New(h).With("schema_version", 1, "service", "resource-broker")
 }
 
 func main() {

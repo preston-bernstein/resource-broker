@@ -1,11 +1,11 @@
 ---
 name: broker-change-control
-description: How changes are classified, gated, and reviewed in the ollama-resource-broker repo. Load BEFORE making any change here — code, config, docs, or deploy unit — and whenever you are asked "does this need an ADR?", "can I just commit this?", "what has to be updated when I add an env var?", "why can't I weaken the yield?", or you are about to commit, open a PR, or touch the scheduler/yield/quantum logic. Contains the non-negotiables with the historical incidents behind them.
+description: How changes are classified, gated, and reviewed in the resource-broker repo. Load BEFORE making any change here — code, config, docs, or deploy unit — and whenever you are asked "does this need an ADR?", "can I just commit this?", "what has to be updated when I add an env var?", "why can't I weaken the yield?", or you are about to commit, open a PR, or touch the scheduler/yield/quantum logic. Contains the non-negotiables with the historical incidents behind them.
 ---
 
 # Broker change control
 
-How changes to `/Users/prestonbernstein/dev/ollama-resource-broker` are classified, gated, and reviewed. Everything below is verified against the repo at branch `v2-go` as of 2026-07-02 unless labeled otherwise.
+How changes to `/Users/prestonbernstein/dev/resource-broker` are classified, gated, and reviewed. Everything below is verified against the repo at branch `v2-go` as of 2026-07-02 unless labeled otherwise.
 
 Vocabulary note: this repo enforces the glossary in `CONTEXT.md` (Broker, Contention, Yield, Preemption, Job, Queue, Position, Fronting Proxy, Synchronous request, Embed lane, Consumer — each with an *Avoid* list). Use those terms exactly, in code comments and docs alike.
 
@@ -76,7 +76,7 @@ Supersession precedent — ADR-0002's status line: "**Status: still in force for
 
 ### 5. `deploy/broker.service` updated in the same change as any new env var
 
-Incident (deploy drift, verified via the retiring principal's read-only live check, 2026-07-02): the live desktop unit (`ollama-broker.service`) has the Tdarr vars set (`BROKER_TDARR_URL`, `BROKER_TDARR_NODE_ID=<node-id>`, `BROKER_TDARR_GPU_WORKERS=2`), but the repo's `deploy/broker.service` has **no** Tdarr env vars — because `dd39d20` never added them. Reinstalling from the repo unit would silently disable Tdarr cooperative GPU management. Related drift: README's deploy section names the unit `broker.service` while the live unit is `ollama-broker.service`.
+Incident (deploy drift, verified via the retiring principal's read-only live check, 2026-07-02): the live desktop unit (`resource-broker.service`) has the Tdarr vars set (`BROKER_TDARR_URL`, `BROKER_TDARR_NODE_ID=<node-id>`, `BROKER_TDARR_GPU_WORKERS=2`), but the repo's `deploy/broker.service` has **no** Tdarr env vars — because `dd39d20` never added them. Reinstalling from the repo unit would silently disable Tdarr cooperative GPU management. Related drift: README's deploy section names the unit `broker.service` while the live unit is `resource-broker.service`.
 
 Rule: repo unit and README config table move with `config.go`, in one commit. The unit file is also where default-change rationale lives as comments (see the `BROKER_BATCH_WAIT=300s` block in `deploy/broker.service`).
 
@@ -121,10 +121,10 @@ When reviewing someone else's change here, produce H/M/L-graded findings; when f
 
 Re-verify before trusting; all facts above dated 2026-07-02.
 
-- Review-culture commits still as described: `git -C /Users/prestonbernstein/dev/ollama-resource-broker log --oneline -25 v2-go`
-- Suite still broken only in internal/admin: `cd /Users/prestonbernstein/dev/ollama-resource-broker && go test ./... 2>&1 | tail -3`
-- Tdarr vars still missing from README table: `grep -c BROKER_TDARR /Users/prestonbernstein/dev/ollama-resource-broker/README.md` (0 = still drifted)
-- Tdarr vars still missing from deploy unit: `grep -c TDARR /Users/prestonbernstein/dev/ollama-resource-broker/deploy/broker.service` (0 = still drifted)
-- ADR statuses: `head -4 /Users/prestonbernstein/dev/ollama-resource-broker/docs/adr/*.md`
-- main still stale: `git -C /Users/prestonbernstein/dev/ollama-resource-broker log --oneline main | wc -l` (3 = stale)
-- Legacy-coexistence quote: `grep -n "reference-only" /Users/prestonbernstein/dev/ollama-resource-broker/docs/DESIGN.md`
+- Review-culture commits still as described: `git -C /Users/prestonbernstein/dev/resource-broker log --oneline -25 v2-go`
+- Suite still broken only in internal/admin: `cd /Users/prestonbernstein/dev/resource-broker && go test ./... 2>&1 | tail -3`
+- Tdarr vars still missing from README table: `grep -c BROKER_TDARR /Users/prestonbernstein/dev/resource-broker/README.md` (0 = still drifted)
+- Tdarr vars still missing from deploy unit: `grep -c TDARR /Users/prestonbernstein/dev/resource-broker/deploy/broker.service` (0 = still drifted)
+- ADR statuses: `head -4 /Users/prestonbernstein/dev/resource-broker/docs/adr/*.md`
+- main still stale: `git -C /Users/prestonbernstein/dev/resource-broker log --oneline main | wc -l` (3 = stale)
+- Legacy-coexistence quote: `grep -n "reference-only" /Users/prestonbernstein/dev/resource-broker/docs/DESIGN.md`

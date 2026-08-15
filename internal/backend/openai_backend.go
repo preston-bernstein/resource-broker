@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/openaicompat"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/openaicompat"
+	"github.com/preston-bernstein/resource-broker/internal/proxy"
+	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
 // openaiBackend is the Backend implementation for an OpenAI-compatible

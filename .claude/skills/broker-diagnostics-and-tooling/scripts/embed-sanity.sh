@@ -22,7 +22,7 @@ r1=$(embed "$RED");  rc1=$?
 r2=$(embed "$BLUE"); rc2=$?
 if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ] || [ -z "$r1" ] || [ -z "$r2" ]; then
   echo "FAIL: embed lane unreachable at $URL — INFINITY_URL likely unset (lane not started) or Infinity down on 127.0.0.1:7997."
-  echo "Check: curl -s \$BROKER_HOST:11437/status ; journalctl -u ollama-broker | grep 'embed lane enabled'"
+  echo "Check: curl -s \$BROKER_HOST:11437/status ; journalctl -u resource-broker | grep 'embed lane enabled'"
   exit 1
 fi
 case "$r1" in *'"error"'*) echo "FAIL: lane returned an error: $r1"; exit 1;; esac

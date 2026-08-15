@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/backend"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/queue"
+	"github.com/preston-bernstein/resource-broker/internal/backend"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/queue"
 )
 
 // --- fakes ---
