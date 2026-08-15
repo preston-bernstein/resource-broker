@@ -1,6 +1,6 @@
 ---
 name: broker-validation-and-qa
-description: What counts as evidence in the ollama-resource-broker repo — the validation commands (go test/vet/race), the full per-package test inventory with the techniques each uses, how to write a new test in house style, which scheduler/Job invariants are pinned by which tests, known gaps (internal/admin broken at HEAD, internal/schedule and internal/tdarr untested), and soak criteria for operational changes. Load when writing or reviewing tests, before claiming "this change is safe", when asked "how do I test this here", "is there a test for preemption/requeue/idempotency", "why does go test fail", or when adding a package that needs its first tests. NOT for running the deployed service (broker-run-and-operate) or measuring it (broker-diagnostics-and-tooling).
+description: What counts as evidence in the resource-broker repo — the validation commands (go test/vet/race), the full per-package test inventory with the techniques each uses, how to write a new test in house style, which scheduler/Job invariants are pinned by which tests, known gaps (internal/admin broken at HEAD, internal/schedule and internal/tdarr untested), and soak criteria for operational changes. Load when writing or reviewing tests, before claiming "this change is safe", when asked "how do I test this here", "is there a test for preemption/requeue/idempotency", "why does go test fail", or when adding a package that needs its first tests. NOT for running the deployed service (broker-run-and-operate) or measuring it (broker-diagnostics-and-tooling).
 ---
 
 # Broker validation and QA
@@ -115,8 +115,8 @@ A deploy-affecting change (binary upgrade, unit change, retiring the legacy daem
 Verified 2026-07-02 on branch `v2-go` by reading every `*_test.go` and running the suite. Re-verify:
 
 ```sh
-ls /Users/prestonbernstein/dev/ollama-resource-broker/internal/*/*_test.go
-cd /Users/prestonbernstein/dev/ollama-resource-broker && go test ./... 2>&1 | tail -5   # admin failure known until campaign P1
-grep -rn "func Test" /Users/prestonbernstein/dev/ollama-resource-broker/internal | wc -l
-grep -c require /Users/prestonbernstein/dev/ollama-resource-broker/go.mod              # still no test-only deps
+ls /Users/prestonbernstein/dev/resource-broker/internal/*/*_test.go
+cd /Users/prestonbernstein/dev/resource-broker && go test ./... 2>&1 | tail -5   # admin failure known until campaign P1
+grep -rn "func Test" /Users/prestonbernstein/dev/resource-broker/internal | wc -l
+grep -c require /Users/prestonbernstein/dev/resource-broker/go.mod              # still no test-only deps
 ```

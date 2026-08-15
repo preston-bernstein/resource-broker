@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/ollama"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/ollama"
 )
 
 // TestNewOllamaBackendReturnsNonNil verifies that New() with a valid

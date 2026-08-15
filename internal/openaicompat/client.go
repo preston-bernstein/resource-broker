@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/proxy"
+	"github.com/preston-bernstein/resource-broker/internal/proxy"
 )
 
 // Client talks to a single OpenAI-compatible upstream (e.g. vLLM) for the

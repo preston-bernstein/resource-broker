@@ -1,4 +1,4 @@
-module github.com/preston-bernstein/ollama-resource-broker
+module github.com/preston-bernstein/resource-broker
 
 go 1.24.0
 

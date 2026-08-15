@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/preston-bernstein/ollama-resource-broker/internal/config"
-	"github.com/preston-bernstein/ollama-resource-broker/internal/yield"
+	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
 // newTestOpenAIBackend builds an *openaiBackend pointed at the given mock

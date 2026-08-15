@@ -1,7 +1,7 @@
 ---
 name: broker-build-and-env
 description: >
-  Recreate the ollama-resource-broker development environment from scratch and
+  Recreate the resource-broker development environment from scratch and
   build/test/vet the project. Load this skill when you need to: set up Go for
   this repo, run `make build` / `make test` / `go test ./...`, cross-compile
   the Linux deploy binary from macOS, understand why `go test ./...` or
@@ -15,10 +15,10 @@ description: >
 
 # Broker build and development environment
 
-How to go from a bare machine to a built, tested `ollama-broker` binary, and
+How to go from a bare machine to a built, tested `resource-broker` binary, and
 the traps that bite people doing local development on this repo.
 
-Repo: `/Users/prestonbernstein/dev/ollama-resource-broker`, branch `v2-go`
+Repo: `/Users/prestonbernstein/dev/resource-broker`, branch `v2-go`
 (all v2 work lives here; `main` is stale). All facts below verified against
 HEAD `ad07905` on 2026-07-02 unless labeled otherwise.
 
@@ -58,8 +58,8 @@ Treat it as a change-control violation — see **broker-change-control**.
 ## 2. Clone, build, test
 
 ```sh
-git clone https://github.com/preston-bernstein/ollama-resource-broker.git
-cd ollama-resource-broker
+git clone https://github.com/preston-bernstein/resource-broker.git
+cd resource-broker
 git checkout v2-go
 make build
 ```
@@ -68,7 +68,7 @@ make build
 
 | Target | Runs | Notes |
 |---|---|---|
-| `make build` | `CGO_ENABLED=0 go build -o bin/ollama-broker ./cmd/broker` | Normal build path. Output: `bin/ollama-broker` (gitignored). |
+| `make build` | `CGO_ENABLED=0 go build -o bin/resource-broker ./cmd/broker` | Normal build path. Output: `bin/resource-broker` (gitignored). |
 | `make test` | `go test ./...` | **FAILS at HEAD** — see known break below. |
 | `make race` | `go test -race ./...` | Same known break applies (race builds the same test files). |
 | `make vet` | `go vet ./...` | **FAILS at HEAD** — same root cause. |
@@ -81,7 +81,7 @@ repo tree (e.g. sandboxed agent sessions), build to a temp dir instead of
 running `make build`:
 
 ```sh
-go build -o /tmp/ollama-broker ./cmd/broker
+go build -o /tmp/resource-broker ./cmd/broker
 ```
 
 ### Cross-compiling the deploy artifact (macOS -> Linux desktop)
@@ -90,7 +90,7 @@ This is how the desktop binary is produced from the Mac. Verified working
 2026-07-02; `file` confirms `ELF 64-bit LSB executable, x86-64 ... statically linked`:
 
 ```sh
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/ollama-broker-linux ./cmd/broker
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/resource-broker-linux ./cmd/broker
 ```
 
 No extra toolchain needed — this works **because** the module is CGO-free
@@ -172,7 +172,7 @@ The Broker listens on `:11435` (interactive), `:11436` (batch), `:11437`
 Raw Ollama's own port `11434` is the *upstream* — the Broker never binds it, so
 a locally running Ollama.app does not conflict. What does conflict: a second
 Broker instance, or anything else squatting on 11435-11438 — you get a bind
-error at startup. On the desktop itself the live `ollama-broker.service`
+error at startup. On the desktop itself the live `resource-broker.service`
 already holds all four ports (dated live fact, 2026-07-02).
 
 ## 4. Running locally
@@ -180,7 +180,7 @@ already holds all four ports (dated live fact, 2026-07-02).
 Minimal invocation (from README, verified 2026-07-02):
 
 ```sh
-OLLAMA_URL=http://127.0.0.1:11434 ./bin/ollama-broker
+OLLAMA_URL=http://127.0.0.1:11434 ./bin/resource-broker
 ```
 
 Behavior with **no Ollama running at all** (verified by live smoke run):
