@@ -29,10 +29,13 @@ type Backend interface {
 	// Reachable reports whether the upstream is reachable, for /healthz.
 	Reachable(ctx context.Context) error
 	// Unloader returns the yield.Unloader this backend uses to free upstream
-	// VRAM on a yield transition, or nil if the backend has no VRAM control
-	// (e.g. the openai backend — see plan.md's "Typed-nil safety" note: any
-	// implementation MUST return a direct, literal nil of this interface
-	// type, never a typed-nil concrete pointer boxed into it).
+	// VRAM on a yield transition. Some backends have no VRAM control and return
+	// nil; others (e.g. an openai-compatible backend with a configured management
+	// mechanism) may return a real implementation. See
+	// docs/adr/0014-vllm-yield-symmetric-stop-start.md for the "Typed-nil safety"
+	// requirement: any implementation that returns nil MUST return a direct,
+	// literal nil of this interface type, never a typed-nil concrete pointer
+	// boxed into it.
 	Unloader() yield.Unloader
 }
 

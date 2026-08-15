@@ -54,10 +54,22 @@ type Detector interface {
 	Detect() (reason string, contended bool)
 }
 
-// Unloader frees GPU memory on the upstream. Optional (may be nil).
+// Unloader frees GPU memory on the upstream and reloads it back. Optional
+// (may be nil).
 type Unloader interface {
 	Unload(ctx context.Context) error
+	Reload(ctx context.Context) error
 }
+
+// unloadReloadTimeout bounds how long doUnload/doReload will wait for the
+// Unloader call before giving up client-side. It is a give-up bound only:
+// cancelling exec.CommandContext when this timeout fires kills the local
+// client process, but does not cancel a systemd job already queued via
+// D-Bus on the upstream — that job runs to completion (or failure)
+// independently of whether our client gave up waiting on it. Callers of
+// Unloader should not treat this timeout as proof the underlying
+// unload/reload actually stopped.
+const unloadReloadTimeout = 30 * time.Second
 
 // GPUManager is an optional external GPU consumer (e.g. Tdarr) that the broker
 // pauses when gaming/Plex takes the GPU and resumes when contention clears.
@@ -89,6 +101,29 @@ type Controller struct {
 	// serving resumes.
 	serveCtx    context.Context
 	serveCancel context.CancelFunc
+
+	// actionDone, when non-nil, is closed once the most recently spawned
+	// doUnload/doReload goroutine has finished its Unload/Reload call. Each
+	// new spawn (in applyLocked, via startAction) captures the current value
+	// as its own predecessor-wait channel before replacing it with a fresh
+	// one. This is read and written only while holding mu (both here in
+	// startAction and by applyLocked's caller), so there is no race on the
+	// field itself.
+	//
+	// It exists to fix a real ordering gap: systemdUnitController's own
+	// mutex only prevents Unload and Reload from *overlapping* on the same
+	// instance — it does not guarantee they run in the order the yield/clear
+	// transitions happened, because `go c.doUnload()` and a later
+	// `go c.doReload()` are independent goroutine spawns with no ordering
+	// relationship between when they actually start executing. Under a fast
+	// contention flap (yield then clear before the first systemctl call has
+	// even been scheduled), the Go scheduler could let the second goroutine
+	// acquire systemdUnitController's mutex first, running `systemctl start`
+	// before `systemctl stop` — leaving the unit stopped even though the
+	// controller's effective state is "not yielding". Chaining each action
+	// on its predecessor's completion (see startAction, doUnload, doReload)
+	// removes that race without making applyLocked itself block.
+	actionDone chan struct{}
 }
 
 // New returns a Controller in ModeAuto, not yielding, that acts on the first
@@ -220,7 +255,7 @@ func (c *Controller) applyLocked() (event, reason string) {
 	if eff {
 		c.serveCancel() // abort in-flight inference
 		if c.unloader != nil {
-			go c.doUnload()
+			go c.doUnload(c.startAction())
 		}
 		if mgr != nil {
 			go c.pauseGPUMgr(mgr)
@@ -228,10 +263,27 @@ func (c *Controller) applyLocked() (event, reason string) {
 		return "start", r
 	}
 	c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
+	if c.unloader != nil {
+		go c.doReload(c.startAction())
+	}
 	if mgr != nil {
 		go c.resumeGPUMgr(mgr)
 	}
 	return "stop", ""
+}
+
+// startAction records a new pending unload/reload action and hands back the
+// two channels doUnload/doReload need: wait (the previous action's done
+// channel, nil if this is the first action ever) and done (this action's own
+// completion channel, which the caller must close when finished). Must only
+// be called from applyLocked, while c.mu is held, so the handoff chain it
+// builds matches applyLocked's own call order exactly — see actionDone's doc
+// comment for why this ordering matters.
+func (c *Controller) startAction() (wait <-chan struct{}, done chan struct{}) {
+	wait = c.actionDone
+	done = make(chan struct{})
+	c.actionDone = done
+	return wait, done
 }
 
 // logTransition logs at WARN, not INFO: this is the single most
@@ -257,18 +309,50 @@ func logTransition(event, reason string) {
 // "Typed-nil safety" note) invoking Unload on a nil receiver. The recover
 // here is cheap defense-in-depth against exactly that unrecovered-goroutine
 // panic path.
-func (c *Controller) doUnload() {
+//
+// wait/done chain this action to its neighbors (see actionDone's doc
+// comment and startAction): doUnload waits for the previous action to
+// finish before calling Unload, and always closes done on the way out
+// (even on panic/recover) so the next action isn't stuck waiting forever.
+func (c *Controller) doUnload(wait <-chan struct{}, done chan struct{}) {
+	defer close(done)
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("panic in vram unload", "recover", r)
 		}
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if wait != nil {
+		<-wait
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), unloadReloadTimeout)
 	defer cancel()
 	if err := c.unloader.Unload(ctx); err != nil {
 		slog.Warn("vram unload failed", "err", err)
 	} else {
 		slog.Info("vram unload requested")
+	}
+}
+
+// doReload runs in its own goroutine (see applyLocked), so a panic here
+// would otherwise crash the whole broker process — see doUnload's comment
+// for the typed-nil Unloader hazard this guards against and for what
+// wait/done do.
+func (c *Controller) doReload(wait <-chan struct{}, done chan struct{}) {
+	defer close(done)
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in vram reload", "recover", r)
+		}
+	}()
+	if wait != nil {
+		<-wait
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), unloadReloadTimeout)
+	defer cancel()
+	if err := c.unloader.Reload(ctx); err != nil {
+		slog.Warn("vram reload failed", "err", err)
+	} else {
+		slog.Info("vram reload requested")
 	}
 }
 

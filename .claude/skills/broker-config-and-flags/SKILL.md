@@ -57,6 +57,7 @@ Parsers (see section 2 for their gotchas):
 |---|---|---|---|---|---|---|
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | URL (scheme+host required) | `proxy.New` (reverse proxy) and `ollama.New` (upstream client: Generate, Unload) in `main.go` | Upstream real Ollama base URL | Production | — (default) |
 | `INFINITY_URL` | unset (`nil`) | URL, optional; empty ⇒ `InfinityURL == nil` | `main.go`: if nil the embed lane is **not started at all** — no listener on `EmbedAddr`; else `proxy.NewEmbed` | Upstream Infinity SigLIP image-embedding server (ADR-0008) | Production | `http://127.0.0.1:7997` (line duplicated in live unit — harmless, systemd last-wins) |
+| `UPSTREAM_UNIT_NAME` | `""` (disabled) | getenv+`strings.TrimSpace` | `newOpenAIBackend` (`internal/backend/openai_backend.go`) | Systemd unit name to `systemctl stop` on yield-start and `systemctl start` on yield-clear; empty disables Unloader (see ADR-0014) | Production (added ADR-0014) | — |
 | `BROKER_INTERACTIVE_ADDR` | `:11435` | getenv | `main.go` interactive server (`sched.Gate(queue.Interactive, ...)`) | Listen address, high-priority class | Production | — |
 | `BROKER_BATCH_ADDR` | `:11436` | getenv | `main.go` batch server (`sched.Gate(queue.Batch, ...)`) | Listen address, low-priority class | Production | — |
 | `BROKER_CONTROL_ADDR` | `:11437` | getenv | `main.go` control-plane server (`admin.Mux`: `/control`, `/status`, `/metrics`, `/healthz`, `/jobs`) | Listen address, admin/control plane + Job API | Production | — |
