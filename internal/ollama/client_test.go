@@ -64,3 +64,17 @@ func TestUnloadNoModels(t *testing.T) {
 		t.Fatalf("Unload with no models: %v", err)
 	}
 }
+
+func TestReload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reload should make no HTTP calls; if this handler is invoked, the test fails
+		t.Errorf("Reload made unexpected HTTP request: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL)
+	if err := New(base).Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+}

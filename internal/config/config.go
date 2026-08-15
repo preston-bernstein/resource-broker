@@ -35,6 +35,10 @@ type Config struct {
 	// compatible upstream (sent as "Authorization: Bearer <value>"; empty
 	// means no Authorization header is sent). Never log this value raw.
 	UpstreamAPIKey string
+	// UpstreamUnitName is the systemd unit name to stop/start on yield-start/
+	// yield-clear when set. Used only by the openai backend. Empty, unset, or
+	// whitespace-only (trimmed to "") disables the Unloader entirely.
+	UpstreamUnitName string
 	// InfinityURL is the upstream Infinity image-embedding base URL. Empty
 	// disables the embed lane entirely.
 	InfinityURL *url.URL
@@ -260,6 +264,7 @@ func Load() (*Config, error) {
 		OllamaURL:         ollamaURL,
 		UpstreamURL:       upstreamURL,
 		UpstreamAPIKey:    upstreamAPIKey,
+		UpstreamUnitName:  strings.TrimSpace(getenv("UPSTREAM_UNIT_NAME", "")),
 		InfinityURL:       infinityURL,
 		InteractiveWait:   iw,
 		BatchWait:         bw,
