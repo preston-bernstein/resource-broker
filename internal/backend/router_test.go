@@ -11,7 +11,9 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
@@ -439,5 +441,257 @@ func TestRouterUnloaderReturnsTrueNil(t *testing.T) {
 	r := NewRouter(&genBackend{name: "default"})
 	if r.Unloader() != nil {
 		t.Fatal("Router.Unloader() != nil, want a true nil (typed-nil safety violation)")
+	}
+}
+
+// --- AC7: idle-Yield race, exercised through the REAL Router + Controller +
+// activityBackend chain (docs/vllm-idle-unload/requirements.md AC7/FR11/FR12) ---
+
+// raceTestDetector is a yield.Detector whose contention flag the test flips
+// at runtime, driving ctrl.Run's real poll loop through a genuine
+// Contention-start / Contention-clear transition — the second event source
+// AC7 requires alongside Idle's own poll-driven fire, so the sequencing is
+// produced by the real machinery (refresh -> applyLocked -> checkIdleLocked)
+// rather than asserted about in isolation.
+type raceTestDetector struct {
+	mu        sync.Mutex
+	contended bool
+}
+
+func (d *raceTestDetector) setContended(v bool) {
+	d.mu.Lock()
+	d.contended = v
+	d.mu.Unlock()
+}
+
+func (d *raceTestDetector) Detect() (string, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.contended {
+		return "gaming-steam", true
+	}
+	return "", false
+}
+
+// orderedIdleUnloader is this package's counterpart to
+// internal/yield/yield_test.go's orderedUnloader: it records each
+// Unload/Reload call, in the order actually invoked, and lets EVERY Unload
+// call block on release until the test closes it — reproducing the exact
+// "idle-triggered Unload still in flight when Contention begins" race AC7
+// describes. Once release is closed, every subsequent receive on it returns
+// immediately (closed-channel semantics), so a later, chained Unload call
+// (Contention's own idempotent second call) proceeds without blocking again.
+type orderedIdleUnloader struct {
+	mu      sync.Mutex
+	order   []string
+	release chan struct{}
+}
+
+func (o *orderedIdleUnloader) Unload(context.Context) error {
+	o.mu.Lock()
+	o.order = append(o.order, "unload")
+	o.mu.Unlock()
+	<-o.release
+	return nil
+}
+
+func (o *orderedIdleUnloader) Reload(context.Context) error {
+	o.mu.Lock()
+	o.order = append(o.order, "reload")
+	o.mu.Unlock()
+	return nil
+}
+
+func (o *orderedIdleUnloader) snapshot() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.order...)
+}
+
+func (o *orderedIdleUnloader) orderLen() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.order)
+}
+
+// waitUntil polls cond, matching internal/yield/yield_test.go's eventually
+// helper (unavailable here — different package), used by the AC7 test below
+// so it doesn't have to guess a fixed sleep for the real poll loop to act.
+func waitUntil(t *testing.T, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+// TestRouterIdleThenContentionUnloadOrderingIsNeverConflicting is the AC7
+// integration test: it drives a request through the REAL Router ->
+// *activityBackend (backend.WithActivityTracking) -> *yield.Controller
+// chain — the same composition cmd/broker/main.go's buildBroker wires up
+// (see cmd/broker/main_test.go's TestBuildBrokerWiresActivityTrackingIntoRouter
+// for the construction-order proof this test builds on) — lets the
+// instance's short idle duration elapse so checkIdleLocked fires a real
+// idle-triggered Unload via the controller's own poll loop (never a direct
+// unit-test call into unexported yield internals, which this package cannot
+// reach anyway), then triggers a genuine gaming/Plex Contention transition
+// on that SAME instance while the idle-triggered Unload is still blocked in
+// flight.
+//
+// This reproduces plan.md's Architecture "case 2" exactly: Idle already
+// fired in an earlier tick; Contention begins later and its own
+// unconditional per-instance unload loop (applyLocked) fires Unload again,
+// idempotently, on the already-idle-unloaded instance. FR11/AC7 explicitly
+// carve this out as an ACCEPTABLE, non-conflicting outcome — this test
+// asserts exactly that shape is what happens (order == [unload, unload,
+// reload]) and treats it as a PASS, while still failing hard on the one
+// thing AC7 actually forbids: a Reload racing ahead of, or interleaved with,
+// either Unload (a genuinely conflicting/out-of-order pair).
+func TestRouterIdleThenContentionUnloadOrderingIsNeverConflicting(t *testing.T) {
+	det := &raceTestDetector{}
+	u := &orderedIdleUnloader{release: make(chan struct{})}
+
+	// Short poll interval and idle timeout so the real poll loop (not a
+	// direct internal call) fires idle-unload within the test's time budget.
+	const pollInterval = 5 * time.Millisecond
+	const idleTimeout = 20 * time.Millisecond
+
+	ctrl := yield.NewWithConfirmMulti(det, []yield.Unloader{u}, []string{"vllm-route"}, pollInterval, 1)
+	ctrl.ConfigureIdle([]time.Duration{idleTimeout})
+
+	raw := &fakeBackend{
+		name: "vllm",
+		handler: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		},
+	}
+	tracked := WithActivityTracking(raw, ctrl, 0)
+
+	def := &fakeBackend{
+		name: "default",
+		handler: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		},
+	}
+	r := NewRouter(def)
+	r.AddRoute("vllm-model", "", tracked)
+
+	// Dispatch a real request through the Router BEFORE starting ctrl.Run,
+	// so lastDispatch reflects real routed traffic via TrackActivity before
+	// the poll loop starts — this test's actual race setup begins from a
+	// known, freshly-dispatched baseline rather than construction time.
+	// (Controller construction itself initializes lastDispatch to "now",
+	// not the atomic.Int64 zero-value/Unix epoch — see
+	// TestNewControllerInitializesLastDispatchToNow in internal/yield — so
+	// this dispatch is about test-setup precision, not working around a
+	// bogus multi-decade "elapsed" on the first poll tick.)
+	req := newTestRequest(t, `{"model":"vllm-model"}`)
+	w := httptest.NewRecorder()
+	r.ProxyForLane("interactive").ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("initial dispatch status = %d, want 200", w.Code)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ctrl.Run(ctx)
+
+	// Wait for the real poll loop to idle-fire: exactly one Unload call,
+	// currently blocked in flight (release not yet closed).
+	if !waitUntil(t, func() bool { return u.orderLen() == 1 }) {
+		t.Fatal("checkIdleLocked never fired an idle-triggered Unload through the real Router+Controller+activityBackend wiring")
+	}
+
+	// Trigger a genuine gaming/Plex Contention transition on the SAME
+	// instance while the idle-triggered Unload is still in flight.
+	det.setContended(true)
+
+	// Give the real poll loop every chance to spawn Contention's own
+	// doUnload goroutine for this instance. actionDone's per-instance
+	// ordering chain (ADR-0014, extended to Idle in this feature) must
+	// prevent it from actually invoking Unload again until the still-
+	// in-flight idle-triggered call finishes — this is the core ordering
+	// guarantee AC7 exists to prove, not an incidental side effect.
+	time.Sleep(50 * time.Millisecond)
+	if got := u.orderLen(); got != 1 {
+		t.Fatalf("a second Unload call ran before the idle-triggered Unload finished: order = %v, want [unload] (actionDone ordering violated)", u.snapshot())
+	}
+
+	// Release the idle-triggered Unload. Contention's chained second Unload
+	// call (queued behind it via actionDone) can now proceed.
+	close(u.release)
+
+	// Contention's own unconditional per-instance unload loop fires a
+	// second, strictly-ordered Unload call on this already-idle-unloaded
+	// instance. Per FR11/AC7, this is an ACCEPTABLE idempotent outcome —
+	// asserting it here is the PASS case, not a failure.
+	if !waitUntil(t, func() bool { return u.orderLen() == 2 }) {
+		t.Fatal("Contention's own unload never fired for the idle-unloaded instance")
+	}
+	if y, reason := ctrl.Yielding(); !y {
+		t.Fatalf("Yielding() = (%v,%q), want yielding=true once Contention is active", y, reason)
+	}
+
+	// Clear Contention: the instance should now Reload, strictly after both
+	// prior Unload calls.
+	det.setContended(false)
+	if !waitUntil(t, func() bool { return u.orderLen() == 3 }) {
+		t.Fatal("Contention-clear never fired a Reload for the instance")
+	}
+
+	got := u.snapshot()
+	want := []string{"unload", "unload", "reload"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("action order = %v, want %v — anything else (a Reload racing ahead of either Unload, or any other interleaving) would be the genuinely conflicting/out-of-order pair FR11/AC7 forbids; a second, later, strictly-ordered Unload (as seen here) is the documented, acceptable idempotent carve-out", got, want)
+	}
+}
+
+// TestRouterRoutingSummaryDoesNotPanicWithActivityTrackedBackend guards the
+// comparability fix documented on WithActivityTracking (see activity.go):
+// activityBackend must be returned as a pointer, never a bare value, because
+// its proxy field holds an uncomparable closure — a bare value would panic
+// with "comparing uncomparable type" the instant two model names shared the
+// same decorated backend, which is exactly what RoutingSummary's map-key
+// grouping does. TestWithActivityTrackingIsUsableAsMapKey (activity_test.go)
+// proves the underlying comparability fact directly; this test proves it
+// through Router.RoutingSummary(), the real production call site (/status's
+// "routing" key) that would actually panic if the fix ever regressed.
+func TestRouterRoutingSummaryDoesNotPanicWithActivityTrackedBackend(t *testing.T) {
+	det := &raceTestDetector{}
+	u := &orderedIdleUnloader{release: make(chan struct{})}
+	close(u.release) // this test never drives an Unload/Reload call; avoid any accidental block
+
+	ctrl := yield.NewWithConfirmMulti(det, []yield.Unloader{u}, []string{"vllm-route"}, time.Hour, 1)
+	ctrl.ConfigureIdle([]time.Duration{5 * time.Minute})
+
+	raw := &fakeBackend{name: "vllm", handler: func(w http.ResponseWriter, r *http.Request) {}}
+	tracked := WithActivityTracking(raw, ctrl, 0)
+
+	def := &fakeBackend{name: "default", handler: func(w http.ResponseWriter, r *http.Request) {}}
+	r := NewRouter(def)
+	r.AddRoute("model-a", "interactive", tracked)
+	r.AddRoute("model-b", "interactive", tracked) // same *activityBackend-decorated backend
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("RoutingSummary() panicked with an activity-tracked backend shared by two models: %v", rec)
+		}
+	}()
+	got := r.RoutingSummary()
+	summaries, ok := got.([]RouteSummary)
+	if !ok {
+		t.Fatalf("RoutingSummary() returned %T, want []RouteSummary", got)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("RoutingSummary() returned %d entries, want 1 (model-a/model-b grouped under the same activity-tracked backend); got %+v", len(summaries), summaries)
+	}
+	wantModels := []string{"model-a", "model-b"}
+	sort.Strings(summaries[0].Models)
+	if !reflect.DeepEqual(summaries[0].Models, wantModels) {
+		t.Fatalf("grouped entry models = %v, want %v", summaries[0].Models, wantModels)
 	}
 }
