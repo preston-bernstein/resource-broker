@@ -41,6 +41,7 @@ Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Upstream Ollama. Required/validated only when `UPSTREAM_BACKEND=ollama` |
 | `UPSTREAM_URL` | _(unset)_ | Upstream OpenAI-compatible server base URL (e.g. a vLLM instance). Required when `UPSTREAM_BACKEND=openai` |
 | `UPSTREAM_API_KEY` | _(unset)_ | Bearer token sent to the OpenAI-compatible upstream, if it requires auth. Ignored when `UPSTREAM_BACKEND=ollama`. Never logged |
+| `UPSTREAM_UNIT_NAME` | _(unset)_ | Systemd unit name to `systemctl stop` on yield-start and `systemctl start` on yield-clear (openai backend only). Unset/empty (or whitespace-only) disables the Unloader entirely — the pre-existing no-op behavior |
 | `INFINITY_URL` | _(unset)_ | Upstream Infinity image-embedding server. Unset disables the embed lane (ADR-0008) |
 | `BROKER_INTERACTIVE_ADDR` | `:11435` | Interactive (high-priority) port |
 | `BROKER_BATCH_ADDR` | `:11436` | Batch (low-priority) port |

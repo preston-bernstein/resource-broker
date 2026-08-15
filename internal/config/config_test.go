@@ -492,3 +492,38 @@ func TestParkHoldBatchWaitBudget(t *testing.T) {
 			cfg.ParkHold, cfg.BatchWait, budget)
 	}
 }
+
+// --- Upstream unit name (UPSTREAM_UNIT_NAME) ---
+
+// TestLoadUpstreamUnitName covers three cases for UPSTREAM_UNIT_NAME: unset
+// (empty), whitespace-only (trimmed to empty), and set with surrounding
+// whitespace (trimmed to the value). TrimSpace is applied to all values.
+func TestLoadUpstreamUnitName(t *testing.T) {
+	for name, env := range map[string]string{
+		"unset":            "",
+		"whitespace-only":  "   ",
+		"with-surrounding": "  vllm  ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+			t.Setenv("UPSTREAM_UNIT_NAME", env)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+
+			var want string
+			switch name {
+			case "unset", "whitespace-only":
+				want = ""
+			case "with-surrounding":
+				want = "vllm"
+			}
+
+			if cfg.UpstreamUnitName != want {
+				t.Errorf("UpstreamUnitName = %q, want %q (input: %q)", cfg.UpstreamUnitName, want, env)
+			}
+		})
+	}
+}
