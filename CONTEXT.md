@@ -18,6 +18,14 @@ _Avoid_: Load, Pressure, Busy
 The state the whole Broker enters in response to Contention: it stops admitting any inference work, so gaming or Plex gets 100% of the GPU. The opposite of Yield is serving the queue — running inference normally.
 _Avoid_: Throttle, Pause, Preempt (Preempt is the act on one request; Yield is the whole-Broker state)
 
+**Idle**:
+The condition of one configured backend instance (the default backend, or one `BROKER_ROUTE_<N>` instance) having received no Synchronous request dispatched to it for at least that instance's own configured idle duration. Idle is per-instance traffic history, not a Broker-wide state — it says nothing about any other instance and nothing about whether gaming/Plex Contention is present. Don't confuse it with Yield: Yield is the whole-Broker response to Contention; Idle is one instance quietly going unused.
+_Avoid_: Yield (Yield is whole-Broker and Contention-driven; Idle is per-instance and traffic-driven), Sleep, Suspend
+
+**Idle-unload**:
+The act of freeing an Idle instance's VRAM — and the symmetric act of bringing it back on its next request — driven through the exact same `systemctl stop`/`start` `yield.Unloader` mechanism Contention-triggered Yield already uses for that instance. Idle-unload is a second, independent event source feeding the same per-instance `yield.Controller` action chain Contention drives; it is not a new state, a new controller, or a new unload mechanism, and it never overrides or delays Contention's own response.
+_Avoid_: Yield-unload (there is no such state — Yield and Idle are separate triggers into one mechanism), Unload (alone; too generic — Unload is the general `systemctl stop` mechanism itself, Idle-unload is one specific trigger for it, Contention is the other)
+
 **Preemption**:
 Interrupting a request that is already running so a higher-priority one can get the GPU instead. Two things trigger it: gaming/Plex Contention preempts all inference; an interactive request preempts a running batch request. A preempted request gets a `503` response, and its caller must retry it (a batch request goes to PENDING to be retried later). Priority order, highest first: gaming/Plex, then interactive, then batch.
 _Avoid_: Kill, Cancel

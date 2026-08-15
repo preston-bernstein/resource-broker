@@ -212,7 +212,7 @@ func newRig(t *testing.T, cfg *config.Config) *rig {
 
 	interactive := httptest.NewServer(sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, interactiveProxy))
 	batchSrv := httptest.NewServer(sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, batchProxy))
-	control := httptest.NewServer(admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), func() any { return jobCounts() }, nil, routingStatus, cfg.ControlToken))
+	control := httptest.NewServer(admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), func() any { return jobCounts() }, nil, routingStatus, nil, cfg.ControlToken))
 
 	// Optional image-embedding lane, wired only when cfg.InfinityURL is set
 	// (AC-12): mirrors cmd/broker/main.go's own "if cfg.InfinityURL != nil"

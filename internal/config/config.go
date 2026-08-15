@@ -35,6 +35,12 @@ type RouteBackend struct {
 	// clear for this instance only. Empty disables the Unloader for this
 	// instance, the same precedent as Config.UpstreamUnitName.
 	UnitName string
+	// IdleTimeout is how long this instance may sit idle before its systemd
+	// unit is stopped to free resources. Zero (unset or explicitly "0")
+	// disables idle-unload for this instance. Requires UnitName to be set —
+	// Load() rejects a nonzero value with an empty UnitName, the same
+	// precedent as Config.UpstreamIdleTimeout.
+	IdleTimeout time.Duration
 	// Lane optionally scopes this rule to a single lane: "interactive" or
 	// "batch". Empty (the default) means the rule applies to both lanes.
 	Lane string
@@ -68,6 +74,12 @@ type Config struct {
 	// yield-clear when set. Used only by the openai backend. Empty, unset, or
 	// whitespace-only (trimmed to "") disables the Unloader entirely.
 	UpstreamUnitName string
+	// UpstreamIdleTimeout is how long the default backend may sit idle
+	// before its systemd unit is stopped to free GPU/resources. Zero (unset
+	// or explicitly "0") disables idle-unload entirely. Requires
+	// UpstreamUnitName to be set — Load() rejects a nonzero value with an
+	// empty UpstreamUnitName.
+	UpstreamIdleTimeout time.Duration
 	// Routes holds per-model routing rules parsed from the indexed
 	// BROKER_ROUTE_<N>_* env vars (N = 1..32). A request for a model listed
 	// in a RouteBackend.Models is proxied to that instance instead of the
@@ -205,6 +217,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("UPSTREAM_API_KEY must not contain control characters")
 	}
 
+	// UPSTREAM_UNIT_NAME is read once, here, into a local var reused both by
+	// the cross-instance unit-name dedup logic below and the final Config
+	// field — there must be exactly one place this env var is read from.
+	unitName := strings.TrimSpace(getenv("UPSTREAM_UNIT_NAME", ""))
+
 	// INFINITY_URL is optional; when set it must be a valid absolute URL. Empty
 	// leaves InfinityURL nil and the embed lane is not started.
 	var infinityURL *url.URL
@@ -231,6 +248,16 @@ func Load() (*Config, error) {
 	di, err := getdur("BROKER_DETECT_INTERVAL", 3*time.Second)
 	if err != nil {
 		return nil, err
+	}
+	uit, err := getdur("UPSTREAM_IDLE_TIMEOUT", 0)
+	if err != nil {
+		return nil, err
+	}
+	if uit < 0 {
+		return nil, fmt.Errorf("UPSTREAM_IDLE_TIMEOUT must not be negative, got %v", uit)
+	}
+	if uit != 0 && unitName == "" {
+		return nil, fmt.Errorf("UPSTREAM_IDLE_TIMEOUT is set but UPSTREAM_UNIT_NAME is empty; idle-unload requires a unit name")
 	}
 	ycp, err := getint("BROKER_YIELD_CONFIRM_POLLS", 2)
 	if err != nil {
@@ -319,8 +346,8 @@ func Load() (*Config, error) {
 		if defaultURL != nil {
 			seenURLs[defaultURL.String()] = "the default backend"
 		}
-		if defaultUnitName := strings.TrimSpace(getenv("UPSTREAM_UNIT_NAME", "")); defaultUnitName != "" {
-			seenUnitNames[defaultUnitName] = "the default backend"
+		if unitName != "" {
+			seenUnitNames[unitName] = "the default backend"
 		}
 
 		for i := 1; i <= highestRoute; i++ {
@@ -382,56 +409,69 @@ func Load() (*Config, error) {
 				seenUnitNames[routeUnitName] = source
 			}
 
+			routeIdleTimeout, err := getdur(prefix+"IDLE_TIMEOUT", 0)
+			if err != nil {
+				return nil, err
+			}
+			if routeIdleTimeout < 0 {
+				return nil, fmt.Errorf("%sIDLE_TIMEOUT must not be negative, got %v", prefix, routeIdleTimeout)
+			}
+			if routeIdleTimeout != 0 && routeUnitName == "" {
+				return nil, fmt.Errorf("%sIDLE_TIMEOUT is set but %sUNIT_NAME is empty; idle-unload requires a unit name", prefix, prefix)
+			}
+
 			lane := getenv(prefix+"LANE", "")
 			if lane != "" && lane != "interactive" && lane != "batch" {
 				return nil, fmt.Errorf("%sLANE %q must be one of: \"\", interactive, batch", prefix, lane)
 			}
 
 			routes = append(routes, RouteBackend{
-				Models:   models,
-				Backend:  routeBackend,
-				URL:      routeURL,
-				APIKey:   routeAPIKey,
-				UnitName: routeUnitName,
-				Lane:     lane,
+				Models:      models,
+				Backend:     routeBackend,
+				URL:         routeURL,
+				APIKey:      routeAPIKey,
+				UnitName:    routeUnitName,
+				IdleTimeout: routeIdleTimeout,
+				Lane:        lane,
 			})
 		}
 	}
 
 	return &Config{
-		InteractiveAddr:   getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
-		BatchAddr:         getenv("BROKER_BATCH_ADDR", ":11436"),
-		EmbedAddr:         getenv("BROKER_EMBED_ADDR", ":11438"),
-		EmbedTimeout:      et,
-		UpstreamBackend:   backend,
-		OllamaURL:         ollamaURL,
-		UpstreamURL:       upstreamURL,
-		UpstreamAPIKey:    upstreamAPIKey,
-		UpstreamUnitName:  strings.TrimSpace(getenv("UPSTREAM_UNIT_NAME", "")),
-		Routes:            routes,
-		InfinityURL:       infinityURL,
-		InteractiveWait:   iw,
-		BatchWait:         bw,
-		ControlAddr:       getenv("BROKER_CONTROL_ADDR", ":11437"),
-		ControlToken:      getenv("BROKER_CONTROL_TOKEN", ""),
-		DetectInterval:    di,
-		YieldConfirmPolls: ycp,
-		PlexURL:           getenv("PLEX_URL", "http://localhost:32400"),
-		PlexToken:         getenv("PLEX_TOKEN", ""),
-		MaxWaiters:        mw,
-		MaxInflight:       mi,
-		BatchQuantum:      bq,
-		JobDBPath:         getenv("BROKER_JOB_DB", "broker-jobs.db"),
-		JobMaxAttempts:    jma,
-		JobPruneInterval:  jpi,
-		JobFetchedGrace:   jfg,
-		JobHardCap:        jhc,
-		TdarrURL:          getenv("BROKER_TDARR_URL", ""),
-		TdarrNodeID:       getenv("BROKER_TDARR_NODE_ID", ""),
-		TdarrGPUWorkers:   tgw,
-		ParkHold:          ph,
-		ParkMaxQueue:      pmq,
-		ParkDrainBurst:    pdb,
+		InteractiveAddr:     getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
+		BatchAddr:           getenv("BROKER_BATCH_ADDR", ":11436"),
+		EmbedAddr:           getenv("BROKER_EMBED_ADDR", ":11438"),
+		EmbedTimeout:        et,
+		UpstreamBackend:     backend,
+		OllamaURL:           ollamaURL,
+		UpstreamURL:         upstreamURL,
+		UpstreamAPIKey:      upstreamAPIKey,
+		UpstreamUnitName:    unitName,
+		UpstreamIdleTimeout: uit,
+		Routes:              routes,
+		InfinityURL:         infinityURL,
+		InteractiveWait:     iw,
+		BatchWait:           bw,
+		ControlAddr:         getenv("BROKER_CONTROL_ADDR", ":11437"),
+		ControlToken:        getenv("BROKER_CONTROL_TOKEN", ""),
+		DetectInterval:      di,
+		YieldConfirmPolls:   ycp,
+		PlexURL:             getenv("PLEX_URL", "http://localhost:32400"),
+		PlexToken:           getenv("PLEX_TOKEN", ""),
+		MaxWaiters:          mw,
+		MaxInflight:         mi,
+		BatchQuantum:        bq,
+		JobDBPath:           getenv("BROKER_JOB_DB", "broker-jobs.db"),
+		JobMaxAttempts:      jma,
+		JobPruneInterval:    jpi,
+		JobFetchedGrace:     jfg,
+		JobHardCap:          jhc,
+		TdarrURL:            getenv("BROKER_TDARR_URL", ""),
+		TdarrNodeID:         getenv("BROKER_TDARR_NODE_ID", ""),
+		TdarrGPUWorkers:     tgw,
+		ParkHold:            ph,
+		ParkMaxQueue:        pmq,
+		ParkDrainBurst:      pdb,
 	}, nil
 }
 

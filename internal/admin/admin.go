@@ -52,9 +52,11 @@ type TdarrStatusFn func() *TdarrStatus
 // routingStatus, if non-nil, contributes a "routing" section (per-model
 // backend routing, docs/adr/0015-per-model-backend-routing.md) — nil (the
 // default, when no BROKER_ROUTE_<N>_* config is set) omits the key entirely,
-// preserving /status's pre-feature shape byte-for-byte. health, if non-nil,
-// backs /healthz with a real readiness check (ADR-0010); nil preserves the
-// old always-200 behavior (used by tests that don't care).
+// preserving /status's pre-feature shape byte-for-byte; idleStatus, if non-nil,
+// contributes an "idle" section (idle-unload state per yield.Controller) — nil
+// (the default, when no idle timeouts are configured) omits the key entirely.
+// health, if non-nil, backs /healthz with a real readiness check (ADR-0010);
+// nil preserves the old always-200 behavior (used by tests that don't care).
 //
 // controlToken gates POST /control (ADR-0005): GET /metrics, /healthz,
 // /status, and GET /control stay open to any LAN caller (Grafana must scrape
@@ -63,7 +65,7 @@ type TdarrStatusFn func() *TdarrStatus
 // a matching "Authorization: Bearer <token>" header; if controlToken is
 // empty, mutations are accepted only from a loopback remote address. Either
 // way, an unauthorized POST /control gets 401.
-func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn, routingStatus func() any, controlToken string) http.Handler {
+func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn, routingStatus func() any, idleStatus func() any, controlToken string) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +151,9 @@ func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandle
 		}
 		if routingStatus != nil {
 			out["routing"] = routingStatus()
+		}
+		if idleStatus != nil {
+			out["idle"] = idleStatus()
 		}
 		httpx.WriteJSON(w, http.StatusOK, out)
 	})

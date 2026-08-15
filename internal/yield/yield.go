@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,6 +74,20 @@ type Unloader interface {
 // unload/reload actually stopped.
 const unloadReloadTimeout = 30 * time.Second
 
+// unloadTrigger identifies what caused a doUnload/doReload call, so its log
+// line tells an operator whether GPU contention (yield) or a per-instance
+// idle timeout (idle) drove the action.
+type unloadTrigger string
+
+const (
+	// triggerYield is a gaming/Plex contention transition, driven by
+	// applyLocked.
+	triggerYield unloadTrigger = "yield"
+	// triggerIdle is a per-instance idle-unload timeout, driven by
+	// checkIdleLocked.
+	triggerIdle unloadTrigger = "idle"
+)
+
 // GPUManager is an optional external GPU consumer (e.g. Tdarr) that the broker
 // pauses when gaming/Plex takes the GPU and resumes when contention clears.
 // Priority: gaming/Plex > Ollama inference > GPUManager background work.
@@ -131,6 +147,28 @@ type Controller struct {
 	// each unloaders[i] gets its own fully independent ADR-0014 ordering
 	// guarantee.
 	actionDone []chan struct{}
+
+	// idleTimeouts[i], lastDispatch[i], inFlight[i], and idleUnloaded[i] are
+	// index-aligned with c.unloaders/c.labels (the post-nil-filter index
+	// space). They are populated by ConfigureIdle; idleTimeouts, lastDispatch,
+	// and idleUnloaded are read/written by checkIdleLocked. inFlight and the
+	// remaining dedup/wake behavior (TrackActivity, IdleSummary) are later
+	// tasks.
+	idleTimeouts []time.Duration
+	lastDispatch []atomic.Int64
+	inFlight     []atomic.Int32
+	idleUnloaded []atomic.Bool
+
+	// origToFiltered maps an ORIG (pre-nil-filter, caller-facing) unloaders
+	// index to its position in the POST-FILTER c.unloaders/c.labels slices,
+	// or -1 if unloaders[i] was nil and got filtered out. Sized to
+	// len(unloaders) as originally passed into NewWithConfirmMulti, before
+	// filtering — orig-index 0 is the default backend, 1..N are route
+	// unloaders, matching cmd/broker/main.go's
+	// `append([]yield.Unloader{be.Unloader()}, routeUnloaders...)` numbering.
+	// Built once, in NewWithConfirmMulti's filter loop; read-only afterward,
+	// so it is safe to read without holding c.mu. See ConfigureIdle.
+	origToFiltered []int
 }
 
 // New returns a Controller in ModeAuto, not yielding, that acts on the first
@@ -207,8 +245,11 @@ func NewWithConfirmMulti(det Detector, unloaders []Unloader, labels []string, in
 
 	var filteredUnloaders []Unloader
 	var filteredLabels []string
+	origToFiltered := make([]int, len(unloaders))
+	postCount := 0
 	for i, u := range unloaders {
 		if u == nil {
+			origToFiltered[i] = -1
 			continue
 		}
 		label := ""
@@ -220,19 +261,140 @@ func NewWithConfirmMulti(det Detector, unloaders []Unloader, labels []string, in
 		}
 		filteredUnloaders = append(filteredUnloaders, u)
 		filteredLabels = append(filteredLabels, label)
+		origToFiltered[i] = postCount
+		postCount++
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Controller{
-		det:          det,
-		unloaders:    filteredUnloaders,
-		labels:       filteredLabels,
-		interval:     interval,
-		confirmPolls: confirmPolls,
-		serveCtx:     ctx,
-		serveCancel:  cancel,
-		actionDone:   make([]chan struct{}, len(filteredUnloaders)),
+	c := &Controller{
+		det:            det,
+		unloaders:      filteredUnloaders,
+		labels:         filteredLabels,
+		interval:       interval,
+		confirmPolls:   confirmPolls,
+		serveCtx:       ctx,
+		serveCancel:    cancel,
+		actionDone:     make([]chan struct{}, len(filteredUnloaders)),
+		idleTimeouts:   make([]time.Duration, len(filteredUnloaders)),
+		lastDispatch:   make([]atomic.Int64, len(filteredUnloaders)),
+		inFlight:       make([]atomic.Int32, len(filteredUnloaders)),
+		idleUnloaded:   make([]atomic.Bool, len(filteredUnloaders)),
+		origToFiltered: origToFiltered,
 	}
+	// lastDispatch[i] must start at construction time ("now"), never at its
+	// atomic.Int64 zero-value (Unix epoch, 1970-01-01) — otherwise the very
+	// first checkIdleLocked tick (Run's immediate first refresh(), before
+	// the polling ticker even fires) would compute a multi-decade elapsed
+	// time for any idle-configured instance that has not yet served a
+	// request, and idle-unload it instantly regardless of the configured
+	// idle timeout — including a freshly (re)started broker instantly
+	// stopping a systemd unit it just as instantly needs to reload for the
+	// next request. This is the "initialized to time.Now() at Controller
+	// construction" behavior docs/vllm-idle-unload/plan.md's Risk-areas
+	// section documents as the intended trade-off (a restart resets the
+	// idle clock to "process start," not "true last real usage" — an
+	// accepted, low-cost trade-off) — not "starts at the epoch."
+	now := time.Now().UnixNano()
+	for i := range c.lastDispatch {
+		c.lastDispatch[i].Store(now)
+	}
+	return c
+}
+
+// ConfigureIdle records per-instance idle-unload timeouts, keyed by ORIG
+// (pre-nil-filter) index — the same index space as the unloaders slice
+// originally passed into NewWithConfirmMulti (or NewMulti), before nil
+// filtering. idleTimeouts must be the same length as that original slice
+// (equivalently, len(c.origToFiltered)); a zero duration at index i means no
+// idle timeout is configured for that instance.
+//
+// This only populates c.idleTimeouts (index-aligned with the post-filter
+// c.unloaders/c.labels); it does not itself start or affect any idle
+// detection or unload behavior — that is checkIdleLocked/TrackActivity/
+// IdleSummary, added in later tasks.
+//
+// Both failure modes here are construction-time invariant violations that
+// config validation (added in a separate task) should already prevent, so
+// this panics rather than silently ignoring or corrupting state:
+//   - a length mismatch against origToFiltered (would otherwise silently
+//     drop entries or index out of bounds with Go's generic panic message);
+//   - a nonzero idle timeout at an orig index whose unloader was nil-filtered
+//     (no Unloader means there is nothing to idle-unload).
+func (c *Controller) ConfigureIdle(idleTimeouts []time.Duration) {
+	if len(idleTimeouts) != len(c.origToFiltered) {
+		panic(fmt.Sprintf("yield: ConfigureIdle: got %d idle timeouts, want %d (len(origToFiltered))", len(idleTimeouts), len(c.origToFiltered)))
+	}
+	for i, d := range idleTimeouts {
+		post := c.origToFiltered[i]
+		if post == -1 {
+			if d != 0 {
+				panic(fmt.Sprintf("yield: ConfigureIdle: orig index %d has an idle timeout but no Unloader (no _UNIT_NAME) — this should have been caught at config.Load()", i))
+			}
+			continue
+		}
+		c.idleTimeouts[post] = d
+	}
+}
+
+// TrackActivity wraps next with per-instance idle bookkeeping for the
+// configured instance at ORIG (pre-nil-filter) index origIdx — the same
+// index space ConfigureIdle takes. It is a construction-time decorator:
+// called once per instance, by a caller in internal/backend, at wrap time —
+// not per request — so the origIdx -> post-filter lookup below happens once
+// here rather than being repeated on every request the returned handler
+// serves.
+//
+// origIdx must identify an instance with a configured Unloader (i.e.
+// c.origToFiltered[origIdx] != -1); requesting idle-tracking for an
+// orig-index with no Unloader is a construction-time invariant violation
+// config validation should already prevent (mirrors ConfigureIdle's own
+// panic for the symmetric case), so this panics rather than silently
+// no-op'ing or indexing a bookkeeping slot that doesn't exist.
+//
+// The returned handler updates c.inFlight[post] and c.lastDispatch[post]
+// around every call to next.ServeHTTP so checkIdleLocked can see accurate
+// in-flight/last-activity state. The decrement + final timestamp update is
+// registered as a defer immediately after the increment — before
+// next.ServeHTTP is called — so it still runs if next.ServeHTTP panics;
+// deferring it only after a plain post-ServeHTTP statement would skip it on
+// that path and leave inFlight permanently elevated.
+func (c *Controller) TrackActivity(origIdx int, next http.Handler) http.Handler {
+	post := c.origToFiltered[origIdx]
+	if post == -1 {
+		panic(fmt.Sprintf("yield: TrackActivity: orig index %d has no Unloader (no _UNIT_NAME) — idle-tracking should never have been requested for it — this should have been caught at config.Load()", origIdx))
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.inFlight[post].Add(1)
+		c.lastDispatch[post].Store(time.Now().UnixNano())
+		defer func() {
+			c.inFlight[post].Add(-1)
+			c.lastDispatch[post].Store(time.Now().UnixNano())
+		}()
+		// Wake-on-request: if this instance was idle-unloaded, the request
+		// that wins the CompareAndSwap (idleUnloaded[post] true -> false) is
+		// responsible for kicking off the reload. This is fire-and-forget —
+		// the current request proceeds to next.ServeHTTP immediately,
+		// regardless of the reload's progress, rather than blocking on it.
+		// That is a deliberate, accepted cost: the waking request may hit a
+		// connection error against the still-cold-starting upstream,
+		// mirroring ADR-0014's existing accepted cost for Contention-
+		// triggered wakes. A CAS loss (either not idle-unloaded, or another
+		// concurrent request already won the wake) does nothing extra here.
+		//
+		// startAction requires c.mu (see its doc comment), but this hot
+		// request path must not contend on the lock for the common case
+		// where the CAS fails — so the lock is only acquired in the rare
+		// CAS-won branch, held just long enough for startAction, then
+		// released before spawning the goroutine, mirroring applyLocked/
+		// checkIdleLocked's own startAction-then-spawn sequencing.
+		if c.idleUnloaded[post].CompareAndSwap(true, false) {
+			c.mu.Lock()
+			wait, done := c.startAction(post)
+			c.mu.Unlock()
+			go c.doReload(post, wait, done, triggerIdle)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // SetGPUManager registers an external GPU consumer to pause/resume alongside
@@ -264,6 +426,7 @@ func (c *Controller) refresh() {
 	c.autoContended, c.autoReason = c.debounceLocked(reason, contended)
 	c.lastPoll = time.Now()
 	event, r := c.applyLocked()
+	c.checkIdleLocked()
 	c.mu.Unlock()
 	logTransition(event, r)
 }
@@ -331,7 +494,7 @@ func (c *Controller) applyLocked() (event, reason string) {
 		c.serveCancel() // abort in-flight inference
 		for i := range c.unloaders {
 			wait, done := c.startAction(i)
-			go c.doUnload(i, wait, done)
+			go c.doUnload(i, wait, done, triggerYield)
 		}
 		if mgr != nil {
 			go c.pauseGPUMgr(mgr)
@@ -341,7 +504,21 @@ func (c *Controller) applyLocked() (event, reason string) {
 	c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
 	for i := range c.unloaders {
 		wait, done := c.startAction(i)
-		go c.doReload(i, wait, done)
+		go c.doReload(i, wait, done, triggerYield)
+	}
+	// A just-cleared (post-Yield) instance must not be immediately eligible
+	// for a fresh Idle-unload before it has had any chance to serve real
+	// traffic: reset lastDispatch[i] to "now" so its idle window starts
+	// counting from when it actually became available again, and reset
+	// idleUnloaded[i] to false so its state is consistent regardless of
+	// whether it was previously idle-unloaded, Contention-unloaded (via the
+	// yield-start branch above), or never unloaded at all — every configured
+	// instance is treated as "fresh" on yield-clear. Same index range
+	// checkIdleLocked iterates (0..len(c.idleTimeouts)-1); c.idleTimeouts,
+	// c.lastDispatch, and c.idleUnloaded are all sized to len(c.unloaders).
+	for i := range c.idleTimeouts {
+		c.lastDispatch[i].Store(time.Now().UnixNano())
+		c.idleUnloaded[i].Store(false)
 	}
 	if mgr != nil {
 		go c.resumeGPUMgr(mgr)
@@ -354,14 +531,61 @@ func (c *Controller) applyLocked() (event, reason string) {
 // instance's previous action's done channel, nil if this is the first
 // action ever for instance i) and done (this action's own completion
 // channel, which the caller must close when finished). Must only be called
-// from applyLocked, while c.mu is held, so the handoff chain it builds
-// matches applyLocked's own call order exactly — see actionDone's doc
-// comment for why this ordering matters.
+// while c.mu is held, from applyLocked, checkIdleLocked, or TrackActivity's
+// CAS-won wake branch (which acquires c.mu only for this case), so the
+// handoff chain it builds matches those callers' own call order exactly —
+// see actionDone's doc comment for why this ordering matters.
 func (c *Controller) startAction(i int) (wait <-chan struct{}, done chan struct{}) {
 	wait = c.actionDone[i]
 	done = make(chan struct{})
 	c.actionDone[i] = done
 	return wait, done
+}
+
+// checkIdleLocked fires a per-instance idle-unload for every post-filter
+// instance i whose configured idleTimeouts[i] has elapsed since
+// lastDispatch[i]. Called by refresh() immediately after applyLocked, still
+// under c.mu, so idle checks always run strictly after — and observe the
+// state resulting from — that tick's contention transition.
+//
+// Before the elapsed-time check, each instance is guarded by three early
+// skips, in order, so an already-guarded-out instance does zero unnecessary
+// work (no time.Since computation, no CAS attempt):
+//   - c.effective (whole-Broker Yield is already active): an Idle-unload
+//     must never fire while Contention-triggered Yield is in effect — that
+//     path (applyLocked) already handles unloading every instance.
+//   - c.inFlight[i] > 0: a request is currently in flight against this
+//     instance, so it must not be unloaded out from under it.
+//   - c.idleUnloaded[i] already true: dedup — this instance was already
+//     idle-unloaded by an earlier tick, no need to re-evaluate or re-fire.
+//
+// idleTimeouts[i] == 0 (disabled) is skipped in O(1) with no atomic writes;
+// otherwise idleUnloaded[i] is CompareAndSwap'd false->true, and only the
+// goroutine that wins the CAS spawns doUnload — so even without the explicit
+// already-fired guard above, this method cannot double-fire a single
+// instance from one call. Caller holds c.mu.
+func (c *Controller) checkIdleLocked() {
+	for i := range c.idleTimeouts {
+		if c.idleTimeouts[i] == 0 {
+			continue
+		}
+		if c.effective {
+			continue
+		}
+		if c.inFlight[i].Load() > 0 {
+			continue
+		}
+		if c.idleUnloaded[i].Load() {
+			continue
+		}
+		elapsed := time.Since(time.Unix(0, c.lastDispatch[i].Load()))
+		if elapsed >= c.idleTimeouts[i] {
+			if c.idleUnloaded[i].CompareAndSwap(false, true) {
+				wait, done := c.startAction(i)
+				go c.doUnload(i, wait, done, triggerIdle)
+			}
+		}
+	}
 }
 
 // logTransition logs at WARN, not INFO: this is the single most
@@ -395,8 +619,10 @@ func logTransition(event, reason string) {
 // startAction): doUnload waits for instance i's previous action to finish
 // before calling Unload, and always closes done on the way out (even on
 // panic/recover) so instance i's next action isn't stuck waiting forever —
-// this has no effect on any other instance's chain.
-func (c *Controller) doUnload(i int, wait <-chan struct{}, done chan struct{}) {
+// this has no effect on any other instance's chain. trigger identifies what
+// caused this call (yield-contention vs idle-timeout) and is only logged,
+// never branched on.
+func (c *Controller) doUnload(i int, wait <-chan struct{}, done chan struct{}, trigger unloadTrigger) {
 	defer close(done)
 	defer func() {
 		if r := recover(); r != nil {
@@ -409,17 +635,17 @@ func (c *Controller) doUnload(i int, wait <-chan struct{}, done chan struct{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), unloadReloadTimeout)
 	defer cancel()
 	if err := c.unloaders[i].Unload(ctx); err != nil {
-		slog.Warn("vram unload failed", "instance", c.labels[i], "err", err)
+		slog.Warn("vram unload failed", "instance", c.labels[i], "err", err, "trigger", string(trigger))
 	} else {
-		slog.Info("vram unload requested", "instance", c.labels[i])
+		slog.Info("vram unload requested", "instance", c.labels[i], "trigger", string(trigger))
 	}
 }
 
 // doReload runs in its own goroutine (see applyLocked), so a panic here
 // would otherwise crash the whole broker process — see doUnload's comment
 // for the typed-nil Unloader hazard this guards against and for what i,
-// wait, and done do.
-func (c *Controller) doReload(i int, wait <-chan struct{}, done chan struct{}) {
+// wait, done, and trigger do.
+func (c *Controller) doReload(i int, wait <-chan struct{}, done chan struct{}, trigger unloadTrigger) {
 	defer close(done)
 	defer func() {
 		if r := recover(); r != nil {
@@ -432,9 +658,9 @@ func (c *Controller) doReload(i int, wait <-chan struct{}, done chan struct{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), unloadReloadTimeout)
 	defer cancel()
 	if err := c.unloaders[i].Reload(ctx); err != nil {
-		slog.Warn("vram reload failed", "instance", c.labels[i], "err", err)
+		slog.Warn("vram reload failed", "instance", c.labels[i], "err", err, "trigger", string(trigger))
 	} else {
-		slog.Info("vram reload requested", "instance", c.labels[i])
+		slog.Info("vram reload requested", "instance", c.labels[i], "trigger", string(trigger))
 	}
 }
 
@@ -484,10 +710,62 @@ type State struct {
 	AutoReason string `json:"auto_reason"`
 }
 
+// IdleSummaryEntry is a single instance's idle-unload status in IdleSummary.
+type IdleSummaryEntry struct {
+	Label             string `json:"label"`
+	IdleTimeout       string `json:"idle_timeout"`
+	IdleUnloaded      bool   `json:"idle_unloaded"`
+	SinceLastDispatch string `json:"since_last_dispatch"`
+}
+
 // Snapshot returns the current state.
 func (c *Controller) Snapshot() State {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	yielding, reason := c.computeLocked()
 	return State{Mode: c.mode.String(), Yielding: yielding, Reason: reason, AutoReason: c.autoReason}
+}
+
+// IdleSummary returns idle-unload status for instances that have it configured,
+// or nil if no instance has idle-unload enabled. Each enabled instance gets one
+// entry in the returned slice.
+func (c *Controller) IdleSummary() any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check if any instance has idle-unload configured
+	hasAnyConfigured := false
+	for _, timeout := range c.idleTimeouts {
+		if timeout != 0 {
+			hasAnyConfigured = true
+			break
+		}
+	}
+
+	// Return nil if no instance has idle-unload configured
+	if !hasAnyConfigured {
+		return nil
+	}
+
+	// Build a slice with entries for instances that have idle-unload enabled
+	var result []IdleSummaryEntry
+	for i, timeout := range c.idleTimeouts {
+		if timeout == 0 {
+			continue
+		}
+		entry := IdleSummaryEntry{
+			Label:             c.labels[i],
+			IdleTimeout:       timeout.String(),
+			IdleUnloaded:      c.idleUnloaded[i].Load(),
+			SinceLastDispatch: time.Since(time.Unix(0, c.lastDispatch[i].Load())).String(),
+		}
+		result = append(result, entry)
+	}
+
+	// Never return a non-nil empty slice (per task spec)
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
 }

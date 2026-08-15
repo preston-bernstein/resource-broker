@@ -47,6 +47,8 @@ Environment=BROKER_YIELD_CONFIRM_POLLS=2
 # pause the specified systemd unit during yield (high contention) and resume when yield clears.
 # Empty/unset disables this behavior entirely (pre-existing no-op).
 #Environment=UPSTREAM_UNIT_NAME=<systemd unit name>
+# Optional idle-unload duration for the default backend; requires UPSTREAM_UNIT_NAME to be set.
+#Environment=UPSTREAM_IDLE_TIMEOUT=1h
 
 # Request parking during yield (optional): batch requests exceeding wait budget park here
 # instead of failing immediately. Defaults hold for 600s, queue ceiling 32, release 8/1s tick.

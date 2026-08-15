@@ -88,33 +88,10 @@ func main() {
 	// its own Proxy(), which has no lane context) and activeBackend becomes
 	// router for the Job worker and healthCheck, since Router.Generate/
 	// Reachable already dispatch/check correctly on its own.
-	var router *backend.Router
-	var activeBackend backend.Backend = be
-	var ctrl *yield.Controller
-	if len(cfg.Routes) == 0 {
-		ctrl = yield.NewWithConfirm(detector, be.Unloader(), cfg.DetectInterval, cfg.YieldConfirmPolls)
-	} else {
-		routeBackends, routeUnloaders, labels, err := buildRoutes(cfg)
-		if err != nil {
-			slog.Error("route construction", "err", err)
-			os.Exit(1)
-		}
-		r := backend.NewRouter(be)
-		for i, rb := range cfg.Routes {
-			for _, model := range rb.Models {
-				r.AddRoute(model, rb.Lane, routeBackends[i])
-			}
-		}
-		router = r
-		activeBackend = router
-		unloaders := append([]yield.Unloader{be.Unloader()}, routeUnloaders...)
-		labels = append([]string{"default"}, labels...)
-		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
-		var routeSummary []string
-		for _, rb := range cfg.Routes {
-			routeSummary = append(routeSummary, fmt.Sprintf("%v->%s(%s)", rb.Models, rb.Backend, rb.URL.String()))
-		}
-		slog.Info("routing configured", "routes", routeSummary)
+	router, activeBackend, ctrl, idleStatus, err := buildBroker(cfg, detector, be)
+	if err != nil {
+		slog.Error("build broker", "err", err)
+		os.Exit(1)
 	}
 	// yieldingFn adapts ctrl.Yielding()'s (bool, string) signature to the
 	// plain closure RunParkDrain expects (ADR-0009's Core redesign: the park
@@ -251,15 +228,27 @@ func main() {
 	// Proxy() (no lane context) is not what production wiring should call —
 	// these two lines are that production wiring, always passing a real lane
 	// (queue.Class.String()) when routes are configured. When router is nil
-	// (zero routes), be.Proxy() is the exact pre-feature code path: no
-	// Router construction, no body-peeking, byte-for-byte unchanged.
+	// (zero routes), activeBackend.Proxy() is the exact pre-feature code path
+	// (no Router construction, no body-peeking) EXCEPT that activeBackend —
+	// not the pre-buildBroker local be — must be used here: buildBroker's
+	// no-routes branch may have reassigned its own be parameter to a
+	// backend.WithActivityTracking-decorated wrapper (idle-unload enabled)
+	// and returned that decorated value as activeBackend. be is a plain Go
+	// interface value passed to buildBroker by copy, so buildBroker
+	// reassigning its own be parameter never changes this be — only
+	// activeBackend carries the decoration back out. Using be.Proxy() here
+	// silently drops idle-activity tracking for every interactive/batch
+	// request on the no-routes path (verified live: /status kept reporting
+	// idle_unloaded=true and since_last_dispatch kept climbing across a real
+	// served request, with no wake-triggered reload log line, until this was
+	// fixed to reference activeBackend instead).
 	var interactiveProxy, batchProxy http.Handler
 	if router != nil {
 		interactiveProxy = router.ProxyForLane(queue.Interactive.String())
 		batchProxy = router.ProxyForLane(queue.Batch.String())
 	} else {
-		interactiveProxy = be.Proxy()
-		batchProxy = be.Proxy()
+		interactiveProxy = activeBackend.Proxy()
+		batchProxy = activeBackend.Proxy()
 	}
 
 	var routingStatus func() any
@@ -273,7 +262,7 @@ func main() {
 	servers := []*http.Server{
 		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, interactiveProxy)),
 		batchServer,
-		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, routingStatus, cfg.ControlToken)),
+		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, routingStatus, idleStatus, cfg.ControlToken)),
 	}
 
 	// Image-embedding lane (optional): fronts an Infinity SigLIP server on CPU
@@ -347,6 +336,111 @@ func main() {
 		}
 	}
 	wg.Wait()
+}
+
+// buildBroker performs the pure (no network I/O, no os.Exit) wiring that
+// used to live inline in main(): constructing the yield.Controller, the
+// optional per-model Router, and the idle-unload decoration of whichever
+// backend(s) are actually in play. It exists so this logic has a real test
+// seam — main() itself blocks on ListenAndServe/signal handling and can't
+// easily be driven by a unit test.
+//
+// THE ORDERING BUG THIS FIXES: it is tempting to build the Router first
+// (AddRoute captures each routeBackends[i] and be BY VALUE into the
+// Router's routing table at that moment) and only afterward construct ctrl
+// and decorate be/routeBackends[i] with backend.WithActivityTracking — ctrl
+// doesn't exist until yield.NewWithConfirmMulti runs, so building it last
+// feels natural. But reassigning the local be/routeBackends[i] variables
+// AFTER the Router has already captured the undecorated values does nothing
+// to what's stored inside the Router — idle-tracking would silently never
+// fire for any routed instance, despite compiling cleanly and passing any
+// test that constructs Router directly. The fix is strict ordering: ctrl
+// must exist, and every backend must be decorated, BEFORE backend.NewRouter
+// and the AddRoute loop ever run.
+func buildBroker(cfg *config.Config, detector yield.Detector, be backend.Backend) (router *backend.Router, activeBackend backend.Backend, ctrl *yield.Controller, idleStatus func() any, err error) {
+	if len(cfg.Routes) == 0 {
+		// unl may be a true nil yield.Unloader (e.g. an openai backend with no
+		// configured unit name) — NewWithConfirm then passes NewWithConfirmMulti
+		// a zero-length unloaders slice (it does not keep a nil placeholder for
+		// a nil single unloader), so ctrl.origToFiltered ends up length 0 in
+		// that case. Calling ConfigureIdle would then panic on a length
+		// mismatch against a 1-element idleTimeouts slice. config.Load()
+		// already guarantees UpstreamIdleTimeout is 0 whenever there is no
+		// Unloader to act on, so skipping ConfigureIdle/decoration entirely
+		// when unl is nil loses nothing.
+		unl := be.Unloader()
+		ctrl = yield.NewWithConfirm(detector, unl, cfg.DetectInterval, cfg.YieldConfirmPolls)
+		if unl != nil {
+			ctrl.ConfigureIdle([]time.Duration{cfg.UpstreamIdleTimeout})
+			if cfg.UpstreamIdleTimeout != 0 {
+				be = backend.WithActivityTracking(be, ctrl, 0)
+			}
+		}
+		activeBackend = be
+	} else {
+		routeBackends, routeUnloaders, labels, buildErr := buildRoutes(cfg)
+		if buildErr != nil {
+			return nil, nil, nil, nil, fmt.Errorf("route construction: %w", buildErr)
+		}
+		// unloaders/labels are computed, and ctrl constructed, BEFORE
+		// backend.NewRouter/AddRoute run below — see this function's doc
+		// comment for why the order matters.
+		unloaders := append([]yield.Unloader{be.Unloader()}, routeUnloaders...)
+		labels = append([]string{"default"}, labels...)
+		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
+
+		// idleTimeouts is index-aligned with unloaders/labels above: orig index
+		// 0 is the default backend, orig index i+1 is cfg.Routes[i]. Unlike the
+		// no-routes branch, this slice's length always matches
+		// ctrl.origToFiltered's length regardless of any individual nil
+		// Unloader, since the unloaders slice above is always exactly
+		// 1+len(cfg.Routes) long (append never drops a nil element by
+		// position).
+		idleTimeouts := make([]time.Duration, len(cfg.Routes)+1)
+		idleTimeouts[0] = cfg.UpstreamIdleTimeout
+		for i, rb := range cfg.Routes {
+			idleTimeouts[i+1] = rb.IdleTimeout
+		}
+		ctrl.ConfigureIdle(idleTimeouts)
+
+		// Decorate in place — orig index 0 is the default backend, i+1 is
+		// route i — BEFORE NewRouter/AddRoute below capture these values.
+		if cfg.UpstreamIdleTimeout != 0 {
+			be = backend.WithActivityTracking(be, ctrl, 0)
+		}
+		for i := range cfg.Routes {
+			if cfg.Routes[i].IdleTimeout != 0 {
+				routeBackends[i] = backend.WithActivityTracking(routeBackends[i], ctrl, i+1)
+			}
+		}
+
+		r := backend.NewRouter(be)
+		for i, rb := range cfg.Routes {
+			for _, model := range rb.Models {
+				r.AddRoute(model, rb.Lane, routeBackends[i])
+			}
+		}
+		router = r
+		activeBackend = router
+
+		var routeSummary []string
+		for _, rb := range cfg.Routes {
+			routeSummary = append(routeSummary, fmt.Sprintf("%v->%s(%s)", rb.Models, rb.Backend, rb.URL.String()))
+		}
+		slog.Info("routing configured", "routes", routeSummary)
+	}
+
+	idleConfigured := cfg.UpstreamIdleTimeout != 0
+	for _, rb := range cfg.Routes {
+		if rb.IdleTimeout != 0 {
+			idleConfigured = true
+		}
+	}
+	if idleConfigured {
+		idleStatus = ctrl.IdleSummary
+	}
+
+	return router, activeBackend, ctrl, idleStatus, nil
 }
 
 // buildRoutes constructs one Backend per cfg.Routes[i] via backend.NewInstance
