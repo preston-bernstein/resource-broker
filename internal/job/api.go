@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/preston-bernstein/ollama-resource-broker/internal/httpx"
 )
 
 // Routes returns the Job HTTP surface (ADR-0006). Mount it on the control plane
@@ -58,7 +60,7 @@ func (s *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if !created {
 		code = http.StatusOK // idempotent replay of an existing Job
 	}
-	writeJSON(w, code, map[string]string{"job_id": j.ID})
+	httpx.WriteJSON(w, code, map[string]string{"job_id": j.ID})
 }
 
 func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +69,7 @@ func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, st)
+	httpx.WriteJSON(w, http.StatusOK, st)
 }
 
 func (s *Service) handleResult(w http.ResponseWriter, r *http.Request) {
@@ -76,7 +78,7 @@ func (s *Service) handleResult(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": r.PathValue("id"), "result": result})
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"id": r.PathValue("id"), "result": result})
 }
 
 func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +96,7 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request) {
 			Attempts: j.Attempts, Error: j.Error, CreatedAt: j.CreatedAt, FetchedAt: j.FetchedAt,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": out})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"jobs": out})
 }
 
 func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +105,7 @@ func (s *Service) handleCancel(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": j.ID, "state": string(j.State)})
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"id": j.ID, "state": string(j.State)})
 }
 
 // handleEvents streams Job events as SSE: an initial snapshot, then live ticks
@@ -175,12 +177,6 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
-}
-
 func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+	httpx.WriteJSON(w, code, map[string]string{"error": msg})
 }

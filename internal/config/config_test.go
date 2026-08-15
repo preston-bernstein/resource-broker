@@ -42,6 +42,33 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.InfinityURL != nil {
 		t.Errorf("InfinityURL = %v, want nil when INFINITY_URL unset", cfg.InfinityURL)
 	}
+	if cfg.DetectInterval != 3*time.Second {
+		t.Errorf("DetectInterval = %v, want 3s", cfg.DetectInterval)
+	}
+	if cfg.BatchQuantum != 10*time.Second {
+		t.Errorf("BatchQuantum = %v, want 10s", cfg.BatchQuantum)
+	}
+	if cfg.JobPruneInterval != 10*time.Minute {
+		t.Errorf("JobPruneInterval = %v, want 10m", cfg.JobPruneInterval)
+	}
+	if cfg.JobHardCap != 7*24*time.Hour {
+		t.Errorf("JobHardCap = %v, want 168h", cfg.JobHardCap)
+	}
+}
+
+// TestLoadIntBoundaryMinimumAccepted proves getint's `n < 1` check accepts
+// exactly 1 — the boundary itself, which TestLoadInvalidMaxWaiters (n=0,
+// rejected) does not exercise, leaving a `<` vs `<=` mutation undetected.
+func TestLoadIntBoundaryMinimumAccepted(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("BROKER_MAX_WAITERS", "1")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MaxWaiters != 1 {
+		t.Errorf("MaxWaiters = %d, want 1", cfg.MaxWaiters)
+	}
 }
 
 func TestLoadInfinityURL(t *testing.T) {
@@ -103,6 +130,103 @@ func TestLoadInvalidDuration(t *testing.T) {
 	t.Setenv("BROKER_BATCH_WAIT", "soon")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for bad duration")
+	}
+}
+
+// --- Upstream backend selection (UPSTREAM_BACKEND / UPSTREAM_URL / UPSTREAM_API_KEY) ---
+
+func TestLoadUpstreamBackendInvalid(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("UPSTREAM_BACKEND", "bogus")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for UPSTREAM_BACKEND=bogus")
+	}
+}
+
+func TestLoadUpstreamBackendOpenAIWithoutUpstreamURL(t *testing.T) {
+	t.Setenv("UPSTREAM_BACKEND", "openai")
+	t.Setenv("UPSTREAM_URL", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for UPSTREAM_BACKEND=openai without UPSTREAM_URL")
+	}
+}
+
+func TestLoadUpstreamBackendOpenAIWithValidUpstreamURL(t *testing.T) {
+	t.Setenv("UPSTREAM_BACKEND", "openai")
+	t.Setenv("UPSTREAM_URL", "http://127.0.0.1:8000")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.UpstreamBackend != "openai" {
+		t.Errorf("UpstreamBackend = %q, want openai", cfg.UpstreamBackend)
+	}
+	if cfg.UpstreamURL == nil || cfg.UpstreamURL.String() != "http://127.0.0.1:8000" {
+		t.Errorf("UpstreamURL = %v, want http://127.0.0.1:8000", cfg.UpstreamURL)
+	}
+	if cfg.OllamaURL != nil {
+		t.Errorf("OllamaURL = %v, want nil when UPSTREAM_BACKEND=openai", cfg.OllamaURL)
+	}
+}
+
+// TestLoadUpstreamBackendOllamaWithoutOllamaURL pins a NEW failure case
+// introduced by making OLLAMA_URL's requirement conditional on
+// UPSTREAM_BACKEND=ollama (FR-23): a truly malformed OLLAMA_URL still fails
+// when the backend is (explicitly or by default) "ollama".
+func TestLoadUpstreamBackendOllamaWithoutOllamaURL(t *testing.T) {
+	t.Setenv("UPSTREAM_BACKEND", "ollama")
+	t.Setenv("OLLAMA_URL", "not-a-url")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for UPSTREAM_BACKEND=ollama with malformed OLLAMA_URL")
+	}
+}
+
+// TestLoadUpstreamBackendDefaultOllamaEmptyURLResolvesToDefault confirms the
+// pre-existing empty-string-resolves-to-default behavior for OLLAMA_URL is
+// unchanged when UPSTREAM_BACKEND is left unset (defaulting to "ollama"):
+// an empty OLLAMA_URL must still resolve to the default and load
+// successfully, not fail, exactly as TestLoadDefaults already asserts.
+func TestLoadUpstreamBackendDefaultOllamaEmptyURLResolvesToDefault(t *testing.T) {
+	t.Setenv("UPSTREAM_BACKEND", "")
+	t.Setenv("OLLAMA_URL", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.UpstreamBackend != "ollama" {
+		t.Errorf("UpstreamBackend = %q, want default ollama", cfg.UpstreamBackend)
+	}
+	if cfg.OllamaURL == nil || cfg.OllamaURL.String() != "http://127.0.0.1:11434" {
+		t.Errorf("OllamaURL = %v, want default http://127.0.0.1:11434", cfg.OllamaURL)
+	}
+}
+
+func TestLoadUpstreamAPIKeyControlCharRejected(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("UPSTREAM_API_KEY", "sekret\r\nX-Injected: true")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for UPSTREAM_API_KEY containing CR/LF")
+	}
+}
+
+func TestLoadUpstreamAPIKeyValid(t *testing.T) {
+	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
+	t.Setenv("UPSTREAM_API_KEY", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.UpstreamAPIKey != "" {
+		t.Errorf("UpstreamAPIKey = %q, want empty when unset", cfg.UpstreamAPIKey)
+	}
+
+	t.Setenv("UPSTREAM_API_KEY", "sk-valid-key")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.UpstreamAPIKey != "sk-valid-key" {
+		t.Errorf("UpstreamAPIKey = %q, want sk-valid-key", cfg.UpstreamAPIKey)
 	}
 }
 

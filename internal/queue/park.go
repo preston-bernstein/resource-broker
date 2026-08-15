@@ -43,8 +43,8 @@ type parker struct {
 	mu sync.Mutex // NEVER held at the same time as Scheduler.mu, except inside
 	// Stats() — see the lock-order comment there. Every other
 	// parker method takes only this mutex.
-	q          []*parkedReq
-	maxQueue   int // 0 is MEANINGFUL: parking disabled (see SetParkConfig). Also
+	q        []*parkedReq
+	maxQueue int // 0 is MEANINGFUL: parking disabled (see SetParkConfig). Also
 	// the zero-value default for a Scheduler that never calls
 	// SetParkConfig at all — fail-closed by construction.
 	hold       time.Duration

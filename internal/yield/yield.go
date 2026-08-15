@@ -108,6 +108,12 @@ func New(det Detector, unloader Unloader, interval time.Duration) *Controller {
 // benefits inference and never risks starving gaming/Plex, so it should be
 // as fast as detection allows. confirmPolls < 1 is treated as 1.
 func NewWithConfirm(det Detector, unloader Unloader, interval time.Duration, confirmPolls int) *Controller {
+	// `< 1` vs `<= 1` is an equivalent mutant here (verified 2026-08-15,
+	// gremlins mutation testing): the clamp target is 1, so confirmPolls=1
+	// produces c.confirmPolls=1 whether or not this branch is taken — no
+	// input can observe a `<` vs `<=` difference. Left as `< 1` since that
+	// reads correctly ("clamp anything below 1"); do not chase this survivor
+	// with more tests, there is no test that can kill it.
 	if confirmPolls < 1 {
 		confirmPolls = 1
 	}
@@ -244,7 +250,19 @@ func logTransition(event, reason string) {
 	}
 }
 
+// doUnload runs in its own goroutine (see applyLocked), so a panic here would
+// otherwise crash the whole broker process — e.g. a typed-nil Unloader (an
+// interface value that passes the `c.unloader != nil` check in applyLocked
+// but wraps a nil concrete pointer, see docs/openai-compatible-upstream-backend/plan.md's
+// "Typed-nil safety" note) invoking Unload on a nil receiver. The recover
+// here is cheap defense-in-depth against exactly that unrecovered-goroutine
+// panic path.
 func (c *Controller) doUnload() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in vram unload", "recover", r)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.unloader.Unload(ctx); err != nil {
