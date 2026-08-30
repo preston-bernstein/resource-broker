@@ -1,6 +1,11 @@
 *.zip
 .DS_Store
 docs/BUILD-PLAN.md
+
+# Local runtime config — real hosts/tokens go here, never in the repo.
+# See .env.example for the placeholder template.
+.env
+.env.local
 # Root-level local runtime/spool dir only (not internal/queue, the Go package)
 /queue/
 *.log

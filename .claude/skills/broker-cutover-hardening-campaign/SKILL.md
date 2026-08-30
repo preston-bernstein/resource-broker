@@ -18,7 +18,7 @@ cd /Users/prestonbernstein/dev/resource-broker
 git status --short && git log --oneline -3          # expect: clean tree on v2-go
 go test ./... 2>&1 | tail -8
 go vet ./... 2>&1 | tail -4
-ssh desktop.example.internal 'systemctl is-active resource-broker resource-manager; curl -s localhost:11437/status'
+ssh <broker-host> 'systemctl is-active resource-broker resource-manager; curl -s localhost:11437/status'
 ```
 
 Expected (2026-07-02): test+vet FAIL only in `internal/admin` (`admin_test.go` `Mux` arity — `have (Controller, fakeStats, http.HandlerFunc, nil, nil)` / `want (..., func() any, TdarrStatusFn)`); both services `active`; `/status` returns the five-section JSON (see `broker-diagnostics-and-tooling`).
@@ -70,7 +70,7 @@ Gate (repo): tests green, review per change control. Classification: behavior ch
 DEPLOY sub-phase (desktop, STOP — confirm with Preston):
 1. Build `GOOS=linux GOARCH=amd64 CGO_ENABLED=0` (see `broker-build-and-env`), stage alongside a dated backup of the current binary.
 2. Pick a safe window (idle, not Friday early morning; check `/status` busy=false and no yield).
-3. Install + restart; verify: `curl -s localhost:11437/status` OK from the box; from the Mac WITHOUT token: `curl -XPOST http://desktop.example.internal:11437/control -d '{"mode":"auto"}'` → expect 401/403; loopback without token still works (if token unset) or with token works.
+3. Install + restart; verify: `curl -s localhost:11437/status` OK from the box; from the Mac WITHOUT token: `curl -XPOST http://<broker-host>:11437/control -d '{"mode":"auto"}'` → expect 401/403; loopback without token still works (if token unset) or with token works.
 4. Rollback line: reinstall backed-up binary, `sudo systemctl restart resource-broker`.
 5. If a token is provisioned, it lives in a systemd drop-in or environment file on the desktop — NEVER in this repo or any skill file.
 
@@ -80,7 +80,7 @@ The legacy Bash arbiter still runs alongside the Broker (verified 2026-07-02) �
 
 1. INVESTIGATE first (read-only):
 ```sh
-ssh desktop.example.internal 'sudo systemctl cat resource-manager; echo ---; sudo cat /usr/local/bin/resource-manager.sh' | less
+ssh <broker-host> 'sudo systemctl cat resource-manager; echo ---; sudo cat /usr/local/bin/resource-manager.sh' | less
 ```
    Compare against `legacy/resource-manager-v3.sh` in the repo. Questions to answer in writing: Does it kill processes or throttle `ollama.service` (CPU/memory caps) in ways the Broker does NOT replicate? Does it write state files (`/tmp/resource-manager-state`) that anything else reads? Do any cron jobs or legacy batch wrappers (`batch-job-wrapper-v*.sh`) depend on it?
 2. BRANCH: if it performs actions the Broker does not cover (the legacy Tier-1 design throttled Ollama to 3GB/1core during gaming — check whether the live script still does) → write a gap ADR: port the behavior, or accept its loss, BEFORE retiring. If it is redundant → proceed.
@@ -126,5 +126,5 @@ Baseline verified 2026-07-02 (repo at `ad07905`; live desktop read-only). This s
 cd /Users/prestonbernstein/dev/resource-broker && go test ./... 2>&1 | tail -3
 grep -rn BROKER_CONTROL_TOKEN /Users/prestonbernstein/dev/resource-broker/internal /Users/prestonbernstein/dev/resource-broker/cmd
 grep -n TDARR /Users/prestonbernstein/dev/resource-broker/deploy/broker.service
-ssh desktop.example.internal 'systemctl is-active resource-broker resource-manager'
+ssh <broker-host> 'systemctl is-active resource-broker resource-manager'
 ```

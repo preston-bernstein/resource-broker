@@ -7,7 +7,7 @@ description: How to MEASURE the resource-broker instead of eyeballing it — the
 
 Measure, do not eyeball. Every performance or health claim about the Broker must come from one of the instruments on this page. When a measurement looks bad, take it to `broker-debugging-playbook` for triage; this skill only tells you how to read the gauges.
 
-All endpoints are on the control plane, default `:11437` (desktop: `http://desktop.example.internal:11437`). Reads are unauthenticated by design (ADR-0005: open reads, gated mutations — the mutation gate is not yet implemented as of 2026-07-02).
+All endpoints are on the control plane, default `:11437` (desktop: `http://<broker-host>:11437`). Reads are unauthenticated by design (ADR-0005: open reads, gated mutations — the mutation gate is not yet implemented as of 2026-07-02).
 
 ## 1. Prometheus metrics inventory (`GET /metrics`)
 
@@ -75,7 +75,7 @@ Lane-port responses (`:11435`, `:11436`, `:11438`) carry:
 See trailers with curl (HTTP/1.1 chunked):
 
 ```sh
-curl -sN --raw http://desktop.example.internal:11435/api/generate \
+curl -sN --raw http://<broker-host>:11435/api/generate \
   -d '{"model":"llama3.1:8b","prompt":"hi"}' | tail -5
 # trailer appears after the terminal chunk; alternatively check for the absence of
 # Ollama's final {"done":true} NDJSON line — a cut stream without it was preempted.
@@ -110,7 +110,7 @@ sudo journalctl -u resource-broker --since -6h -o cat | grep '"outcome":"deferre
 
 ## 5. Probe scripts (in this skill's `scripts/` dir)
 
-All read-only (GETs; embed-sanity sends two tiny CPU embedding requests). Default target `BROKER_HOST=http://desktop.example.internal`; override for local runs. Verified 2026-07-02: executed against the live broker during an active Plex yield — snapshot rendered the yield WARN and real metrics; probe-wait correctly reported `503 deferred` with the live Retry-After budgets (30s/300s); embed-sanity took its DEFER exit (the embed lane 503s during yield BY DESIGN — shared yield controller, ADR-0008 — even though Infinity is CPU-only). PASS paths for lanes/embedding not yet observed live; re-run when the broker is serving.
+All read-only (GETs; embed-sanity sends two tiny CPU embedding requests). Default target `BROKER_HOST=http://<broker-host>`; override for local runs. Verified 2026-07-02: executed against the live broker during an active Plex yield — snapshot rendered the yield WARN and real metrics; probe-wait correctly reported `503 deferred` with the live Retry-After budgets (30s/300s); embed-sanity took its DEFER exit (the embed lane 503s during yield BY DESIGN — shared yield controller, ADR-0008 — even though Infinity is CPU-only). PASS paths for lanes/embedding not yet observed live; re-run when the broker is serving.
 
 | Script | What it measures | Healthy output |
 |---|---|---|

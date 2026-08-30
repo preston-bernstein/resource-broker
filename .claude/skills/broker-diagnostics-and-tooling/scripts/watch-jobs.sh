@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # watch-jobs.sh — poll the durable Job queue and scheduler state; compact drain view.
-# Usage: BROKER_HOST=http://desktop.example.internal ./watch-jobs.sh [interval-seconds, default 5]
+# Usage: BROKER_HOST=http://<broker-host> ./watch-jobs.sh [interval-seconds, default 5]
 # Read-only: GETs only. Ctrl-C to stop. jq recommended.
 set -u
-HOST="${BROKER_HOST:-http://desktop.example.internal}"
+HOST="${BROKER_HOST:-http://127.0.0.1}"
 CTRL="$HOST:11437"
 N="${1:-5}"
 
