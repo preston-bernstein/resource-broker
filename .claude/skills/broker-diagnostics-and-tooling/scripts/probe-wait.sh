@@ -2,12 +2,12 @@
 # probe-wait.sh — measure admission latency per broker lane WITHOUT generating tokens.
 # Sends a cheap GET /api/tags (proxied to Ollama) through the interactive and batch
 # lanes and prints X-Broker-Wait-Ms, X-Broker-Status, and wall time.
-# Usage: BROKER_HOST=http://10.0.0.243 ./probe-wait.sh [max-wait-seconds, default 12]
+# Usage: BROKER_HOST=http://<broker-host> ./probe-wait.sh [max-wait-seconds, default 12]
 # Read-only. NOTE: even this metadata read must acquire the GPU slot (the Gate wraps
 # every request on a lane port), so a long in-flight generation delays it — that IS
 # the measurement.
 set -u
-HOST="${BROKER_HOST:-http://10.0.0.243}"
+HOST="${BROKER_HOST:-http://127.0.0.1}"
 T="${1:-12}"
 
 for p in 11435 11436; do

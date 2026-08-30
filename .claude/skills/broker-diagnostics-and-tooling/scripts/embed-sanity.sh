@@ -3,11 +3,11 @@
 # not the text-tower trap (ADR-0008: Infinity's unified /embeddings tokenizes a
 # base64 data: URI as TEXT, making every image embed near-identical).
 # Method: embed a red and a blue 8x8 PNG; cosine similarity must be well below ~0.99.
-# Usage: BROKER_HOST=http://10.0.0.243 ./embed-sanity.sh
+# Usage: BROKER_HOST=http://<broker-host> ./embed-sanity.sh
 # Read-only in spirit: sends two tiny embedding requests through the lane (CPU-side,
 # yield-gated); no state is written, no GPU touched. Requires python3.
 set -u
-HOST="${BROKER_HOST:-http://10.0.0.243}"
+HOST="${BROKER_HOST:-http://127.0.0.1}"
 URL="$HOST:11438/embeddings"
 MODEL="siglip-so400m-patch14-384"
 RED="iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC"
