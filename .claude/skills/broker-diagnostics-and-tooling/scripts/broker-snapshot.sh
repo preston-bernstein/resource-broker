@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # broker-snapshot.sh — one-shot read-only health snapshot of the Resource Broker.
-# Usage: BROKER_HOST=http://desktop.example.internal ./broker-snapshot.sh   (default host below)
+# Usage: BROKER_HOST=http://<broker-host> ./broker-snapshot.sh   (default host below)
 # Read-only: GETs only. Never POSTs, never restarts anything.
 set -u
-HOST="${BROKER_HOST:-http://desktop.example.internal}"
+HOST="${BROKER_HOST:-http://127.0.0.1}"
 CTRL="$HOST:11437"
 T=6
 

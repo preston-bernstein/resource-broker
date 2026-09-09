@@ -1,7 +1,7 @@
 # Steps: vLLM/OpenAI-backend VRAM-yield Unloader
 
 ## Prerequisites
-None. The feature is standalone; no prior feature, external access, or live vLLM/systemd host is required. Provisioning the actual vLLM systemd unit and the sudoers/polkit rule on desktop (desktop.example.internal) is out-of-repo operator work and not a dependency for merging this code (see requirements.md "Out of scope").
+None. The feature is standalone; no prior feature, external access, or live vLLM/systemd host is required. Provisioning the actual vLLM systemd unit and the sudoers/polkit rule on desktop (<broker-host>) is out-of-repo operator work and not a dependency for merging this code (see requirements.md "Out of scope").
 
 ## Implementation steps
 

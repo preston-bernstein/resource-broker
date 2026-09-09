@@ -1,37 +1,86 @@
-# Resource Broker
+# ollama-yield
 
-The Resource Broker (called "the Broker" throughout this repo) decides who gets the GPU on a home PC. Three things compete for it: gaming, Plex video transcoding, and Ollama inference (AI model requests). Gaming and Plex always win. The Broker queues inference requests, pauses them, and resumes them around gaming and Plex.
+Stop your local LLM from holding the GPU when you start a game.
 
-This is the **v2 Go HTTP-fronting broker**: a single program, written in Go, that sits between every inference Consumer (a service that sends Ollama requests, such as internal-monitor-app or LightRAG) and Ollama itself. Consumers point at the Broker instead of Ollama directly, so no Consumer needs custom code to cooperate with gaming or Plex. The original Bash version of this idea lives in [`legacy/`](legacy/) for reference only — do not run it alongside the Broker.
+## The problem
 
-The Broker's actual upstream is swappable: it defaults to Ollama's own API (zero change from today), but `UPSTREAM_BACKEND=openai` re-points it at any OpenAI-compatible server (e.g. vLLM) instead, translating requests/responses so every Consumer keeps speaking Ollama's API unchanged. See the `UPSTREAM_BACKEND`/`UPSTREAM_URL`/`UPSTREAM_API_KEY` rows below.
+You run Ollama on the same machine you game on. Ollama loads a model into VRAM and keeps it there. Then you launch a game and it stutters, or it fails to get the VRAM it needs, or a Plex transcode falls back to the CPU.
 
-Read next:
-- [`docs/DESIGN.md`](docs/DESIGN.md) — the design
-- [`docs/adr/`](docs/adr/) — the ADRs, one per major decision
-- [`CONTEXT.md`](CONTEXT.md) — the glossary of every term this repo uses
+Ollama has no way to hand the GPU back. As one open feature request on Ollama puts it, killing the process frees the VRAM but loses all context, and leaving it running keeps the GPU locked up. The usual workaround is stopping and starting the service by hand, which defeats the point of having it always available.
+
+`ollama-yield` does that automatically.
+
+## What it does
+
+It sits in front of Ollama and speaks the same API, so nothing that talks to Ollama has to change. Point your client at it instead.
+
+- **Detects a game or a Plex transcode starting.** When one does, it stops serving inference, cancels anything in flight, and makes Ollama unload its models so the GPU is free.
+- **Resumes on its own** when the game or transcode ends. Queued work is not thrown away.
+- **Keeps two priority lanes.** Interactive requests jump ahead of batch work. Long jobs go to a durable queue that survives a restart.
+
+## It works on any GPU, including AMD
+
+Contention detection reads process command lines. It never calls NVIDIA, CUDA, or ROCm libraries.
+
+That matters if you own an AMD card. Most local-AI tooling assumes NVIDIA, and AMD owners are used to being second class. Here there is nothing vendor-specific to support, so an RX 9070 behaves the same as an RTX 5090.
+
+It detects Steam and Proton games, Lutris, Heroic, and Wine, plus Plex and Tdarr transcodes.
+
+One detail worth knowing: Plex runs its transcoder binary for background maintenance, such as intro detection and thumbnail generation, on its own schedule. A process-name match alone would give false positives and pause your inference for no reason. When you give it a Plex token, it checks Plex's own session list before deciding a transcode is real.
+
+## What it deliberately does not do
+
+Scope, stated up front so a change that fights it can be recognised early.
+
+- **It does not pause and resume a generation in progress.** There is no KV cache serialization. A request interrupted by a game is canceled and has to be retried; a durable job re-runs from the start rather than continuing. Doing it properly needs support inside Ollama, which is [an open request there](https://github.com/ollama/ollama/issues/17298).
+- **It arbitrates one machine's GPU.** Detection reads the local `/proc`, so it has no view of other hosts. It is not a cluster scheduler.
+- **It does not replace Ollama.** It sits in front of Ollama and speaks the same API. Models, prompts and generation are still Ollama's job.
+
+## Requirements
+
+- **Linux.** Detection reads `/proc`. On other systems it reports no contention and the yield feature does nothing.
+- **Go 1.24 or newer** to build. The binary is static, with no C dependencies.
+- **Ollama**, or any OpenAI-compatible server such as vLLM.
+
+Contributions are welcome, and [`CONTRIBUTING.md`](CONTRIBUTING.md) says what gets merged quickly. Adding another game launcher or transcoder to the detection rules is a small, self-contained first change.
+
+## Quick start
+
+```sh
+make build                 # -> bin/resource-broker (static, CGO disabled)
+OLLAMA_URL=http://127.0.0.1:11434 ./bin/resource-broker
+```
+
+Then point your client at port `11435` instead of `11434`:
+
+```sh
+curl localhost:11435/api/generate -d '{"model":"llama3.1:8b","prompt":"hello"}'
+```
+
+Start a game and watch it yield:
+
+```sh
+curl localhost:11437/status
+```
+
+Note: the built binary and the systemd unit are still named `resource-broker`, from before this project was renamed. Renaming them is a separate change so that existing installs keep working.
 
 ## How it works
 
-- **Two listener ports.** Both speak Ollama's own API. The interactive port is high priority; the batch port is low priority. A Consumer picks a port by which one it connects to. Interactive requests jump ahead of batch requests in line.
-- **One request at a time.** The Broker sends at most one request to Ollama at once (concurrency 1).
-- **Yield.** When the Broker detects a game or a Plex transcode running (by matching its process name), it stops serving inference: new requests get `503 Retry-After`, any request already in flight is canceled, and the Broker forces Ollama to unload its models so the GPU is fully free for the game. When the game or transcode ends, the Broker serves inference again.
-- **Two request paths.**
-  - *Synchronous requests* stream live through the Broker's proxy. This covers all interactive work and short batch calls like embeddings. They are stateless: each one waits at most a fixed time budget for its class, then gets `503`, and the Consumer must retry.
-  - *Durable Jobs* are for long batch work (scoring, vision). A Consumer submits one with `POST /jobs`; the Broker saves it to a SQLite database, runs it through the same GPU rule as everything else, and it survives a Broker restart. A Job interrupted by a crash re-runs; one interrupted by gaming or a burst of interactive traffic goes back to the front of the line. See [`docs/DESIGN-jobs.md`](docs/DESIGN-jobs.md) for detail.
-- **Configurable concurrency and protected run time (ADR-0004).** `BROKER_MAX_INFLIGHT` (default 1) sets how many requests may reach Ollama at once. `BROKER_BATCH_QUANTUM` sets how long a running Job is protected from being preempted by an interactive request.
-- **Observable.** The Broker exposes Prometheus metrics at `/metrics`, writes JSON logs, and serves `/status`. Each response also carries: an `X-Broker-Request-Id` header, a unique id minted for every Synchronous request (ADR-0011) so one request's admission, log lines, and response can all be tied together — useful when a Consumer needs to match its own failure to a specific line in the Broker's logs; an `X-Broker-Wait-Ms` header (how long the request waited); an `X-Broker-Status` header (`served`, or `deferred` if it got a 503); and, on streamed responses, an authoritative `X-Broker-Status` trailer with the true final outcome (`served` or `preempted`) — a trailer is needed because a stream can still get preempted after its headers are already sent.
-- **A real `/healthz` (ADR-0010).** It checks three things, not just whether the process is running: that Ollama is reachable, that the durable Job store can be read, and that the Contention-detection loop is still actively polling (not stuck or dead). If any of the three fails, `/healthz` returns `503` naming which dependency is broken, instead of always reporting healthy.
+- **Two listener ports.** Both speak Ollama's own API. The interactive port is high priority; the batch port is low priority. A client picks by which port it connects to, and interactive requests jump ahead of batch requests.
+- **One request at a time.** At most one request reaches Ollama at once, by default.
+- **Yield.** When a game or transcode is detected, new requests get `503 Retry-After`, any request in flight is canceled, and Ollama is forced to unload its models so the GPU is fully free. When the game ends, normal service resumes.
+- **Two request paths.** Synchronous requests stream through the proxy and are stateless: each waits at most a fixed budget, then gets a `503` the client should retry. Durable Jobs are for long batch work, saved to SQLite so they survive a restart. A job interrupted by gaming goes back to the front of the queue. See [`docs/DESIGN-jobs.md`](docs/DESIGN-jobs.md).
+- **Swappable upstream.** It defaults to Ollama's own API, and `UPSTREAM_BACKEND=openai` points it at any OpenAI-compatible server such as vLLM instead, translating both ways so clients keep speaking Ollama's API unchanged.
+- **Observable.** Prometheus metrics at `/metrics`, JSON logs, and a `/status` endpoint. Every response carries a request id, how long it waited, and whether it was served or deferred. Streamed responses carry a trailer with the true final outcome, because a stream can be preempted after its headers are already sent.
+- **A real health check.** `/healthz` verifies three things rather than just that the process is alive: that the upstream is reachable, that the job store is readable, and that the detection loop is still polling. If any fail it returns `503` naming which one.
 
-## Build & run
+Read next:
+- [`docs/DESIGN.md`](docs/DESIGN.md) — the design
+- [`docs/adr/`](docs/adr/) — one architecture decision record per major decision
+- [`CONTEXT.md`](CONTEXT.md) — a glossary of every term this repo uses
 
-```sh
-make build                 # -> bin/ollama-broker (static, CGO disabled)
-OLLAMA_URL=http://127.0.0.1:11434 ./bin/ollama-broker
-```
-
-Requires **Go ≥ 1.24** (the durable Job store uses the pure-Go
-`modernc.org/sqlite` driver, so the binary stays static / CGO-free).
+## Configuration and reference
 
 ### Configuration (env)
 

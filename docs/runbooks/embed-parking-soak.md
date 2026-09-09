@@ -24,7 +24,7 @@ This is a chaos/soak test: a controlled test that forces a real failure conditio
 
 1. **Start a yield** (force Contention):
    ```bash
-   curl -X POST http://desktop.example.internal:11437/control \
+   curl -X POST http://<broker-host>:11437/control \
      -H "Authorization: Bearer $BROKER_CONTROL_TOKEN" \
      -d '{"mode":"yield"}'
    ```
@@ -38,7 +38,7 @@ This is a chaos/soak test: a controlled test that forces a real failure conditio
 
 3. **End the yield** (release the parked requests):
    ```bash
-   curl -X POST http://desktop.example.internal:11437/control \
+   curl -X POST http://<broker-host>:11437/control \
      -H "Authorization: Bearer $BROKER_CONTROL_TOKEN" \
      -d '{"mode":"auto"}'
    ```

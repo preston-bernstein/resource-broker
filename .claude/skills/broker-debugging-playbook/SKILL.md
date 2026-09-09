@@ -29,7 +29,7 @@ Live triage for the Broker: the single-binary Go proxy at `/Users/prestonbernste
 
 | Thing | Value |
 |---|---|
-| Desktop LAN IP | `desktop.example.internal` (run curl from anywhere on LAN; `journalctl`/`systemctl` only on the desktop) |
+| Desktop LAN IP | `<broker-host>` (run curl from anywhere on LAN; `journalctl`/`systemctl` only on the desktop) |
 | Interactive lane | `:11435` (high priority) |
 | Batch lane | `:11436` (low priority) |
 | Control plane | `:11437` — `/status`, `/control`, `/metrics`, `/healthz`, `/jobs` |
@@ -42,7 +42,7 @@ Vocabulary (from `CONTEXT.md`, enforced): **Yield** = Broker surrenders the GPU 
 First command for almost everything:
 
 ```bash
-curl -s http://desktop.example.internal:11437/status | python3 -m json.tool
+curl -s http://<broker-host>:11437/status | python3 -m json.tool
 ```
 
 Fields: `yield.mode` (`auto|yield|serve`), `yield.yielding`, `yield.reason`, `yield.auto_reason`, `queue.{busy,inflight,interactive,batch}`, `jobs` counts, `tdarr.{managed,gpu_workers}`.
@@ -58,20 +58,20 @@ journalctl -u resource-broker -f          # follow live
 
 | # | SYMPTOM | FIRST CHECK | LIKELY CAUSES (ranked) | DISCRIMINATING EXPERIMENT | FIX / ESCALATION |
 |---|---|---|---|---|---|
-| 1 | Every request 503 `broker: yielding GPU: <reason>` | `curl -s http://desktop.example.internal:11437/status` → `yield` block | 1. Real contention (game/Plex running). 2. False-positive detection (`wine.*\.exe` matches a non-game wine app). 3. Stuck manual `ModeForceYield` override. | `yield.mode` = `yield` → override. `mode` = `auto` → read `auto_reason`, then find the matching process (see detail). | Override: `POST /control {"mode":"auto"}`. False positive: kill/exclude the process; rule change goes through `broker-change-control`. |
+| 1 | Every request 503 `broker: yielding GPU: <reason>` | `curl -s http://<broker-host>:11437/status` → `yield` block | 1. Real contention (game/Plex running). 2. False-positive detection (`wine.*\.exe` matches a non-game wine app). 3. Stuck manual `ModeForceYield` override. | `yield.mode` = `yield` → override. `mode` = `auto` → read `auto_reason`, then find the matching process (see detail). | Override: `POST /control {"mode":"auto"}`. False positive: kill/exclude the process; rule change goes through `broker-change-control`. |
 | 2 | Batch 503 `broker: GPU busy: wait budget exceeded` | `journalctl -u resource-broker \| grep BATCH_WAIT` is nothing — check unit env: `systemctl cat resource-broker \| grep BATCH_WAIT` | 1. Wait budget too small for queue depth behind interactive traffic. 2. Genuine sustained interactive storm. 3. `max_inflight` slot leak (rare; check `queue.busy` when idle). | `/status` → `queue.interactive` high while batch defers = budget vs storm. Idle system but `busy: true` = slot leak. | Raise `BROKER_BATCH_WAIT` (live is already 300s per commit `ad07905`); or move the work to a durable Job (`POST /jobs`). Slot leak → restart + file issue. |
 | 3 | Interactive stream cut mid-response | Trailer: `curl --raw` against `:11435` (see detail) | 1. Preemption by Yield (game/Plex started mid-generation). 2. Client-side disconnect/timeout. 3. Ollama crash. | Trailer `X-Broker-Status: preempted` = Yield. Trailer `served` but truncated = client/Ollama side. Missing `{"done":true}` final line also indicates a cut stream. | Expected behavior under contention — retry after `Retry-After`. If no contention existed, check symptom 1 causes and Ollama logs. |
-| 4 | Jobs stuck QUEUED | `curl -s http://desktop.example.internal:11437/jobs/<id>` → `state`, `position` | 1. Yield active (worker holds the line). 2. Interactive storm holding the single slot. 3. Worker/broker not running. | `/status`: `yield.yielding: true` → cause 1; `queue.interactive > 0` persistently → cause 2; control plane unreachable → cause 3. | 1–2: wait, it self-drains (preempted Jobs requeue at FRONT). 3: `systemctl status resource-broker` + journalctl. |
-| 5 | Job FAILED, attempts exhausted | `curl -s http://desktop.example.internal:11437/jobs/<id>` → `attempts`, `error` | 1. Genuine repeated run error (bad model name, prompt too big, Ollama OOM). 2. Broker restart-loop burning attempts. | `error` field: `"exceeded attempts after restart"` = restart-recovery path; any other text = the last real generation error. Cross-check `journalctl -u resource-broker \| grep -c "broker up"`. | Real error: fix the request, resubmit with a NEW Idempotency-Key. Restart-loop: find why the unit is crashing first. |
-| 6 | Image embeddings nearly identical across different images | Where is the consumer pointed? Must be `http://desktop.example.internal:11438/embeddings` | 1. Consumer bypasses the lane and hits Infinity `:7997/embeddings` directly (text-tower trap, ADR-0008). 2. Consumer hits Ollama ports (`11435/11436`) instead of the embed lane. | Embed the SAME image via `:11438/embeddings` and via `127.0.0.1:7997/embeddings` (on desktop); cosine-compare. The lane rewrite to `/embeddings_image` gives a different (correct) vector. | Repoint the consumer at the Broker embed lane `:11438`. Never call Infinity's unified `/embeddings` with images. |
-| 7 | Embed lane connection refused / 404 | `curl -s http://desktop.example.internal:11438/health` | 1. `INFINITY_URL` unset → lane never started (connection refused). 2. Infinity down on `127.0.0.1:7997` (502/503 from lane). 3. Yield active (503 `yielding GPU`). | `journalctl -u resource-broker \| grep "embed lane enabled"` — absent = cause 1. Present but 502 = cause 2. | 1: set `INFINITY_URL` in the unit, restart. 2: restart Infinity on the desktop. 3: symptom 1. |
+| 4 | Jobs stuck QUEUED | `curl -s http://<broker-host>:11437/jobs/<id>` → `state`, `position` | 1. Yield active (worker holds the line). 2. Interactive storm holding the single slot. 3. Worker/broker not running. | `/status`: `yield.yielding: true` → cause 1; `queue.interactive > 0` persistently → cause 2; control plane unreachable → cause 3. | 1–2: wait, it self-drains (preempted Jobs requeue at FRONT). 3: `systemctl status resource-broker` + journalctl. |
+| 5 | Job FAILED, attempts exhausted | `curl -s http://<broker-host>:11437/jobs/<id>` → `attempts`, `error` | 1. Genuine repeated run error (bad model name, prompt too big, Ollama OOM). 2. Broker restart-loop burning attempts. | `error` field: `"exceeded attempts after restart"` = restart-recovery path; any other text = the last real generation error. Cross-check `journalctl -u resource-broker \| grep -c "broker up"`. | Real error: fix the request, resubmit with a NEW Idempotency-Key. Restart-loop: find why the unit is crashing first. |
+| 6 | Image embeddings nearly identical across different images | Where is the consumer pointed? Must be `http://<broker-host>:11438/embeddings` | 1. Consumer bypasses the lane and hits Infinity `:7997/embeddings` directly (text-tower trap, ADR-0008). 2. Consumer hits Ollama ports (`11435/11436`) instead of the embed lane. | Embed the SAME image via `:11438/embeddings` and via `127.0.0.1:7997/embeddings` (on desktop); cosine-compare. The lane rewrite to `/embeddings_image` gives a different (correct) vector. | Repoint the consumer at the Broker embed lane `:11438`. Never call Infinity's unified `/embeddings` with images. |
+| 7 | Embed lane connection refused / 404 | `curl -s http://<broker-host>:11438/health` | 1. `INFINITY_URL` unset → lane never started (connection refused). 2. Infinity down on `127.0.0.1:7997` (502/503 from lane). 3. Yield active (503 `yielding GPU`). | `journalctl -u resource-broker \| grep "embed lane enabled"` — absent = cause 1. Present but 502 = cause 2. | 1: set `INFINITY_URL` in the unit, restart. 2: restart Infinity on the desktop. 3: symptom 1. |
 | 8 | Broker does NOT yield while a game runs | `/status` → `yield.auto_reason` empty while game visibly running | 1. New launcher's cmdline matches no rule. 2. Running on macOS/dev box (`/proc` absent — detection silently disabled, fail-open). 3. `ModeForceServe` override stuck. | On desktop: `cat /proc/<game-pid>/cmdline \| tr '\0' ' '` and test against the rule list (see detail). `yield.mode` = `serve` → cause 3. | Force manually now: `POST /control {"mode":"yield"}`. Adding a detection rule = code change → `broker-change-control`. |
 | 9 | `go test ./...` fails at HEAD | Look at the failing package name | KNOWN as of 2026-07-02: `internal/admin/admin_test.go:31` calls `Mux` with 5 args; signature grew a `TdarrStatusFn` (commit `dd39d20`). | `go test ./... 2>&1 \| grep -v internal/admin` — everything else passes. | Not your bug. Do not "fix" it in passing; see `broker-validation-and-qa`. |
 | 10 | Tdarr GPU workers not restored after yield | `/status` → `tdarr` section | 1. Tdarr integration disabled (needs BOTH `BROKER_TDARR_URL` and `BROKER_TDARR_NODE_ID`). 2. Tdarr API call failed (`gpu_workers: -1`). 3. Estate-scraper window active (Fri 02:00–07:00 pauses GPU workers by schedule). | No `tdarr` key in `/status` = cause 1. `gpu_workers: -1` = cause 2. It's Friday early morning = cause 3. | 1: set both vars (repo `deploy/broker.service` LACKS them — deploy drift; live sets `BROKER_TDARR_GPU_WORKERS=2`). 2: check Tdarr at `:8265`. 3: wait for 07:00. |
 | 11 | Weird contention / GPU state flapping / double arbitration | On desktop: `systemctl status resource-manager` | The legacy Bash daemon `resource-manager.service` STILL runs alongside the Broker (verified 2026-07-02) — an uncoordinated second arbiter, explicitly forbidden by `docs/DESIGN.md`. | Correlate flap timestamps in `journalctl -u resource-broker` vs `journalctl -u resource-manager`. | Treat it as a prime suspect but do NOT stop/disable it ad hoc — that is the `broker-cutover-hardening-campaign` skill's job. |
 | 12 | All lanes down (connection refused on 11435–11438) | `systemctl status resource-broker` on the desktop | 1. Unit stopped/crashed. 2. Config error at startup (`config` error log then exit 1). 3. Port conflict (`listen ... : address already in use`). | `journalctl -u resource-broker -n 50` — look for `"broker up"`, `"config"`, or `"listen"` errors. | Fix config/port, `sudo systemctl restart resource-broker`. Remember: the unit is `resource-broker.service`, not `broker.service`. |
-| 13 | Lane ports (11435/11436) hang or time out (curl `HTTP 000`) while `:11437`/`:11438` answer instantly | `curl -s http://desktop.example.internal:11437/status` → `queue.busy`, `queue.inflight` | 1. A long in-flight generation holds the single GPU slot — the Gate wraps EVERY lane path, so even `GET /api/tags` queues behind it (`BROKER_MAX_INFLIGHT=1`). 2. Only if `busy:false` too: real network/listener issue → symptom 12. | `busy:true, inflight:1` + responsive control plane = working as designed under load, NOT an outage (observed live 2026-07-02: probes with an 8s client timeout got `000` on both lanes mid-generation). | Wait it out or raise the client's timeout past the wait budget. Do NOT restart — that kills the in-flight work to fix a non-problem. Recurring pattern → move the long workload to the Job API. |
-| 14 | Embed lane (`:11438`) itself hangs indefinitely — no response, no timeout, even after minutes; `grep upstream_timeout` in logs is EMPTY (i.e. it never even got that far) | `curl -sm10 -o /dev/null -w '%{http_code}\n' http://desktop.example.internal:11438/metrics` from `:11437` proxied metrics if separately exposed, or `journalctl -u resource-broker -n 50 \| grep embed` | 1. Pre-ADR-0013 binary (no `BROKER_EMBED_TIMEOUT` support) — a stuck Infinity backend call held the lane's single `MaxInflight=1` slot forever, wedging every request behind it permanently, not just for one wait-budget cycle. 2. `BROKER_EMBED_TIMEOUT=0` explicitly set, disabling the bound. | Check the deployed binary's build date/commit against ADR-0013's landing commit; check `deploy/broker.service`/live unit for `BROKER_EMBED_TIMEOUT`. | Deploy the ADR-0013 binary (or unset `BROKER_EMBED_TIMEOUT=0` if it was deliberately disabled) and restart. After the fix, a stuck backend call surfaces as `outcome=upstream_timeout` in `/metrics` and the access log within `BROKER_EMBED_TIMEOUT` (default 30s), not as a permanent wedge — see `rate(broker_requests_total{outcome="upstream_timeout"}[5m]) > 0` alerting in README. |
+| 13 | Lane ports (11435/11436) hang or time out (curl `HTTP 000`) while `:11437`/`:11438` answer instantly | `curl -s http://<broker-host>:11437/status` → `queue.busy`, `queue.inflight` | 1. A long in-flight generation holds the single GPU slot — the Gate wraps EVERY lane path, so even `GET /api/tags` queues behind it (`BROKER_MAX_INFLIGHT=1`). 2. Only if `busy:false` too: real network/listener issue → symptom 12. | `busy:true, inflight:1` + responsive control plane = working as designed under load, NOT an outage (observed live 2026-07-02: probes with an 8s client timeout got `000` on both lanes mid-generation). | Wait it out or raise the client's timeout past the wait budget. Do NOT restart — that kills the in-flight work to fix a non-problem. Recurring pattern → move the long workload to the Job API. |
+| 14 | Embed lane (`:11438`) itself hangs indefinitely — no response, no timeout, even after minutes; `grep upstream_timeout` in logs is EMPTY (i.e. it never even got that far) | `curl -sm10 -o /dev/null -w '%{http_code}\n' http://<broker-host>:11438/metrics` from `:11437` proxied metrics if separately exposed, or `journalctl -u resource-broker -n 50 \| grep embed` | 1. Pre-ADR-0013 binary (no `BROKER_EMBED_TIMEOUT` support) — a stuck Infinity backend call held the lane's single `MaxInflight=1` slot forever, wedging every request behind it permanently, not just for one wait-budget cycle. 2. `BROKER_EMBED_TIMEOUT=0` explicitly set, disabling the bound. | Check the deployed binary's build date/commit against ADR-0013's landing commit; check `deploy/broker.service`/live unit for `BROKER_EMBED_TIMEOUT`. | Deploy the ADR-0013 binary (or unset `BROKER_EMBED_TIMEOUT=0` if it was deliberately disabled) and restart. After the fix, a stuck backend call surfaces as `outcome=upstream_timeout` in `/metrics` and the access log within `BROKER_EMBED_TIMEOUT` (default 30s), not as a permanent wedge — see `rate(broker_requests_total{outcome="upstream_timeout"}[5m]) > 0` alerting in README. |
 
 ## Symptom detail
 
@@ -80,7 +80,7 @@ journalctl -u resource-broker -f          # follow live
 `internal/queue/gate.go` refuses admission with body `broker: yielding GPU: <reason>` (HTTP 503, `Retry-After` set, `X-Broker-Status: deferred`) whenever the yield controller reports yielding — checked both before AND after slot acquisition.
 
 ```bash
-curl -s http://desktop.example.internal:11437/status | python3 -m json.tool
+curl -s http://<broker-host>:11437/status | python3 -m json.tool
 ```
 
 Decision tree on the `yield` block:
@@ -88,7 +88,7 @@ Decision tree on the `yield` block:
 - `mode: "yield"` — a manual `ModeForceYield` override is stuck (someone posted it and forgot). Reset:
 
 ```bash
-curl -s -X POST http://desktop.example.internal:11437/control -d '{"mode":"auto"}'
+curl -s -X POST http://<broker-host>:11437/control -d '{"mode":"auto"}'
 ```
 
 - `mode: "auto"`, `auto_reason` set — detection fired. Reasons map to rules in `internal/detect/detect.go` (first match wins): `plex`, `gaming-steam`, `gaming-lutris`, `gaming-heroic`, `gaming-wine`. The `gaming-wine` rule is regex `wine.*\.exe` with only `protonmail` and `protonvpn` excluded — **any other wine-based app (installers, Office-under-wine, launcher stubs) is a false positive**. Find the culprit on the desktop:
@@ -113,7 +113,7 @@ systemctl cat resource-broker | grep BATCH_WAIT
 If the budget is already generous and batch still defers, the work is too long-running for the synchronous batch lane — submit it as a durable Job instead (Jobs queue instead of failing, and preempted Jobs requeue at the front):
 
 ```bash
-curl -s -X POST http://desktop.example.internal:11437/jobs \
+curl -s -X POST http://<broker-host>:11437/jobs \
   -H 'Idempotency-Key: my-unique-key-001' \
   -d '{"model":"<model>","prompt":"<prompt>"}'
 ```
@@ -125,14 +125,14 @@ Mechanism: on yield the controller cancels the serve context; the gate aborts th
 See the trailer (note `--raw` shows the chunked framing and the trailer after the last chunk; plain `-i` will not show trailers):
 
 ```bash
-curl --raw -is http://desktop.example.internal:11435/api/generate \
+curl --raw -is http://<broker-host>:11435/api/generate \
   -d '{"model":"<model>","prompt":"count to 100 slowly"}' | tail -5
 ```
 
 Check for a complete stream instead:
 
 ```bash
-curl -sN http://desktop.example.internal:11435/api/generate \
+curl -sN http://<broker-host>:11435/api/generate \
   -d '{"model":"<model>","prompt":"hi"}' | tail -1 | grep -c '"done":true'
 ```
 
@@ -141,8 +141,8 @@ curl -sN http://desktop.example.internal:11435/api/generate \
 ### 4. Jobs stuck QUEUED
 
 ```bash
-curl -s http://desktop.example.internal:11437/jobs/<id> | python3 -m json.tool   # state, position, attempts
-curl -s "http://desktop.example.internal:11437/jobs?state=QUEUED"   # states are UPPERCASE; the SQL match is case-sensitive — lowercase silently returns {"jobs":[]}
+curl -s http://<broker-host>:11437/jobs/<id> | python3 -m json.tool   # state, position, attempts
+curl -s "http://<broker-host>:11437/jobs?state=QUEUED"   # states are UPPERCASE; the SQL match is case-sensitive — lowercase silently returns {"jobs":[]}
 ```
 
 The worker loop (`internal/job/worker.go`) deliberately does NOT claim work while yielding ("hold the line"), and it acquires the batch slot BEFORE claiming — so a Job stays QUEUED (never RUNNING-but-idle) while a game plays or interactive traffic saturates the slot. Check in order:
@@ -175,7 +175,7 @@ Suspicious pattern: a Job whose runtime approaches Ollama's own limits crashing 
 
 The trap (ADR-0008): Infinity's unified `POST /embeddings` tokenizes a base64 `data:` URI as **text**, returning near-identical text-tower vectors for every image. The Broker embed lane exists to prevent exactly this: `internal/proxy.NewEmbed` rewrites `/embeddings` and `/v1/embeddings` to Infinity's `/embeddings_image`, keeping the OpenAI wire contract for Consumers.
 
-So if vectors collapse, the Consumer is almost certainly NOT going through the lane. Correct target: `http://desktop.example.internal:11438/embeddings`. Wrong targets that produce this symptom: Infinity `127.0.0.1:7997/embeddings` directly (only reachable from the desktop — loopback-only), or an Ollama port.
+So if vectors collapse, the Consumer is almost certainly NOT going through the lane. Correct target: `http://<broker-host>:11438/embeddings`. Wrong targets that produce this symptom: Infinity `127.0.0.1:7997/embeddings` directly (only reachable from the desktop — loopback-only), or an Ollama port.
 
 Discriminating experiment (on the desktop): embed two clearly different images through `:11438` and through `:7997/embeddings`; the lane's vectors differ per image, the direct ones barely do. Then audit the consumer's base URL config.
 
@@ -186,7 +186,7 @@ The lane is optional: `cmd/broker/main.go` starts it only when `INFINITY_URL` is
 ```bash
 # on the desktop
 journalctl -u resource-broker | grep "embed lane enabled"
-curl -s http://desktop.example.internal:11438/health        # passes through to Infinity
+curl -s http://<broker-host>:11438/health        # passes through to Infinity
 curl -s http://127.0.0.1:7997/health           # desktop only: Infinity direct
 ```
 
@@ -215,9 +215,9 @@ Consequences:
 Immediate mitigation for an unmatched game:
 
 ```bash
-curl -s -X POST http://desktop.example.internal:11437/control -d '{"mode":"yield"}'
+curl -s -X POST http://<broker-host>:11437/control -d '{"mode":"yield"}'
 # ... after gaming:
-curl -s -X POST http://desktop.example.internal:11437/control -d '{"mode":"auto"}'
+curl -s -X POST http://<broker-host>:11437/control -d '{"mode":"auto"}'
 ```
 
 Permanent fix = new detection rule = code change with tests → `broker-change-control`.
@@ -231,7 +231,7 @@ Known-broken as of 2026-07-02: `internal/admin/admin_test.go:31` still calls `Mu
 Tdarr integration activates only when BOTH `BROKER_TDARR_URL` and `BROKER_TDARR_NODE_ID` are set (main.go). On yield the controller calls `PauseGPU` (sets the node's `transcodegpu` workers to 0); on yield-stop `ResumeGPU` restores `BROKER_TDARR_GPU_WORKERS` (default 1; live unit sets 2 as of 2026-07-02). Separately, the internal-scraper-service schedule (Fri 02:00–07:00, hardcoded in `internal/schedule`) pauses GPU workers regardless of yield.
 
 ```bash
-curl -s http://desktop.example.internal:11437/status | python3 -c "import json,sys; print(json.load(sys.stdin).get('tdarr'))"
+curl -s http://<broker-host>:11437/status | python3 -c "import json,sys; print(json.load(sys.stdin).get('tdarr'))"
 ```
 
 - `None` (no `tdarr` key) → integration disabled: a var is missing. Deploy trap: repo `deploy/broker.service` contains NO Tdarr vars, so reinstalling the unit from the repo silently disables Tdarr management.

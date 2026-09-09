@@ -105,13 +105,13 @@ func TestLoadInvalidMaxWaiters(t *testing.T) {
 }
 
 func TestLoadOverrides(t *testing.T) {
-	t.Setenv("OLLAMA_URL", "http://desktop.example.internal:11434")
+	t.Setenv("OLLAMA_URL", "http://192.0.2.10:11434")
 	t.Setenv("BROKER_INTERACTIVE_WAIT", "45s")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.OllamaURL.Host != "desktop.example.internal:11434" {
+	if cfg.OllamaURL.Host != "192.0.2.10:11434" {
 		t.Errorf("OllamaURL.Host = %q", cfg.OllamaURL.Host)
 	}
 	if cfg.InteractiveWait != 45*time.Second {
@@ -455,14 +455,14 @@ func TestLoadPlexDefaults(t *testing.T) {
 
 func TestLoadPlexOverrides(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
-	t.Setenv("PLEX_URL", "http://desktop.example.internal:32400")
+	t.Setenv("PLEX_URL", "http://192.0.2.10:32400")
 	t.Setenv("PLEX_TOKEN", "secret-token")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.PlexURL != "http://desktop.example.internal:32400" {
+	if cfg.PlexURL != "http://192.0.2.10:32400" {
 		t.Errorf("PlexURL = %q", cfg.PlexURL)
 	}
 	if cfg.PlexToken != "secret-token" {
@@ -536,16 +536,16 @@ func TestLoadRoutesThreeRoutes(t *testing.T) {
 
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen,llama")
 	t.Setenv("BROKER_ROUTE_1_BACKEND", "openai")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_LANE", "interactive")
 
 	t.Setenv("BROKER_ROUTE_2_MODELS", "mistral")
 	t.Setenv("BROKER_ROUTE_2_BACKEND", "ollama")
-	t.Setenv("BROKER_ROUTE_2_URL", "http://vmhost.example.internal:11434")
+	t.Setenv("BROKER_ROUTE_2_URL", "http://192.0.2.11:11434")
 	t.Setenv("BROKER_ROUTE_2_LANE", "batch")
 
 	t.Setenv("BROKER_ROUTE_3_MODELS", "phi")
-	t.Setenv("BROKER_ROUTE_3_URL", "http://lan.example.internal:9000")
+	t.Setenv("BROKER_ROUTE_3_URL", "http://192.0.2.12:9000")
 	// BROKER_ROUTE_3_LANE unset: applies to both lanes.
 
 	cfg, err := Load()
@@ -563,8 +563,8 @@ func TestLoadRoutesThreeRoutes(t *testing.T) {
 	if r1.Backend != "openai" {
 		t.Errorf("Routes[0].Backend = %q, want openai", r1.Backend)
 	}
-	if r1.URL == nil || r1.URL.String() != "http://desktop.example.internal:8000" {
-		t.Errorf("Routes[0].URL = %v, want http://desktop.example.internal:8000", r1.URL)
+	if r1.URL == nil || r1.URL.String() != "http://192.0.2.10:8000" {
+		t.Errorf("Routes[0].URL = %v, want http://192.0.2.10:8000", r1.URL)
 	}
 	if r1.Lane != "interactive" {
 		t.Errorf("Routes[0].Lane = %q, want interactive", r1.Lane)
@@ -618,7 +618,7 @@ func TestLoadRouteInvalidURL(t *testing.T) {
 func TestLoadRouteEmptyModelName(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen,,llama")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for empty model name in BROKER_ROUTE_1_MODELS")
 	}
@@ -627,7 +627,7 @@ func TestLoadRouteEmptyModelName(t *testing.T) {
 func TestLoadRouteDuplicateModelSameList(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen,qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for duplicate model name within one route's MODELS list")
 	}
@@ -636,9 +636,9 @@ func TestLoadRouteDuplicateModelSameList(t *testing.T) {
 func TestLoadRouteDuplicateModelAcrossRoutes(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_2_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_2_URL", "http://vmhost.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_2_URL", "http://192.0.2.11:8000")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for the same model name routed by two different routes")
 	}
@@ -647,7 +647,7 @@ func TestLoadRouteDuplicateModelAcrossRoutes(t *testing.T) {
 func TestLoadRouteInvalidLane(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_LANE", "bogus")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for BROKER_ROUTE_1_LANE not in \"\"/interactive/batch")
@@ -657,10 +657,10 @@ func TestLoadRouteInvalidLane(t *testing.T) {
 func TestLoadRouteIndexGap(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	// index 2 deliberately left unset.
 	t.Setenv("BROKER_ROUTE_3_MODELS", "phi")
-	t.Setenv("BROKER_ROUTE_3_URL", "http://lan.example.internal:9000")
+	t.Setenv("BROKER_ROUTE_3_URL", "http://192.0.2.12:9000")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for an index gap (route 2 unset while route 3 configured)")
 	}
@@ -669,10 +669,10 @@ func TestLoadRouteIndexGap(t *testing.T) {
 func TestLoadRouteDuplicateUnitNameAcrossRoutes(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_UNIT_NAME", "vllm-shared")
 	t.Setenv("BROKER_ROUTE_2_MODELS", "llama")
-	t.Setenv("BROKER_ROUTE_2_URL", "http://vmhost.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_2_URL", "http://192.0.2.11:8000")
 	t.Setenv("BROKER_ROUTE_2_UNIT_NAME", "vllm-shared")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for two routes sharing the same resolved _UNIT_NAME")
@@ -682,9 +682,9 @@ func TestLoadRouteDuplicateUnitNameAcrossRoutes(t *testing.T) {
 func TestLoadRouteDuplicateURLAcrossRoutes(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_2_MODELS", "llama")
-	t.Setenv("BROKER_ROUTE_2_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_2_URL", "http://192.0.2.10:8000")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for two routes sharing the same resolved URL")
 	}
@@ -703,7 +703,7 @@ func TestLoadRouteDuplicatesDefaultBackendUnitName(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("UPSTREAM_UNIT_NAME", "vllm")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_UNIT_NAME", "vllm")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for a route UNIT_NAME duplicating the default backend's UPSTREAM_UNIT_NAME")
@@ -713,7 +713,7 @@ func TestLoadRouteDuplicatesDefaultBackendUnitName(t *testing.T) {
 func TestLoadRouteAPIKeyControlCharRejected(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_API_KEY", "sekret\r\nX-Injected: true")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for BROKER_ROUTE_1_API_KEY containing CR/LF")
@@ -735,7 +735,7 @@ func TestLoadRouteTooManyRoutes(t *testing.T) {
 func TestLoadRouteBackendInvalid(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_BACKEND", "bogus")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for BROKER_ROUTE_1_BACKEND=bogus")
@@ -828,7 +828,7 @@ func TestLoadUpstreamIdleTimeoutInvalidDuration(t *testing.T) {
 func TestLoadRouteIdleTimeoutValid(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_UNIT_NAME", "vllm-qwen")
 	t.Setenv("BROKER_ROUTE_1_IDLE_TIMEOUT", "10m")
 
@@ -849,7 +849,7 @@ func TestLoadRouteIdleTimeoutValid(t *testing.T) {
 func TestLoadRouteIdleTimeoutRequiresUnitName(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_IDLE_TIMEOUT", "10m")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for BROKER_ROUTE_1_IDLE_TIMEOUT set without BROKER_ROUTE_1_UNIT_NAME")
@@ -859,7 +859,7 @@ func TestLoadRouteIdleTimeoutRequiresUnitName(t *testing.T) {
 func TestLoadRouteIdleTimeoutNegative(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_UNIT_NAME", "vllm-qwen")
 	t.Setenv("BROKER_ROUTE_1_IDLE_TIMEOUT", "-10m")
 	if _, err := Load(); err == nil {
@@ -870,7 +870,7 @@ func TestLoadRouteIdleTimeoutNegative(t *testing.T) {
 func TestLoadRouteIdleTimeoutZeroDisabled(t *testing.T) {
 	t.Setenv("OLLAMA_URL", "http://127.0.0.1:11434")
 	t.Setenv("BROKER_ROUTE_1_MODELS", "qwen")
-	t.Setenv("BROKER_ROUTE_1_URL", "http://desktop.example.internal:8000")
+	t.Setenv("BROKER_ROUTE_1_URL", "http://192.0.2.10:8000")
 	t.Setenv("BROKER_ROUTE_1_IDLE_TIMEOUT", "0")
 
 	cfg, err := Load()

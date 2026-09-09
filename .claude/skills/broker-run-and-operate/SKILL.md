@@ -1,7 +1,7 @@
 ---
 name: broker-run-and-operate
 description: >
-  Operate the deployed resource-broker on the desktop (desktop.example.internal):
+  Operate the deployed resource-broker on the desktop (<broker-host>):
   systemd unit anatomy, deploy/upgrade steps, control plane (/healthz, /metrics,
   /status, /control), durable Job API cookbook (POST /jobs, Idempotency-Key,
   states, SSE events, cancel), consumer port map (:11435/:11436/:11437/:11438),
@@ -15,7 +15,7 @@ description: >
 # Running and operating the Broker
 
 The Broker is a single Go binary that fronts Ollama on a home desktop
-(desktop.example.internal) whose one GPU (AMD RX 9070 XT) is shared, in priority order:
+(<broker-host>) whose one GPU (AMD RX 9070 XT) is shared, in priority order:
 gaming/Plex > Ollama inference > Tdarr transcoding. Consumers point at Broker
 ports instead of raw Ollama; the Broker queues, yields, and preempts around
 the GPU's real owner.
@@ -40,7 +40,7 @@ the Fronting Proxy), **Embed lane** (the :11438 Infinity path).
 
 | Item | Value |
 |---|---|
-| Host | desktop, desktop.example.internal (Linux) |
+| Host | desktop, <broker-host> (Linux) |
 | Live systemd unit | `resource-broker.service` — **NOT** `broker.service` (see mismatch below) |
 | User/Group | `ollama-broker` (dedicated service user — house rule, see note) |
 | Binary | `/usr/local/bin/resource-broker` (dated Jun 30) |
@@ -176,13 +176,13 @@ curl -s localhost:11437/control    # current yield state only
 **Auth (verified live 2026-08-15, supersedes the 2026-07-02 "unauthenticated"
 warning below this section's history): ADR-0005 is now implemented and
 enabled live.** `BROKER_CONTROL_TOKEN` is set via
-`EnvironmentFile=/home/ollama-broker/resource-broker/broker-control-token.env`
+`EnvironmentFile=/home/<broker-user>/resource-broker/broker-control-token.env`
 on the live unit — read it with `sudo cat` on that path. Once a token is
 configured, POST /control requires it from every caller, loopback included
 (GET /control, /healthz, /metrics, /status stay open regardless):
 
 ```sh
-TOKEN=$(sudo cat /home/ollama-broker/resource-broker/broker-control-token.env | cut -d= -f2)
+TOKEN=$(sudo cat /home/<broker-user>/resource-broker/broker-control-token.env | cut -d= -f2)
 curl -s -XPOST localhost:11437/control -H "Authorization: Bearer $TOKEN" -d '{"mode":"yield"}'   # force yield
 curl -s -XPOST localhost:11437/control -H "Authorization: Bearer $TOKEN" -d '{"mode":"serve"}'   # force serve
 curl -s -XPOST localhost:11437/control -H "Authorization: Bearer $TOKEN" -d '{"mode":"auto"}'    # back to detection (default)
@@ -526,5 +526,5 @@ climbs unexpectedly after a yield-clear in production.
   map: `README.md` ("Deploy", "Consumer integration").
 - Windows: `internal/schedule/schedule.go` `windows` slice.
 - Tdarr wiring: `cmd/broker/main.go` (`runTdarrSchedule`), `internal/tdarr/tdarr.go`.
-- ADR-0005 status: implemented and live as of 2026-08-15 (`internal/admin/admin.go`'s `authorized()`); token lives in `/home/ollama-broker/resource-broker/broker-control-token.env` on the live host, not in this repo.
+- ADR-0005 status: implemented and live as of 2026-08-15 (`internal/admin/admin.go`'s `authorized()`); token lives in `/home/<broker-user>/resource-broker/broker-control-token.env` on the live host, not in this repo.
 - Live per-model route / vLLM cutover state: section 7 above, dated 2026-08-15 — re-verify with `curl -s localhost:11437/status` and `systemctl cat resource-broker`/`systemctl cat vllm` on desktop before trusting it's unchanged.
