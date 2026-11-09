@@ -141,6 +141,15 @@ func newSystemdUnitController(unit string) *systemdUnitController {
 	}
 }
 
+// NewUnitUnloader returns a yield.Unloader for a systemd unit that is not a
+// backend the Broker fronts (BROKER_YIELD_UNITS, ADR-0019): stopped on
+// yield-start, started on yield-clear. It is the same controller the openai
+// backend uses for UPSTREAM_UNIT_NAME, so it inherits the same ordering and
+// polkit requirements (ADR-0014).
+func NewUnitUnloader(unit string) yield.Unloader {
+	return newSystemdUnitController(unit)
+}
+
 // Unload stops the configured systemd unit.
 func (u *systemdUnitController) Unload(ctx context.Context) error {
 	u.mu.Lock()

@@ -24,6 +24,24 @@ Environment=BROKER_INTERACTIVE_WAIT=30s
 # ingestion error out ("GPU busy: wait budget exceeded") whenever an interactive
 # generation is mid-flight. 300s lets batch work queue patiently behind interactive.
 Environment=BROKER_BATCH_WAIT=300s
+
+# Batch concurrency. ADR-0004: concurrency-1 is "a conservative default, not a
+# law; the only law is yielding to gaming" -- this setting never touches the
+# yield controller, so a game or Plex playback still preempts everything.
+#
+# 2026-09-17: at the default of 1, LightRAG's embedding worker (10 calls in
+# flight) turned its own backlog into a lane-wide stall. One embedding is 0.07s
+# of real work, but each call waited ~300s -- the BROKER_BATCH_WAIT cap above --
+# until LightRAG's 2400s worker timeout fired, halted its pipeline, and marked
+# 51 documents failed. Every nightly retry rebuilt the same jam; the corpus sat
+# stale for 18 days behind it. 4 keeps the GPU slot small enough to stay
+# responsive while stopping one chatty consumer from starving the rest.
+Environment=BROKER_MAX_INFLIGHT=4
+# bge-m3-cpu is bge-m3 with num_gpu 0 (algo-corpus embeds). It never uses
+# the GPU, but it took the GPU slot anyway: on 2026-09-29 four CPU embeds held
+# all 4 slots for 80-180s each while the GPU sat at 0% busy, and every
+# interactive request got "GPU busy: wait budget exceeded" (ADR-0018).
+Environment=BROKER_CPU_MODELS=bge-m3-cpu
 Environment=BROKER_DETECT_INTERVAL=3s
 
 # Yield debounce: require this many consecutive same-reason detections before

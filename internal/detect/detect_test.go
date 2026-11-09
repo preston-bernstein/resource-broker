@@ -36,6 +36,10 @@ func TestDetect(t *testing.T) {
 		// exercise wineRe matching before the system32 exclusion applies.
 		{"wine-system32-excluded", []string{`C:\wine\drive_c\windows\system32\winedevice.exe`}, "", false},
 		{"wine-system32-excluded-forward-slash", []string{"/home/user/.wine/drive_c/windows/system32/services.exe"}, "", false},
+		// The Norgate Data Updater runs headless under xvfb-run; its runuser
+		// and xvfb-run wrappers carry the .exe path but are not games.
+		{"wine-xvfb-runuser-excluded", []string{"runuser -u agent -- xvfb-run -a wine /home/agent/.wine/drive_c/Program Files/Norgate Data Updater/bin/dataupdater.norgate.exe"}, "", false},
+		{"wine-xvfb-sh-excluded", []string{"/bin/sh /usr/bin/xvfb-run -a wine /home/agent/.wine/drive_c/Program Files/Norgate Data Updater/bin/dataupdater.norgate.exe"}, "", false},
 		{"plex-beats-steam", []string{"reaper SteamLaunch AppId=1", "Plex Transcoder x"}, "plex", true},
 	}
 	for _, c := range cases {

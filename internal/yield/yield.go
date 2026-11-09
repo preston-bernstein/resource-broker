@@ -86,6 +86,9 @@ const (
 	// triggerIdle is a per-instance idle-unload timeout, driven by
 	// checkIdleLocked.
 	triggerIdle unloadTrigger = "idle"
+	// triggerDisplace is a displaced unit giving way to, or getting back,
+	// the GPU from a displacing route (ADR-0020, displace.go).
+	triggerDisplace unloadTrigger = "displace"
 )
 
 // GPUManager is an optional external GPU consumer (e.g. Tdarr) that the broker
@@ -169,6 +172,17 @@ type Controller struct {
 	// Built once, in NewWithConfirmMulti's filter loop; read-only afterward,
 	// so it is safe to read without holding c.mu. See ConfigureIdle.
 	origToFiltered []int
+
+	// Displacement (ADR-0020); see displace.go. Nil unless ConfigureDisplace
+	// was called. Guarded by mu.
+	displacers [][]int
+	displaces  [][]int
+	unitWant   []bool
+	pollCount  int
+	// Resume hold-off (ADR-0021): unitFreeSince[j] is when unit j's GPU
+	// last became free, zero while it is not free.
+	unitHoldoff   time.Duration
+	unitFreeSince []time.Time
 }
 
 // New returns a Controller in ModeAuto, not yielding, that acts on the first
@@ -389,8 +403,14 @@ func (c *Controller) TrackActivity(origIdx int, next http.Handler) http.Handler 
 		// checkIdleLocked's own startAction-then-spawn sequencing.
 		if c.idleUnloaded[post].CompareAndSwap(true, false) {
 			c.mu.Lock()
+			// Units this instance displaces stop first; the reload waits
+			// for them so the two never hold VRAM at once (ADR-0020).
+			unitWaits := c.stopDisplacedLocked(post)
 			wait, done := c.startAction(post)
 			c.mu.Unlock()
+			if len(unitWaits) > 0 {
+				wait = afterAll(append(unitWaits, wait)...)
+			}
 			go c.doReload(post, wait, done, triggerIdle)
 		}
 		next.ServeHTTP(w, r)
@@ -427,6 +447,8 @@ func (c *Controller) refresh() {
 	c.lastPoll = time.Now()
 	event, r := c.applyLocked()
 	c.checkIdleLocked()
+	c.pollCount++
+	c.reconcileDisplacedLocked()
 	c.mu.Unlock()
 	logTransition(event, r)
 }
@@ -495,6 +517,9 @@ func (c *Controller) applyLocked() (event, reason string) {
 		for i := range c.unloaders {
 			wait, done := c.startAction(i)
 			go c.doUnload(i, wait, done, triggerYield)
+			if c.isDisplaced(i) {
+				c.unitWant[i] = false
+			}
 		}
 		if mgr != nil {
 			go c.pauseGPUMgr(mgr)
@@ -503,22 +528,40 @@ func (c *Controller) applyLocked() (event, reason string) {
 	}
 	c.serveCtx, c.serveCancel = context.WithCancel(context.Background())
 	for i := range c.unloaders {
+		// A displaced unit is started by reconcileDisplacedLocked, which runs
+		// later in this same refresh and only if no displacer holds the GPU.
+		if c.isDisplaced(i) {
+			continue
+		}
+		// An instance with an idle timeout reloads only if it was in use
+		// before the Yield. One that was idle-unloaded, or has been idle
+		// past its timeout, stays unloaded and is marked idle-unloaded, so
+		// TrackActivity wakes it on the next request. lastDispatch is never
+		// touched here: a Yield is not traffic. Before 2026-10-20 every
+		// clear reloaded every instance and reset its idle clock, so Plex
+		// yields every ~35 minutes kept an unused vLLM resident forever
+		// (see ADR-0016's 2026-10-20 amendment). Idle time includes the
+		// Yield itself. Same index range as checkIdleLocked;
+		// c.idleTimeouts, c.lastDispatch, c.inFlight, and c.idleUnloaded
+		// are all sized to len(c.unloaders).
+		if c.idleTimeouts[i] > 0 && c.inFlight[i].Load() == 0 {
+			stamp := c.lastDispatch[i].Load()
+			if c.idleUnloaded[i].Load() || time.Since(time.Unix(0, stamp)) >= c.idleTimeouts[i] {
+				c.idleUnloaded[i].Store(true)
+				// TrackActivity runs without c.mu. A request that started
+				// after the reads above saw idleUnloaded false and lost its
+				// wake. Re-check; if one arrived, take the wake back here.
+				// The CAS keeps it to one reload if a later request won it.
+				if c.inFlight[i].Load() == 0 && c.lastDispatch[i].Load() == stamp {
+					continue
+				}
+				if !c.idleUnloaded[i].CompareAndSwap(true, false) {
+					continue
+				}
+			}
+		}
 		wait, done := c.startAction(i)
 		go c.doReload(i, wait, done, triggerYield)
-	}
-	// A just-cleared (post-Yield) instance must not be immediately eligible
-	// for a fresh Idle-unload before it has had any chance to serve real
-	// traffic: reset lastDispatch[i] to "now" so its idle window starts
-	// counting from when it actually became available again, and reset
-	// idleUnloaded[i] to false so its state is consistent regardless of
-	// whether it was previously idle-unloaded, Contention-unloaded (via the
-	// yield-start branch above), or never unloaded at all — every configured
-	// instance is treated as "fresh" on yield-clear. Same index range
-	// checkIdleLocked iterates (0..len(c.idleTimeouts)-1); c.idleTimeouts,
-	// c.lastDispatch, and c.idleUnloaded are all sized to len(c.unloaders).
-	for i := range c.idleTimeouts {
-		c.lastDispatch[i].Store(time.Now().UnixNano())
-		c.idleUnloaded[i].Store(false)
 	}
 	if mgr != nil {
 		go c.resumeGPUMgr(mgr)

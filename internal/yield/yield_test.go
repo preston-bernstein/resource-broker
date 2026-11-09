@@ -1091,75 +1091,141 @@ func TestCheckIdleLockedSkipsWhenAlreadyIdleUnloaded(t *testing.T) {
 	}
 }
 
-// TestYieldClearResetsIdleState proves applyLocked's eff==false (yield-clear)
-// branch resets every configured instance's idle bookkeeping: an instance
-// that was idle-unloaded before a Contention-triggered Yield started must
-// come out of the yield-clear with lastDispatch reset to ~now and
-// idleUnloaded reset to false, and must NOT be immediately re-idle-unloaded
-// on the very next refresh (its fresh lastDispatch means elapsed time is
-// ~0, well under the configured idle duration).
-func TestYieldClearResetsIdleState(t *testing.T) {
-	d := &fakeDet{}
-	u := &fakeUnloader{}
-	c := NewMulti(d, []Unloader{u}, nil, time.Hour)
-	// A long idle duration, paired with a far-backdated lastDispatch for the
-	// setup idle-unload below: this makes the post-reset "must not
-	// immediately re-fire" assertion robust against scheduling jitter
-	// (elapsed since a ~now reset will be milliseconds, nowhere near 1 hour),
-	// instead of racing a short duration against test execution time.
-	c.ConfigureIdle([]time.Duration{time.Hour})
-
-	// Idle-unload the instance directly via checkIdleLocked, the same way
-	// the existing idle tests do.
-	c.lastDispatch[0].Store(time.Now().Add(-2 * time.Hour).UnixNano())
-	c.checkIdleLocked()
-	if !eventually(t, func() bool { return u.calls() == 1 }) {
-		t.Fatalf("setup: Unload called %d times, want 1 (idle-unload)", u.calls())
-	}
-	if !c.idleUnloaded[0].Load() {
-		t.Fatal("setup: idleUnloaded[0] was not set true by checkIdleLocked")
-	}
-
-	// Trigger a Yield-start, then a Yield-clear. Yield-start unconditionally
-	// unloads every configured instance (applyLocked's eff==true branch,
-	// regardless of idleUnloaded), so u.calls() goes to 2 here — that is
-	// expected setup, not what this test is proving.
-	d.set("gaming-steam", true)
+// yieldCycle runs one Contention-triggered Yield-start and Yield-clear and
+// waits for the Yield-start unload to land, so a test can then check what
+// the clear did.
+func yieldCycle(t *testing.T, c *Controller, d *fakeDet, u *fakeUnloader) {
+	t.Helper()
+	before := u.calls()
+	d.set("plex", true)
 	c.refresh()
 	if y, _ := c.Yielding(); !y {
 		t.Fatal("setup: expected yielding after yield-start")
 	}
-	if !eventually(t, func() bool { return u.calls() == 2 }) {
-		t.Fatalf("setup: Unload called %d times after yield-start, want 2 (idle-unload + yield-start unload)", u.calls())
+	if !eventually(t, func() bool { return u.calls() == before+1 }) {
+		t.Fatalf("setup: Unload called %d times after yield-start, want %d", u.calls(), before+1)
 	}
-	callsAfterYieldStart := u.calls()
-
-	before := time.Now()
 	d.set("", false)
 	c.refresh()
 	if y, _ := c.Yielding(); y {
 		t.Fatal("setup: expected cleared after yield-clear")
 	}
+}
 
-	// lastDispatch[0] must be reset to ~now, and idleUnloaded[0] to false.
-	if c.idleUnloaded[0].Load() {
-		t.Fatal("idleUnloaded[0] was not reset to false on yield-clear")
-	}
-	got := time.Unix(0, c.lastDispatch[0].Load())
-	if got.Before(before.Add(-time.Second)) || got.After(before.Add(time.Second)) {
-		t.Fatalf("lastDispatch[0] = %v, want ~%v (reset to now on yield-clear)", got, before)
-	}
+// TestYieldClearKeepsIdleUnloadedInstanceUnloaded proves a yield-clear does
+// not reload an instance that was idle-unloaded before the Yield started.
+// It stays idle-unloaded, and the next request wakes it (TrackActivity).
+// Found 2026-10-20: Plex yielded about every 35 minutes, each clear reloaded
+// vLLM and reset its 60m idle clock, so vLLM never idle-unloaded and held
+// 9.5 GB of VRAM that pushed Ollama's models onto the CPU.
+func TestYieldClearKeepsIdleUnloadedInstanceUnloaded(t *testing.T) {
+	d := &fakeDet{}
+	u := &fakeUnloader{}
+	c := NewMulti(d, []Unloader{u}, nil, time.Hour)
+	c.ConfigureIdle([]time.Duration{time.Hour})
 
-	// The very next tick must not immediately re-idle-unload the instance:
-	// its fresh lastDispatch means elapsed time is ~0, nowhere near the
-	// configured 1-hour idle duration. u.calls() must stay exactly where it
-	// was right after yield-start (no additional idle-triggered Unload).
-	c.refresh()
-	if got := u.calls(); got != callsAfterYieldStart {
-		t.Fatalf("Unload called %d times after yield-clear + immediate refresh, want still %d (not immediately re-idle-unloaded)", got, callsAfterYieldStart)
+	c.lastDispatch[0].Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	c.checkIdleLocked()
+	if !eventually(t, func() bool { return u.calls() == 1 }) {
+		t.Fatalf("setup: Unload called %d times, want 1 (idle-unload)", u.calls())
+	}
+	stamp := c.lastDispatch[0].Load()
+
+	yieldCycle(t, c, d, u)
+	time.Sleep(20 * time.Millisecond)
+
+	if got := u.reloadCalls(); got != 0 {
+		t.Fatalf("Reload called %d times on yield-clear, want 0 (instance was idle-unloaded)", got)
+	}
+	if !c.idleUnloaded[0].Load() {
+		t.Fatal("idleUnloaded[0] was reset to false on yield-clear, want still true")
+	}
+	if got := c.lastDispatch[0].Load(); got != stamp {
+		t.Fatal("lastDispatch[0] changed on yield-clear, want it untouched")
+	}
+}
+
+// TestYieldClearDoesNotReloadInstanceIdlePastTimeout proves a yield-clear
+// does not reload an instance whose last dispatch is older than its idle
+// timeout, even when no idle tick fired before the Yield started. It is
+// marked idle-unloaded so the next request wakes it.
+func TestYieldClearDoesNotReloadInstanceIdlePastTimeout(t *testing.T) {
+	d := &fakeDet{}
+	u := &fakeUnloader{}
+	c := NewMulti(d, []Unloader{u}, nil, time.Hour)
+	c.ConfigureIdle([]time.Duration{time.Hour})
+	c.lastDispatch[0].Store(time.Now().Add(-2 * time.Hour).UnixNano())
+
+	yieldCycle(t, c, d, u)
+	time.Sleep(20 * time.Millisecond)
+
+	if got := u.reloadCalls(); got != 0 {
+		t.Fatalf("Reload called %d times on yield-clear, want 0 (idle past its timeout)", got)
+	}
+	if !c.idleUnloaded[0].Load() {
+		t.Fatal("idleUnloaded[0] = false after yield-clear, want true so a request wakes it")
+	}
+}
+
+// TestYieldClearReloadsRecentlyUsedInstanceWithoutResettingClock proves a
+// yield-clear reloads an instance used within its idle timeout, and keeps
+// its last-dispatch time. A Yield is not traffic, so it must not restart
+// the idle window.
+func TestYieldClearReloadsRecentlyUsedInstanceWithoutResettingClock(t *testing.T) {
+	d := &fakeDet{}
+	u := &fakeUnloader{}
+	c := NewMulti(d, []Unloader{u}, nil, time.Hour)
+	c.ConfigureIdle([]time.Duration{time.Hour})
+	stamp := time.Now().Add(-10 * time.Minute).UnixNano()
+	c.lastDispatch[0].Store(stamp)
+
+	yieldCycle(t, c, d, u)
+
+	if !eventually(t, func() bool { return u.reloadCalls() == 1 }) {
+		t.Fatalf("Reload called %d times on yield-clear, want 1 (recently used)", u.reloadCalls())
 	}
 	if c.idleUnloaded[0].Load() {
-		t.Fatal("idleUnloaded[0] was set true again immediately after yield-clear")
+		t.Fatal("idleUnloaded[0] = true after yield-clear of a recently used instance")
+	}
+	if got := c.lastDispatch[0].Load(); got != stamp {
+		t.Fatal("lastDispatch[0] reset on yield-clear, want the last real dispatch kept")
+	}
+}
+
+// TestYieldClearReloadsInstanceWithRequestInFlight proves a yield-clear
+// reloads an instance that has a request in flight, even when its last
+// dispatch is older than its idle timeout. Leaving it unloaded would serve
+// that request against a stopped upstream with no wake pending.
+func TestYieldClearReloadsInstanceWithRequestInFlight(t *testing.T) {
+	d := &fakeDet{}
+	u := &fakeUnloader{}
+	c := NewMulti(d, []Unloader{u}, nil, time.Hour)
+	c.ConfigureIdle([]time.Duration{time.Hour})
+	c.lastDispatch[0].Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	c.inFlight[0].Add(1)
+
+	yieldCycle(t, c, d, u)
+
+	if !eventually(t, func() bool { return u.reloadCalls() == 1 }) {
+		t.Fatalf("Reload called %d times on yield-clear, want 1 (request in flight)", u.reloadCalls())
+	}
+	if c.idleUnloaded[0].Load() {
+		t.Fatal("idleUnloaded[0] = true after yield-clear with a request in flight")
+	}
+}
+
+// TestYieldClearReloadsInstanceWithoutIdleTimeout proves an instance with no
+// idle timeout still reloads on every yield-clear, as before.
+func TestYieldClearReloadsInstanceWithoutIdleTimeout(t *testing.T) {
+	d := &fakeDet{}
+	u := &fakeUnloader{}
+	c := NewMulti(d, []Unloader{u}, nil, time.Hour)
+	c.lastDispatch[0].Store(time.Now().Add(-2 * time.Hour).UnixNano())
+
+	yieldCycle(t, c, d, u)
+
+	if !eventually(t, func() bool { return u.reloadCalls() == 1 }) {
+		t.Fatalf("Reload called %d times on yield-clear, want 1 (no idle timeout)", u.reloadCalls())
 	}
 }
 

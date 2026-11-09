@@ -11,7 +11,7 @@ The single program that decides which inference request gets the GPU, and when. 
 _Avoid_: Manager, Orchestrator, Gateway
 
 **Contention**:
-A high-priority claim on the GPU: gaming, or Plex video transcoding. The Broker detects it by matching the process name. While Contention is present, the Broker yields the GPU completely — no inference runs.
+A high-priority claim on the GPU: gaming, or Plex video transcoding. The Broker detects it by matching the process name, corroborated for Plex by its session API. Audio-only Plex playback is explicitly not Contention — music decoding never touches the GPU (ADR-0017). While Contention is present, the Broker yields the GPU completely — no inference runs.
 _Avoid_: Load, Pressure, Busy
 
 **Yield**:

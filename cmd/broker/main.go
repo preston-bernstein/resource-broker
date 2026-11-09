@@ -73,6 +73,7 @@ func main() {
 	sched := queue.New()
 	sched.SetMaxWaiters(cfg.MaxWaiters)
 	sched.SetMaxInflight(cfg.MaxInflight)
+	sched.SetCPUModels(cfg.CPUModels) // ADR-0018: CPU-only models skip the GPU slot
 	sched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
 	detector := detect.New(detect.ProcLister)
 	if cfg.PlexToken != "" {
@@ -357,8 +358,37 @@ func main() {
 // test that constructs Router directly. The fix is strict ordering: ctrl
 // must exist, and every backend must be decorated, BEFORE backend.NewRouter
 // and the AddRoute loop ever run.
+// newUnitUnloader builds the Unloader for one BROKER_YIELD_UNITS entry. A
+// variable so tests can record stop/start without running systemctl.
+var newUnitUnloader = backend.NewUnitUnloader
+
+// routeUnloader returns route rb's Unloader. A variable for the same reason as
+// newUnitUnloader: ConfigureDisplace stops a displacing route at construction.
+var routeUnloader = func(_ config.RouteBackend, b backend.Backend) yield.Unloader { return b.Unloader() }
+
 func buildBroker(cfg *config.Config, detector yield.Detector, be backend.Backend) (router *backend.Router, activeBackend backend.Backend, ctrl *yield.Controller, idleStatus func() any, err error) {
-	if len(cfg.Routes) == 0 {
+	// BROKER_YIELD_UNITS (ADR-0019) go after the default backend and every
+	// route, so the orig indexes 0..len(cfg.Routes) keep their meaning. They
+	// never idle-unload: their idle timeout is always 0.
+	var unitUnloaders []yield.Unloader
+	var unitLabels []string
+	for _, u := range cfg.YieldUnits {
+		unitUnloaders = append(unitUnloaders, newUnitUnloader(u))
+		unitLabels = append(unitLabels, "unit:"+u)
+	}
+
+	if len(cfg.Routes) == 0 && len(unitUnloaders) > 0 {
+		unloaders := append([]yield.Unloader{be.Unloader()}, unitUnloaders...)
+		labels := append([]string{"default"}, unitLabels...)
+		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
+		idleTimeouts := make([]time.Duration, len(unloaders))
+		idleTimeouts[0] = cfg.UpstreamIdleTimeout
+		ctrl.ConfigureIdle(idleTimeouts)
+		if cfg.UpstreamIdleTimeout != 0 {
+			be = backend.WithActivityTracking(be, ctrl, 0)
+		}
+		activeBackend = be
+	} else if len(cfg.Routes) == 0 {
 		// unl may be a true nil yield.Unloader (e.g. an openai backend with no
 		// configured unit name) — NewWithConfirm then passes NewWithConfirmMulti
 		// a zero-length unloaders slice (it does not keep a nil placeholder for
@@ -386,22 +416,40 @@ func buildBroker(cfg *config.Config, detector yield.Detector, be backend.Backend
 		// backend.NewRouter/AddRoute run below — see this function's doc
 		// comment for why the order matters.
 		unloaders := append([]yield.Unloader{be.Unloader()}, routeUnloaders...)
+		unloaders = append(unloaders, unitUnloaders...)
 		labels = append([]string{"default"}, labels...)
+		labels = append(labels, unitLabels...)
 		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
 
 		// idleTimeouts is index-aligned with unloaders/labels above: orig index
-		// 0 is the default backend, orig index i+1 is cfg.Routes[i]. Unlike the
-		// no-routes branch, this slice's length always matches
+		// 0 is the default backend, orig index i+1 is cfg.Routes[i], and the
+		// BROKER_YIELD_UNITS entries follow with a 0 timeout. Unlike the
+		// single-unloader branch, this slice's length always matches
 		// ctrl.origToFiltered's length regardless of any individual nil
 		// Unloader, since the unloaders slice above is always exactly
-		// 1+len(cfg.Routes) long (append never drops a nil element by
-		// position).
-		idleTimeouts := make([]time.Duration, len(cfg.Routes)+1)
+		// 1+len(cfg.Routes)+len(cfg.YieldUnits) long (append never drops a
+		// nil element by position).
+		idleTimeouts := make([]time.Duration, len(unloaders))
 		idleTimeouts[0] = cfg.UpstreamIdleTimeout
 		for i, rb := range cfg.Routes {
 			idleTimeouts[i+1] = rb.IdleTimeout
 		}
 		ctrl.ConfigureIdle(idleTimeouts)
+
+		// BROKER_ROUTE_<N>_DISPLACES (ADR-0020), in the same orig index space:
+		// route i is i+1, yield unit k is 1+len(cfg.Routes)+k.
+		unitOrig := map[string]int{}
+		for k, u := range cfg.YieldUnits {
+			unitOrig[u] = 1 + len(cfg.Routes) + k
+		}
+		displace := map[int][]int{}
+		for i, rb := range cfg.Routes {
+			for _, u := range rb.Displaces {
+				displace[i+1] = append(displace[i+1], unitOrig[u])
+			}
+		}
+		ctrl.ConfigureDisplace(displace)
+		ctrl.SetUnitResumeHoldoff(cfg.UnitResumeHoldoff)
 
 		// Decorate in place — orig index 0 is the default backend, i+1 is
 		// route i — BEFORE NewRouter/AddRoute below capture these values.
@@ -459,7 +507,7 @@ func buildRoutes(cfg *config.Config) (backends []backend.Backend, unloaders []yi
 			return nil, nil, nil, fmt.Errorf("route %d (%v): %w", i, rb.Models, err)
 		}
 		backends[i] = b
-		unloaders[i] = b.Unloader()
+		unloaders[i] = routeUnloader(rb, b)
 		labels[i] = rb.URL.String()
 	}
 	return backends, unloaders, labels, nil

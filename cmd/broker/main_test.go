@@ -13,6 +13,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -447,5 +448,122 @@ func TestMainInteractiveProxyTracksActivityOnNoRoutesPath(t *testing.T) {
 			"1.2s pre-request wait), want near-zero — this means interactiveProxy is not the activity-tracked backend "+
 			"(the bug: main() used the pre-buildBroker be instead of the returned activeBackend). Full /status: %+v\nbroker output:\n%s",
 			since, st, buf.String())
+	}
+}
+
+// recordingUnloader records each Unload/Reload as "stop <unit>"/"start <unit>".
+type recordingUnloader struct {
+	unit  string
+	calls chan<- string
+}
+
+func (r recordingUnloader) Unload(context.Context) error { r.calls <- "stop " + r.unit; return nil }
+func (r recordingUnloader) Reload(context.Context) error { r.calls <- "start " + r.unit; return nil }
+
+func expectCall(t *testing.T, calls <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-calls:
+		if got != want {
+			t.Fatalf("unloader call = %q, want %q", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %q", want)
+	}
+}
+
+// TestBuildBrokerStopsAndStartsYieldUnits checks BROKER_YIELD_UNITS (ADR-0019)
+// on both branches of buildBroker: each unit is stopped when the Broker yields
+// and started when the yield clears, in that order.
+func TestBuildBrokerStopsAndStartsYieldUnits(t *testing.T) {
+	routeURL, err := url.Parse("http://127.0.0.1:19998")
+	if err != nil {
+		t.Fatalf("parse route url: %v", err)
+	}
+	cases := map[string][]config.RouteBackend{
+		"no routes": nil,
+		"with a route": {{
+			Models: []string{"test-model"}, Backend: "openai", URL: routeURL,
+		}},
+	}
+	for name, routes := range cases {
+		t.Run(name, func(t *testing.T) {
+			calls := make(chan string, 8)
+			orig := newUnitUnloader
+			newUnitUnloader = func(unit string) yield.Unloader { return recordingUnloader{unit, calls} }
+			t.Cleanup(func() { newUnitUnloader = orig })
+
+			defaultURL, err := url.Parse("http://127.0.0.1:19999")
+			if err != nil {
+				t.Fatalf("parse default url: %v", err)
+			}
+			be, err := backend.NewInstance("openai", defaultURL, "", "")
+			if err != nil {
+				t.Fatalf("build default backend: %v", err)
+			}
+			cfg := &config.Config{
+				DetectInterval:    time.Minute,
+				YieldConfirmPolls: 1,
+				Routes:            routes,
+				YieldUnits:        []string{"gpu-worker.service"},
+			}
+			_, _, ctrl, _, err := buildBroker(cfg, stubDetector{}, be)
+			if err != nil {
+				t.Fatalf("buildBroker: %v", err)
+			}
+
+			ctrl.SetMode(yield.ModeForceYield)
+			expectCall(t, calls, "stop gpu-worker.service")
+			ctrl.SetMode(yield.ModeAuto)
+			expectCall(t, calls, "start gpu-worker.service")
+		})
+	}
+}
+
+// TestBuildBrokerWiresRouteDisplacement checks ADR-0020's index mapping end to
+// end: the displacing route is stopped once at start, then the unit starts; a
+// request to the route stops the unit before the route's backend starts.
+func TestBuildBrokerWiresRouteDisplacement(t *testing.T) {
+	calls := make(chan string, 16)
+	origUnit, origRoute := newUnitUnloader, routeUnloader
+	newUnitUnloader = func(unit string) yield.Unloader { return recordingUnloader{unit, calls} }
+	routeUnloader = func(rb config.RouteBackend, _ backend.Backend) yield.Unloader {
+		return recordingUnloader{rb.UnitName, calls}
+	}
+	t.Cleanup(func() { newUnitUnloader, routeUnloader = origUnit, origRoute })
+
+	routeURL, _ := url.Parse("http://127.0.0.1:19997")
+	defaultURL, _ := url.Parse("http://127.0.0.1:19999")
+	be, err := backend.NewInstance("openai", defaultURL, "", "")
+	if err != nil {
+		t.Fatalf("build default backend: %v", err)
+	}
+	cfg := &config.Config{
+		DetectInterval:    time.Minute,
+		YieldConfirmPolls: 1,
+		Routes: []config.RouteBackend{{
+			Models: []string{"qwen2.5"}, Backend: "openai", URL: routeURL,
+			UnitName: "vllm", IdleTimeout: time.Hour, Displaces: []string{"gpu-worker.service"},
+		}},
+		YieldUnits: []string{"other.service", "gpu-worker.service"},
+	}
+	router, _, ctrl, _, err := buildBroker(cfg, stubDetector{}, be)
+	if err != nil {
+		t.Fatalf("buildBroker: %v", err)
+	}
+	expectCall(t, calls, "stop vllm")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go ctrl.Run(ctx)
+	expectCall(t, calls, "start gpu-worker.service")
+
+	req := httptest.NewRequest("POST", "/api/chat", strings.NewReader(`{"model":"qwen2.5","messages":[]}`))
+	router.Proxy().ServeHTTP(httptest.NewRecorder(), req)
+	expectCall(t, calls, "stop gpu-worker.service")
+	expectCall(t, calls, "start vllm")
+	select {
+	case got := <-calls:
+		t.Fatalf("unexpected call %q (other.service is not displaced)", got)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

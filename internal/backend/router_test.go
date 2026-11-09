@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/preston-bernstein/resource-broker/internal/httpx"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
@@ -91,25 +92,22 @@ func TestRouterHappyPathDispatch(t *testing.T) {
 // vision-style payload with "model" as the first JSON field must be
 // dispatched correctly, with the forwarded body byte-identical to what was
 // sent, AND the peek step itself must not have buffered the large payload —
-// verified directly against peekModel, which is the only place Router reads
+// verified directly against httpx.PeekModel, which is the only place Router reads
 // from the body before forwarding.
 func TestRouterLargeBodyModelPeekNotFullyBuffered(t *testing.T) {
 	// Build an ~8MB body: {"model":"vision-model","images":["<8MB of base64-ish filler>"]}
 	filler := strings.Repeat("A", 8*1024*1024)
 	body := `{"model":"vision-model","images":["` + filler + `"]}`
 
-	// 1. Prove peekModel itself doesn't buffer the large payload: consumed
+	// 1. Prove httpx.PeekModel itself doesn't buffer the large payload: consumed
 	// bytes should be a tiny fraction of the 8MB body, since "model" is the
-	// first field and peekModel stops right after decoding it.
-	model, consumed, err := peekModel(strings.NewReader(body))
-	if err != nil {
-		t.Fatalf("peekModel() error = %v", err)
-	}
+	// first field and httpx.PeekModel stops right after decoding it.
+	model, consumed := httpx.PeekModel(strings.NewReader(body))
 	if model != "vision-model" {
-		t.Fatalf("peekModel() model = %q, want %q", model, "vision-model")
+		t.Fatalf("httpx.PeekModel() model = %q, want %q", model, "vision-model")
 	}
 	if len(consumed) > 4096 {
-		t.Fatalf("peekModel() consumed %d bytes finding an early model field, want a small peek (not the full %d-byte body)", len(consumed), len(body))
+		t.Fatalf("httpx.PeekModel() consumed %d bytes finding an early model field, want a small peek (not the full %d-byte body)", len(consumed), len(body))
 	}
 
 	// 2. Prove the full dispatch path still forwards a byte-identical body
@@ -636,11 +634,22 @@ func TestRouterIdleThenContentionUnloadOrderingIsNeverConflicting(t *testing.T) 
 		t.Fatalf("Yielding() = (%v,%q), want yielding=true once Contention is active", y, reason)
 	}
 
-	// Clear Contention: the instance should now Reload, strictly after both
-	// prior Unload calls.
+	// Clear Contention: the instance was idle-unloaded before the Yield, so
+	// the clear must leave it unloaded (2026-10-20 change, ADR-0016
+	// amendment). The next routed request wakes it, and that Reload must
+	// still land strictly after both prior Unload calls.
 	det.setContended(false)
+	if !waitUntil(t, func() bool { y, _ := ctrl.Yielding(); return !y }) {
+		t.Fatal("Contention never cleared")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := u.orderLen(); got != 2 {
+		t.Fatalf("Contention-clear reloaded an idle-unloaded instance: order = %v, want [unload unload]", u.snapshot())
+	}
+	w = httptest.NewRecorder()
+	r.ProxyForLane("interactive").ServeHTTP(w, newTestRequest(t, `{"model":"vllm-model"}`))
 	if !waitUntil(t, func() bool { return u.orderLen() == 3 }) {
-		t.Fatal("Contention-clear never fired a Reload for the instance")
+		t.Fatal("a routed request never woke the idle-unloaded instance after Contention cleared")
 	}
 
 	got := u.snapshot()

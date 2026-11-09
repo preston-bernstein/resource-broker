@@ -7,6 +7,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 )
 
@@ -67,6 +68,11 @@ type Scheduler struct {
 	// SetShutdownContext. Defaults to context.Background() (never fires) so
 	// existing tests that never call the setter are unaffected.
 	shutdownCtx context.Context
+
+	// cpuModels are models that run on CPU only (BROKER_CPU_MODELS). Gate
+	// serves them without the GPU slot (ADR-0018). Set once before serving
+	// traffic and never written again, so it is read without the mutex.
+	cpuModels map[string]struct{}
 }
 
 // New returns an idle Scheduler: concurrency 1, default per-class waiter cap.
@@ -99,6 +105,30 @@ func (s *Scheduler) SetMaxInflight(n int) {
 	s.mu.Lock()
 	s.maxInflight = n
 	s.mu.Unlock()
+}
+
+// SetCPUModels names the models that run on CPU only, so Gate serves them
+// without taking the GPU slot or honouring a GPU yield (ADR-0018). A name
+// matches with or without Ollama's ":latest" tag. Call before serving
+// traffic; nil or empty turns the bypass off.
+func (s *Scheduler) SetCPUModels(names []string) {
+	if len(names) == 0 {
+		s.cpuModels = nil
+		return
+	}
+	s.cpuModels = make(map[string]struct{}, len(names))
+	for _, n := range names {
+		s.cpuModels[strings.TrimSuffix(n, ":latest")] = struct{}{}
+	}
+}
+
+// isCPUModel reports whether model was named in SetCPUModels.
+func (s *Scheduler) isCPUModel(model string) bool {
+	if model == "" {
+		return false
+	}
+	_, ok := s.cpuModels[strings.TrimSuffix(model, ":latest")]
+	return ok
 }
 
 // InteractiveWaiting returns a channel pinged when an interactive request parks

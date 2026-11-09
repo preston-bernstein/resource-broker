@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/httpx"
 )
 
 // newRequestID mints an 8-byte hex correlation id for one Synchronous
@@ -86,6 +88,14 @@ func (s *Scheduler) Gate(class Class, wait, upstreamTimeout time.Duration, adm A
 		// always had this via j.ID, see internal/job/worker.go).
 		reqID := newRequestID()
 		w.Header().Set("X-Broker-Request-Id", reqID)
+
+		// A CPU-only model never touches the GPU, so it takes no slot and
+		// ignores a GPU yield (ADR-0018). The body is peeked only when CPU
+		// models are configured; otherwise this is the exact old path.
+		if s.cpuModels != nil && s.isCPUModel(httpx.RequestModel(r)) {
+			serveCPU(w, r, rec, reqID, cls, upstreamTimeout, next)
+			return
+		}
 
 		for {
 			if yielding, reason := adm.Yielding(); yielding {
@@ -187,6 +197,33 @@ func (s *Scheduler) Gate(class Class, wait, upstreamTimeout time.Duration, adm A
 		slog.Info("request", "req_id", reqID, "class", cls, "outcome", outcome,
 			"path", r.URL.Path, "method", r.Method, "wait_ms", waited.Milliseconds())
 	})
+}
+
+// serveCPU forwards a CPU-only model's request straight to next, with no
+// slot and no yield check (ADR-0018). The client's disconnect still cancels
+// it, and a lane's upstreamTimeout still bounds it. It is recorded as
+// "served" so dashboards keep one success label; the log line's cpu_model
+// field tells the two paths apart.
+func serveCPU(w http.ResponseWriter, r *http.Request, rec Recorder, reqID, cls string, upstreamTimeout time.Duration, next http.Handler) {
+	ctx := r.Context()
+	if upstreamTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, upstreamTimeout)
+		defer cancel()
+	}
+	w.Header().Set("X-Broker-Status", "served")
+	w.Header().Set("X-Broker-Wait-Ms", "0")
+	w.Header().Set(http.TrailerPrefix+"X-Broker-Status", "served")
+	next.ServeHTTP(w, r.WithContext(ctx))
+
+	outcome := "served"
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		outcome = "upstream_timeout"
+	}
+	w.Header().Set(http.TrailerPrefix+"X-Broker-Status", outcome)
+	record(rec, cls, outcome, 0)
+	slog.Info("request", "req_id", reqID, "class", cls, "outcome", outcome, "cpu_model", true,
+		"path", r.URL.Path, "method", r.Method, "wait_ms", 0)
 }
 
 // deferRequest writes a 503 with Retry-After and records the outcome.

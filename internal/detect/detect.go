@@ -51,6 +51,13 @@ var wineRe = regexp.MustCompile(`wine.*\.exe`)
 // install path, never from system32.
 var wineSystemDirRe = regexp.MustCompile(`(?i)windows[\\/]system32`)
 
+// headlessDisplay marks a Wine process launched under xvfb-run, a virtual X
+// server nobody can see, so it is a background tool (e.g. the Norgate Data
+// Updater run by `runuser -u agent -- xvfb-run -a wine ...`), never a game.
+// The runuser and xvfb-run wrapper command lines both carry the .exe path,
+// so without this they matched wineRe and held the GPU yielded indefinitely.
+const headlessDisplay = "xvfb-run"
+
 const plexReason = "plex"
 
 // plexProcess matches Plex's transcoder binary. On its own this is not a
@@ -68,7 +75,8 @@ var gamingRules = []rule{
 		return wineRe.MatchString(c) &&
 			!strings.Contains(c, "protonmail") &&
 			!strings.Contains(c, "protonvpn") &&
-			!wineSystemDirRe.MatchString(c)
+			!wineSystemDirRe.MatchString(c) &&
+			!strings.Contains(c, headlessDisplay)
 	}},
 }
 

@@ -1,27 +1,13 @@
 package backend
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"sort"
 
+	"github.com/preston-bernstein/resource-broker/internal/httpx"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
-
-// peekLimit bounds how much of an inbound request body Router will buffer
-// while looking for the "model" field. Inbound vision requests can carry
-// base64-encoded images tens of MB in size (this repo has already been
-// burned once by an unbounded io.ReadAll assumption — see
-// internal/proxy/proxy.go's retryTransport comment — so this Router must not
-// repeat that mistake for the inbound side). 64KB comfortably covers a
-// "model" field appearing anywhere near the front of realistic JSON request
-// bodies (Ollama/OpenAI-compatible chat/generate payloads put "model" among
-// the first few fields) without ever buffering the large parts of a payload
-// (prompt text, base64 images) that follow it.
-const peekLimit = 64 * 1024
 
 // routeEntry is one entry in Router's per-model routing table: the Backend a
 // matching request dispatches to, and the lane ("interactive", "batch", or
@@ -68,8 +54,8 @@ func (r *Router) AddRoute(model, lane string, backend Backend) {
 }
 
 // ProxyForLane returns an http.Handler that, for each incoming request,
-// peeks at the JSON request body's "model" field (bounded to peekLimit
-// bytes — see peekLimit's doc comment) and dispatches to the routed
+// peeks at the JSON request body's "model" field (bounded to 64KB
+// — see httpx.PeekModel) and dispatches to the routed
 // backend's Proxy() if one is configured for that model, else falls back to
 // the default backend's Proxy(). The request body is restored before
 // forwarding either way, so the backend that ultimately handles the request
@@ -105,23 +91,14 @@ func (r *Router) Proxy() http.Handler {
 // resolve peeks at req's body to find a routed backend for the request's
 // model, restoring the body (byte-identical to what was received) before
 // returning. It falls back to the default backend when: req.Body is nil,
-// the "model" field isn't found within peekLimit bytes, no route is
+// the "model" field isn't found within the 64KB peek, no route is
 // configured for that model, or a configured route is scoped to a lane
 // other than lane (when lane is non-empty and the route's lane is
 // non-empty and they differ).
 func (r *Router) resolve(req *http.Request, lane string) Backend {
-	if req.Body == nil || req.Body == http.NoBody {
-		return r.def
-	}
-
-	model, consumed, err := peekModel(req.Body)
-	// Restore the body regardless of outcome: consumed bytes (whatever was
-	// read, even on error or cap-exceeded) followed by whatever remains
-	// unread on the original body. No bytes are dropped and none are
-	// duplicated.
-	req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(consumed), req.Body))
-
-	if err != nil || model == "" {
+	// RequestModel restores the body byte-identical either way.
+	model := httpx.RequestModel(req)
+	if model == "" {
 		return r.def
 	}
 
@@ -139,58 +116,6 @@ func (r *Router) resolve(req *http.Request, lane string) Backend {
 		return r.def
 	}
 	return entry.backend
-}
-
-// peekModel reads at most peekLimit bytes from body via a streaming
-// json.Decoder, stopping as soon as it has decoded the top-level "model"
-// field (whatever comes after — including multi-MB base64 image data in a
-// vision request's "images" field — is never touched). It returns the
-// model name found (empty if none), and the raw bytes consumed from body so
-// the caller can restore them ahead of the remaining unread body.
-//
-// peekModel deliberately does not buffer the whole body: it wraps body in
-// an io.LimitReader capped at peekLimit and additionally tees every byte
-// the decoder actually consumes into a buffer, so "consumed" reflects
-// exactly what the decoder read — no more.
-func peekModel(body io.Reader) (model string, consumed []byte, err error) {
-	var buf bytes.Buffer
-	limited := io.LimitReader(body, peekLimit)
-	teed := io.TeeReader(limited, &buf)
-
-	dec := json.NewDecoder(teed)
-	tok, tokErr := dec.Token() // expect '{'
-	if tokErr != nil {
-		return "", buf.Bytes(), nil // not JSON (or empty) — fall back to default, no error needed
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return "", buf.Bytes(), nil
-	}
-
-	for dec.More() {
-		keyTok, keyErr := dec.Token()
-		if keyErr != nil {
-			return "", buf.Bytes(), nil
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return "", buf.Bytes(), nil
-		}
-		if key == "model" {
-			var val string
-			if decErr := dec.Decode(&val); decErr != nil {
-				return "", buf.Bytes(), nil
-			}
-			return val, buf.Bytes(), nil
-		}
-		// Skip this field's value without caring about its shape (string,
-		// number, nested object/array, etc).
-		var discard json.RawMessage
-		if decErr := dec.Decode(&discard); decErr != nil {
-			return "", buf.Bytes(), nil
-		}
-	}
-	// Reached the end of object (or hit peekLimit) without finding "model".
-	return "", buf.Bytes(), nil
 }
 
 // Generate dispatches to the routed backend for model, if one is

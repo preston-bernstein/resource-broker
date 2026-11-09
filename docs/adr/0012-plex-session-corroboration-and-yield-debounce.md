@@ -1,6 +1,6 @@
 # Plex session corroboration and yield-entry debounce
 
-**Status: accepted; implemented in `internal/plex/`, `internal/detect/detect.go`, `internal/yield/yield.go`, `internal/config/config.go`, wired in `cmd/broker/main.go`.**
+**Status: accepted; implemented in `internal/plex/`, `internal/detect/detect.go`, `internal/yield/yield.go`, `internal/config/config.go`, wired in `cmd/broker/main.go`. Refined by ADR-0017: the `size`-only reading below also counted audio-only playback as Contention, which yielded the GPU for music.**
 
 Detection (ported verbatim from the Bash V3 daemon, see ADR-0001) matches "Plex Transcoder" by process name alone and yields on the first poll that sees it. Two false-positive sources were observed live: (1) Plex runs its own transcoder binary for background maintenance — Skip Intro/Credits detection, chapter-thumbnail generation, loudness analysis — on a server-scheduled cadence, completely independent of anyone watching anything; (2) a single-poll process-match blip (e.g. a game launcher's background housekeeping subprocess transiently matching a gaming regex) is not sustained gameplay. Both false-positive classes make the Broker yield the GPU — refusing all inference — for no real contention, hurting the Broker's actual purpose without protecting anything.
 
