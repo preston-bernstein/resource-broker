@@ -1,0 +1,21 @@
+- [EXPOSURE] — `msg` field on all call sites (Integration points) — The plan fixes the text for `err_msg` but not `msg`. Existing call sites may interpolate `err.Error()`, URLs, or upstream fragments into `msg`, which R19 forbids — Add a rule that `msg` is a constant or built only from allowlisted fields. Run the leak test over every `msg`, and grep existing log calls for `err`/`Error()` interpolation.
+
+- [EXPOSURE] — path field on request lines — Stripping the query string is not enough. Tokens can sit in path segments (Plex-style `/token/...`, route keys). The path is also client-controlled — Log the matched route template instead of the raw path, or allowlist and truncate it.
+
+- [VALIDATION] — `req_id`, `class`, `method` log fields — The plan doesn't say where `req_id` comes from. If it is taken from a client header such as `X-Request-ID`, it allows log forging, unbounded length, and Loki/search cardinality abuse. `class` and `method` carry the same risk if they are derived from client input — Generate `req_id` server-side or validate it (charset `[A-Za-z0-9-]`, max length). Allowlist `class` and `method`. Confirm the logger JSON-encodes with `encoding/json` rather than hand-built strings, so control characters and newlines are escaped.
+
+- [EXPOSURE] — `err_type` mapping — The plan doesn't define behavior for an unmapped error. A natural fallback is `err.Error()`, which brings back the leak — Default unmapped errors to `err_type=unknown` with fixed text. Test that path.
+
+- [SECRETS] — leak test (AC9 and plan) — Coverage is thin. It lists only `UPSTREAM_API_KEY`, `BROKER_ROUTE_1_API_KEY` and `PLEX_TOKEN` (AC9 omits ROUTE_N), and it doesn't say the test covers failure paths. Inbound client `Authorization` headers and query-string tokens aren't covered either — Plant canaries in all of these: every `BROKER_ROUTE_<N>_API_KEY`, the inbound `Authorization` header, a query-string token, and an upstream error body that echoes the key. Drive failed, preempted and `queue_full` paths, and assert the canaries are absent from stdout and stderr.
+
+- [EXPOSURE] — output that bypasses the logger (panics, `http.Server.ErrorLog`, stdlib `log`) — These lines lack `run_id` and can carry request details or stack traces. The plan only flags this as a scope risk, not a leak risk — Route `ErrorLog` and panic recovery through the canonical logger. Grep for `log.Print*`, `fmt.Print*` and `os.Stderr`. Add a test that all captured stdout and stderr lines are canonical.
+
+- [AUTH] — `request.rejected` logging (unauthenticated or invalid requests) — The plan doesn't say whether 401/403 requests are logged. If they are, unauthenticated clients can flood the logs at `warn` level and fill the disk, and logging the presented credential would leak it — Log auth failures with a fixed `err_type=auth` and no credential. Add rate limiting or sampling for repeated rejects, and confirm journald/log rotation limits.
+
+- [INJECTION] — test harness invoking `logging-check.py` via an env-var path — Anyone who controls the env var gets code execution in test or CI. A shell-based pipe would add command injection — Use `exec.Command` with an argv list and no shell. Verify the path is absolute and exists. Run the checker with `python3 -I`.
+
+- [DEPENDENCY] — `logging-check.py` and the golden file under `testdata/` — The checker comes from an unreviewed external pack and its path is unspecified. The golden file is captured from the live pre-change process, so it could contain real hostnames or labels — Pin the checker version or hash. Capture the golden file against a fake upstream with dummy credentials only.
+
+- [SECRETS] — `run_id` generation (`crypto/rand`) — If the read error is ignored, `run_id` becomes zeros or empty and is not unique per start. This is low severity because the ID isn't a secret — Fail startup on a rand error, or fall back to time plus PID.
+
+- [EXPOSURE] — Loki label check (`deploy/` scan only) — The scan misses label configs outside `deploy/` and pipeline stages that promote JSON fields to labels (`labels:`/`json` stages), so R20 can pass falsely — Scan all shipped promtail/alloy/Loki configs repo-wide, including pipeline stages, and name the config paths explicitly in the test.

@@ -1,0 +1,3 @@
+No data model changes exist in this spec ("Data model: No data model changes") — log fields are unstructured JSON, not tables — so no CONSTRAINT/NAMING/MIGRATION/INDEX/TYPE/ENUM findings apply.
+
+[INDEX] — log query by `event`/`run_id` — R20 bans `run_id` and `req_id` as Loki labels, and the plan keeps label config frozen, so every operator query that groups by process run (`run_id`) or filters by event name is a full line-filter scan over the Broker's log stream, not a label-index lookup — fix: accept the scan cost deliberately; emit `event` early in each JSON line and keep queries anchored to literal string matches (e.g. `"request.rejected"` with `|= Runnable`-style filters), and note in the plan that per-run grouping is O(lines) by design since a label is forbidden.

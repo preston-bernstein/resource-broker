@@ -1,0 +1,8 @@
+- TOO LARGE — Step 2 — Bundles run_id generation, canonical log function, level validation, outcome/err fields, event constants, shim, and six test assertions; split run_id plumbing from the event/outcome API.
+- TOO LARGE — Step 3 — Rewrites three separate lanes (interactive, batch, embed) plus partial-path and query-string scrubbing in one step; split per lane.
+- TOO LARGE — Step 4 — Sweeps every remaining call site across cmd/, yield, job, and queue plus shim deletion (compile fixes land wherever events are missing); split shim removal into its own step.
+- TOO SMALL — Step 6 — A single repo-walk test plus one fixture is under 15 minutes; merge into Step 5's acceptance test.
+- DEP ERROR — Step 2 — Depends on Step 1, but the metrics golden baseline shares no code or data with the logger core; drop the dependency so Step 2 can start immediately.
+- UNVERIFIABLE — Step 3 — The test asserts served/rejected lines only and never exercises the partial (stream-cut-after-headers) path the step implements; add a stream-cut case asserting non-empty err_type/err_msg.
+- UNVERIFIABLE — Step 4 — "go test ./... passes" does not verify fixed err_type/err_msg on yield/job/queue failure lines; add assertions on captured failure output from those packages.
+- UNVERIFIABLE — Step 6 — Assumes the Loki label config lives under deploy/ without verifying that; if the shipping config is elsewhere the guard passes vacuously — locate the config first or scan repo-wide.
