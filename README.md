@@ -1,4 +1,4 @@
-# ollama-yield
+# resource-broker
 
 Stop your local LLM from holding the GPU when you start a game.
 
@@ -8,7 +8,7 @@ You run Ollama on the same machine you game on. Ollama loads a model into VRAM a
 
 Ollama has no way to hand the GPU back. As one open feature request on Ollama puts it, killing the process frees the VRAM but loses all context, and leaving it running keeps the GPU locked up. The usual workaround is stopping and starting the service by hand, which defeats the point of having it always available.
 
-`ollama-yield` does that automatically.
+`resource-broker` does that automatically.
 
 ## What it does
 
