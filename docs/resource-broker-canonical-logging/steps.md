@@ -8,9 +8,9 @@
 ## Implementation steps
 
 ### Step 1: Confirm the logging seam and the outcome rule
-**What**: Confirm there is a single log emission point and record its construction model. State the injected-logger decision. Read CONVENTIONS §18 and the logging pack. Settle whether outcome is optional on non-request lines. Add a test that forces the preempted-stream path and records whether it emits a log today.
-**Files**: cmd/broker/main.go, internal/proxy/proxy.go
-**Test**: A short design note names the emission point, the construction model, the injected-logger decision, and the outcome rule. The forced-preemption test runs and its result is in the note.
+**What**: Confirm there is a single log emission point and record its construction model. State the injected-logger decision. Read CONVENTIONS §18 and the logging pack. Settle whether outcome is optional on non-request lines. Write the design note only. Write no code and no test; the forced-preemption test belongs to Step 4.
+**Files**: docs/resource-broker-canonical-logging/design-note.md
+**Test**: The note names the emission point, the construction model, the injected-logger decision, and the outcome rule. It states the forced-preemption case as a requirement for Step 4.
 **Covers**: none
 **Depends on**: none
 **Parallelizable**: No
@@ -34,8 +34,8 @@
 
 ### Step 4: Give request handler lines events and outcomes
 **What**: In the interactive, batch and embed lane handlers, log request.served (info, outcome ok) for admitted, completed requests. Log request.rejected (warn, outcome failed) for turned-away requests such as the 503 during Yield. Log outcome partial for a stream cut after headers. Pass fixed err_type and err_msg texts (yield, queue_full, wait_timeout, preempted, upstream) on every non-ok line. Drop the served outcome value. Log only method, path without query string, class, status and wait time. Use slog.InfoContext and slog.WarnContext so req_id from context survives.
-**Files**: internal/proxy/proxy.go, internal/openaicompat/handler.go, internal/proxy/proxy_test.go
-**Test**: go test on the handler package passes. Captured output shows a request.served line with outcome ok and req_id present. It also shows a request.rejected line with outcome failed, req_id, and non-empty err_type and err_msg. No line has outcome served. Logged paths carry no query string. One test asserts the literal event strings on a response at header time. Another asserts them on a stream at trailer time. Renaming the shared served constant then breaks a test.
+**Files**: internal/proxy/proxy.go, internal/openaicompat/handler.go, internal/proxy/proxy_test.go, cmd/broker/tests/preemption_log_test.go
+**Test**: go test on the handler package passes. Captured output shows a request.served line with outcome ok and req_id present. It also shows a request.rejected line with outcome failed, req_id, and non-empty err_type and err_msg. No line has outcome served. Logged paths carry no query string. One test asserts the literal event strings on a response at header time. Another asserts them on a stream at trailer time. Renaming the shared served constant then breaks a test. A forced-preemption test in cmd/broker/tests drives queue.Gate, cuts a stream after its headers are sent, and asserts outcome partial, err_type preempted and a non-empty err_msg.
 **Covers**: R9, R10, R11, R12, R15, R16, R19
 **Depends on**: 3
 **Parallelizable**: No
