@@ -29,5 +29,3 @@ coverage.html
 # Local agent tooling and working notes, kept out of the repo
 .claude/
 docs/POLISH-*.md
-docs/*/.ctx.md
-docs/*/TASKS.md
