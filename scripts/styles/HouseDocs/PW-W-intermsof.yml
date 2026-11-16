@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Usually cuttable; name the relationship instead. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bin terms of\\b": "(cut)"

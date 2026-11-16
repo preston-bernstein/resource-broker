@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'although'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\b(?:in spite of|despite) the fact that\\b": "although"

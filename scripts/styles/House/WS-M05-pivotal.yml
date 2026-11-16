@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'pivotal'. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\bpivotal\\b": "important / key"

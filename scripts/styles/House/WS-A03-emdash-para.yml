@@ -1,0 +1,6 @@
+message: "More than one em-dash in a paragraph."
+level: "warning"
+extends: "occurrence"
+scope: "paragraph"
+max: 1
+token: "\u2014"

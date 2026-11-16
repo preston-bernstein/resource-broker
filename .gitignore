@@ -29,3 +29,6 @@ coverage.html
 # Local agent tooling and working notes, kept out of the repo
 .claude/
 docs/POLISH-*.md
+
+# Node tools for the gates (ci/package.json)
+node_modules/

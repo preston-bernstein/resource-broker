@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'because of'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bas a result of\\b": "because of"

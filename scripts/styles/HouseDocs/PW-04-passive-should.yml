@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Passive instruction. Write it as an imperative: 'Run the script', not 'the script should be run'."
+level: "warning"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:should be|must be|can be|needs? to be|is to be)\\s+\\w+(?:ed|un)\\b"

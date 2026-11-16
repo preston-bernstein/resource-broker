@@ -1,0 +1,42 @@
+message: "Long sentences at more than 4.5 per 1000 words. WS-A01 forces variance and has no ceiling, so one very long sentence is a valid way to satisfy it; this is the other half of that pair. Rate, not an absolute cap, and the cap sits above Preston's own worst post (4.3 per 1000, longest sentence 87 words): a single deliberate long sentence is his voice, systematic length is not."
+level: "warning"
+extends: "script"
+scope: "raw"
+script: |
+  text := import("text")
+  matches := []
+  strip := func(s) {
+    s = text.re_replace(`(?s)\A---\r?\n.*?\r?\n---\r?\n`, s, "")
+    s = text.re_replace(`(?s)\x60\x60\x60.*?\x60\x60\x60`, s, " ")
+    s = text.re_replace(`(?s)~~~.*?~~~`, s, " ")
+    s = text.re_replace(`\x60[^\x60\n]*\x60`, s, " ")
+    s = text.re_replace(`(?s)<!--.*?-->`, s, " ")
+    s = text.re_replace(`(?m)^\s*\|.*$`, s, " ")
+    s = text.re_replace(`(?m)^\s*>.*$`, s, " ")
+    s = text.re_replace(`\]\([^)]*\)`, s, "]")
+    return s
+  }
+  body := strip(scope)
+  words := text.re_find(`\w+`, body, -1)
+  report := func(snippet) {
+    b := text.index(scope, snippet)
+    if b < 0 {
+      b = 0
+    }
+    return {begin: b, end: b + len(snippet)}
+  }
+  prose := text.re_replace(`(?m)^\s*(?:[-*+]|\d+[.)])\s.*$`, body, " ")
+  prose = text.re_replace(`(?m)^#{1,6}\s.*$`, prose, " ")
+  sentences := text.re_find(`[^.!?]+[.!?]+`, prose, -1)
+  if words != undefined && sentences != undefined && len(words) >= 300 {
+    hits := []
+    for s in sentences {
+      w := text.re_find(`\w+`, s[0].text, -1)
+      if w != undefined && len(w) > 45 {
+        hits = append(hits, s[0])
+      }
+    }
+    if len(hits) * 1000 > 4.5 * len(words) {
+      matches = append(matches, report(hits[0].text))
+    }
+  }

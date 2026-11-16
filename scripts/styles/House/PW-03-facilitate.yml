@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Plain word available: 'help'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bfacilitat(?:e|es|ed|ing)\\b": "help"

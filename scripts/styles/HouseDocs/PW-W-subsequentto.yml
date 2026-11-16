@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'after'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bsubsequent to\\b": "after"

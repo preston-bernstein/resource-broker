@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "A result is already the end. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bend result\\b": "result"

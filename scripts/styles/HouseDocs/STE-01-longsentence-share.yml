@@ -1,0 +1,42 @@
+message: "Over 45%% of body sentences run past 25 words. STE rule 1 caps a description at 25 and an instruction at 20. Measured on 110 real READMEs/docs in ~/dev: overall 37.7%%, p50 26.3%%, p90 46.4%%, cleanest docs under 5%%. The cap sits at p90 on purpose, so it flags systematic bloat rather than one long sentence. List items are excluded: they merge into a single long pseudo-sentence and would fire falsely."
+level: "error"
+extends: "script"
+scope: "raw"
+script: |
+  text := import("text")
+  matches := []
+  strip := func(s) {
+    s = text.re_replace(`(?s)\A---\r?\n.*?\r?\n---\r?\n`, s, "")
+    s = text.re_replace(`(?s)\x60\x60\x60.*?\x60\x60\x60`, s, " ")
+    s = text.re_replace(`(?s)~~~.*?~~~`, s, " ")
+    s = text.re_replace(`\x60[^\x60\n]*\x60`, s, " ")
+    s = text.re_replace(`(?s)<!--.*?-->`, s, " ")
+    s = text.re_replace(`(?m)^\s*\|.*$`, s, " ")
+    s = text.re_replace(`(?m)^\s*>.*$`, s, " ")
+    s = text.re_replace(`\]\([^)]*\)`, s, "]")
+    return s
+  }
+  body := strip(scope)
+  words := text.re_find(`\w+`, body, -1)
+  report := func(snippet) {
+    b := text.index(scope, snippet)
+    if b < 0 {
+      b = 0
+    }
+    return {begin: b, end: b + len(snippet)}
+  }
+  prose := text.re_replace(`(?m)^\s*(?:[-*+]|\d+[.)])\s.*$`, body, " ")
+  prose = text.re_replace(`(?m)^#{1,6}\s.*$`, prose, " ")
+  sentences := text.re_find(`[^.!?]+[.!?]+`, prose, -1)
+  if sentences != undefined && len(sentences) >= 10 {
+    long := 0
+    for s in sentences {
+      w := text.re_find(`\w+`, s[0].text, -1)
+      if w != undefined && len(w) > 25 {
+        long = long + 1
+      }
+    }
+    if long * 100 > 45 * len(sentences) {
+      matches = append(matches, report(sentences[0][0].text))
+    }
+  }

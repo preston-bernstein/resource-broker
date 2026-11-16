@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'decide'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bmake[s]? a decision\\b": "decide"

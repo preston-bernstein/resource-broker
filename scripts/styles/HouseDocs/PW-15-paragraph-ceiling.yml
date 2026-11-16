@@ -1,0 +1,6 @@
+message: "Body paragraph over 150 words. Set far above WS-A06's need_longer_than of 80 on purpose: that rule requires a long paragraph to exist, this one caps it, and a threshold near 80 would make the two contradict. The longest paragraph in 25 published posts is 130 words."
+level: "warning"
+extends: "occurrence"
+scope: "paragraph"
+max: 150
+token: "\\b\\w+\\b"

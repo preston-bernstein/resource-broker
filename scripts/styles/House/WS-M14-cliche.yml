@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Business-cliche idiom. ('the whole argument for X' is allowed when it literally names an argument being summarised, so it is not matched here.)"
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:stops? being a nice-to-have|pulls? its weight|moves? the needle|table stakes)\\b"

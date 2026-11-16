@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Explaining the joke. If a line needs a gloss to land, cut it."
+level: "warning"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\bwhich is (?:ironic|funny|the joke)\\b|\\bif you (?:get|know) (?:the|that) reference\\b"

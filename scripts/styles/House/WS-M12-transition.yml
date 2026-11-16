@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Content-free transition."
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:As technology continues to evolve|In today'?s fast-paced world|It'?s important to note)\\b"
