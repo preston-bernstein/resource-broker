@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "'or not' adds nothing. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bwhether or not\\b": "whether"

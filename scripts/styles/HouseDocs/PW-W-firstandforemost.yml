@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'first'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bfirst and foremost\\b": "first"

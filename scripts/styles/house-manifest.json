@@ -1,0 +1,199 @@
+{
+  "ported": [
+    "AmericanSpelling",
+    "CV-04-explains-joke",
+    "PW-01-selfdesc",
+    "PW-02-utilize",
+    "PW-03-facilitate",
+    "PW-04-passive-should",
+    "PW-14-sentence-ceiling",
+    "PW-15-paragraph-ceiling",
+    "PW-18-expletive",
+    "PW-W-abilityto",
+    "PW-W-absolutelyessential",
+    "PW-W-advanceplanning",
+    "PW-W-alargenumberof",
+    "PW-W-anumberof",
+    "PW-W-asaresultof",
+    "PW-W-atalltimes",
+    "PW-W-atthepresenttime",
+    "PW-W-atthispointintime",
+    "PW-W-basicfundamentals",
+    "PW-W-bymeansof",
+    "PW-W-closeproximity",
+    "PW-W-cometotheconclusion",
+    "PW-W-completelyeliminate",
+    "PW-W-despitethefact",
+    "PW-W-duetothefact",
+    "PW-W-eachandevery",
+    "PW-W-endresult",
+    "PW-W-firstandforemost",
+    "PW-W-forthepurposeof",
+    "PW-W-futureplans",
+    "PW-W-giveconsideration",
+    "PW-W-inatimelymanner",
+    "PW-W-incloseproximity",
+    "PW-W-inconjunctionwith",
+    "PW-W-inmanycases",
+    "PW-W-inorderto",
+    "PW-W-intermsof",
+    "PW-W-intheeventthat",
+    "PW-W-inthenearfuture",
+    "PW-W-intheprocessof",
+    "PW-W-isableto",
+    "PW-W-itiswellknown",
+    "PW-W-itshouldbenoted",
+    "PW-W-majorityof",
+    "PW-W-makeadecision",
+    "PW-W-needlessto",
+    "PW-W-onaregularbasis",
+    "PW-W-pasthistory",
+    "PW-W-priorto",
+    "PW-W-servesto",
+    "PW-W-subsequentto",
+    "PW-W-takeintoconsideration",
+    "PW-W-thefactthat",
+    "PW-W-thereasonwhy",
+    "PW-W-thereisnodoubt",
+    "PW-W-variousdifferent",
+    "PW-W-whetherornot",
+    "PW-W-withregardto",
+    "PW-W-withtheexceptionof",
+    "STE-01-longsentence-share",
+    "STE-03-paragraph-sentences",
+    "STE-04-perfect",
+    "STE-04-progressive",
+    "STE-07-condition-last",
+    "WS-A03-emdash-para",
+    "WS-A04-emdash-rate",
+    "WS-M05-boast",
+    "WS-M05-delve",
+    "WS-M05-foster",
+    "WS-M05-harness",
+    "WS-M05-leverage",
+    "WS-M05-pivotal",
+    "WS-M05-robust",
+    "WS-M05-seamless",
+    "WS-M05-underscore",
+    "WS-M06-copula",
+    "WS-M07-notjust",
+    "WS-M08-xnoty",
+    "WS-M10-hedge",
+    "WS-M11-glue",
+    "WS-M12-transition",
+    "WS-M13-intensifier",
+    "WS-M14-cliche",
+    "WS-M15-negation",
+    "WS-M16-actually",
+    "WS-M17-thats",
+    "WS-M18-signpost",
+    "WS-M22-bareurl",
+    "WS-M99-humanizer"
+  ],
+  "skipped": [
+    {
+      "id": "CV-02-cold-open",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "CV-03-hedge-zero",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-05-teaser-heading",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-06-fence-lang",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-07-length-ceiling",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-08-bold-coverage",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-09-toc",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-10-meta-desc",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-11-unlinked-stat",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-12-date-order",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-13-readability",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-16-heading-density",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-17-passive-rate",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-P01-headingdensity",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "PW-P02-firstperson",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "RS-01-sms-deadpan",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "RS-02-mirror-note",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "RS-03-github-comedy",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A01-window",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A02-openers",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A05-cutratio",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A06-paraspread",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A07-conceit",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A08-fragments",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A09-outreach-len",
+      "reason": "voice register (blog, outreach, SMS, proposal), not repo docs; stays in the n8n writing checker"
+    },
+    {
+      "id": "WS-A10-nominalization",
+      "reason": "needs document structure Vale does not expose (headings, front matter, drafts); stays in the n8n writing checker"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Essential is already absolute. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\babsolutely essential\\b": "essential"

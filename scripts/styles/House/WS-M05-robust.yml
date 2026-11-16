@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'robust'. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\brobust\\b": "solid / reliable"

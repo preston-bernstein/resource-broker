@@ -1,0 +1,33 @@
+extends: "script"
+message: "Condition trailing the instruction ('Return 1 if the trigger fails') over 3 per 1000 words. STE rule 7 puts the condition first. Corpus p50 is 1.09 per 1000 and p75 is 3.24, so this flags roughly the worst quarter. A cap of 5 was measured first and fired on 0 of 109 real docs: with per=1000w the cap is also an absolute floor, so a loose value makes the rule unable to fire at all. Known limit: the pattern also matches a noun clause ('it is unclear when the token expires'), which is why this is warn, not error."
+level: "warning"
+scope: "raw"
+script: |
+  text := import("text")
+  matches := []
+  strip := func(s) {
+    s = text.re_replace(`(?s)\A---\r?\n.*?\r?\n---\r?\n`, s, "")
+    s = text.re_replace(`(?s)\x60\x60\x60.*?\x60\x60\x60`, s, " ")
+    s = text.re_replace(`(?s)~~~.*?~~~`, s, " ")
+    s = text.re_replace(`\x60[^\x60\n]*\x60`, s, " ")
+    s = text.re_replace(`(?s)<!--.*?-->`, s, " ")
+    s = text.re_replace(`(?m)^\s*\|.*$`, s, " ")
+    s = text.re_replace(`(?m)^\s*>.*$`, s, " ")
+    s = text.re_replace(`\]\([^)]*\)`, s, "]")
+    return s
+  }
+  body := strip(scope)
+  words := text.re_find(`\w+`, body, -1)
+  report := func(snippet) {
+    b := text.index(scope, snippet)
+    if b < 0 {
+      b = 0
+    }
+    return {begin: b, end: b + len(snippet)}
+  }
+  found := text.re_find(`(?i)\w+\s+(?:if|when|unless)\s+[^.!?;]{5,}[.!?]`, body, -1)
+  if found != undefined && words != undefined && len(words) >= 0 {
+    if len(found) > 3 && len(found) * 1000 > 3 * len(words) {
+      matches = append(matches, report(found[0][0].text))
+    }
+  }

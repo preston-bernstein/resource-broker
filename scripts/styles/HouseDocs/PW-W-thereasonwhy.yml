@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "'why' is redundant after 'the reason'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bthe reason why\\b": "the reason"

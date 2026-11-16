@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Plain word available: 'use'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\butiliz(?:e|es|ed|ing|ation)\\b": "use"

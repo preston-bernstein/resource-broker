@@ -1,0 +1,7 @@
+extends: "existence"
+message: "'not just X, it's Y' / 'not only X but also Y'. State the thing directly."
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\bnot (?:just|only)\\b[^.!?]{0,60}\\b(?:but(?: also)?|it'?s|it is|they'?re)\\b"

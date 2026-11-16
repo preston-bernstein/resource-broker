@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'if'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bin the event that\\b": "if"

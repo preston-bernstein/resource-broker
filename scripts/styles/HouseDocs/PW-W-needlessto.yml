@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "If it is needless, cut it. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bneedless to say\\b": "(cut)"

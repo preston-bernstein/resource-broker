@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'delve'. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\bdelv(?:e|es|ed|ing)\\b": "explore / look at"

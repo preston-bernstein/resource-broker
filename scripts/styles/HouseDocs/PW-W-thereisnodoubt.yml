@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Cut it and state the thing. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bthere is no doubt that\\b": "(cut)"

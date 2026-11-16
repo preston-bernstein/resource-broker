@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'always'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bat all times\\b": "always"

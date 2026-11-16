@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Elimination is already complete. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bcompletely (?:eliminate[sd]?|remove[sd]?)\\b": "eliminate"

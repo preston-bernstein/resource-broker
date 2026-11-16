@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Hollow verdict intensifier. Replace with the reason."
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:plain and simple|make no mistake|at the end of the day|the bottom line)\\b|,\\s*full stop\\."

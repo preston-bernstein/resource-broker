@@ -1,0 +1,33 @@
+extends: "script"
+message: "Progressive verb form ('is running') over 2 per 1000 words. STE rule 4 allows simple present, simple past, future and the imperative only. Corpus runs 0.67 per 1000, p90 1.9, worst doc 5.62."
+level: "warning"
+scope: "raw"
+script: |
+  text := import("text")
+  matches := []
+  strip := func(s) {
+    s = text.re_replace(`(?s)\A---\r?\n.*?\r?\n---\r?\n`, s, "")
+    s = text.re_replace(`(?s)\x60\x60\x60.*?\x60\x60\x60`, s, " ")
+    s = text.re_replace(`(?s)~~~.*?~~~`, s, " ")
+    s = text.re_replace(`\x60[^\x60\n]*\x60`, s, " ")
+    s = text.re_replace(`(?s)<!--.*?-->`, s, " ")
+    s = text.re_replace(`(?m)^\s*\|.*$`, s, " ")
+    s = text.re_replace(`(?m)^\s*>.*$`, s, " ")
+    s = text.re_replace(`\]\([^)]*\)`, s, "]")
+    return s
+  }
+  body := strip(scope)
+  words := text.re_find(`\w+`, body, -1)
+  report := func(snippet) {
+    b := text.index(scope, snippet)
+    if b < 0 {
+      b = 0
+    }
+    return {begin: b, end: b + len(snippet)}
+  }
+  found := text.re_find(`(?i)\b(?:is|are|was|were|be|been|being)\s+[a-z]+ing\b`, body, -1)
+  if found != undefined && words != undefined && len(words) >= 0 {
+    if len(found) > 2 && len(found) * 1000 > 2 * len(words) {
+      matches = append(matches, report(found[0][0].text))
+    }
+  }

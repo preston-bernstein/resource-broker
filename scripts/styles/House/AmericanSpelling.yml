@@ -1,0 +1,12 @@
+extends: "existence"
+level: "error"
+nonword: true
+ignorecase: true
+message: "Use American spelling: '%s' is British."
+tokens:
+  - "\\b(?:colour|behaviour|favour|honour|labour|neighbour|flavour|humour|rumour|savour|harbour|vapour|armour|endeavour|rigour|odour)(?:s|ed|ing|ite|ites|al|ful)?\\b"
+  - "\\b(?:organis|recognis|realis|optimis|normalis|serialis|initialis|customis|categoris|summaris|utilis|minimis|maximis|finalis|authoris|synchronis|prioritis|standardis|visualis|centralis|emphasis|apologis|generalis|specialis|capitalis|materialis|sanitis|randomis|stabilis|virtualis|containeris|parallelis|modularis|localis|digitis|tokenis|characteris|neutralis)(?:e|es|ed|ing|ation|ations|er|ers)\\b"
+  - "\\banalys(?:e|es|ed|ing)\\b"
+  - "\\b(?:centre|metre|litre|fibre|theatre|calibre|sabre)s?\\b"
+  - "\\b(?:defence|offence|pretence|licence|practise|practised|practising)\\b"
+  - "\\b(?:catalogue|catalogues|grey|programme|programmes|cheque|tyre|tyres|aluminium|artefact|artefacts|whilst|amongst|fulfil|enrol|instalment|judgement|ageing|acknowledgement|labelled|labelling|modelled|modelling|travelled|travelling|signalled|signalling)\\b"

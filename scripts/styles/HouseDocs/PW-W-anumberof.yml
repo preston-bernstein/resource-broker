@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Name the number, or say 'several'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\ba number of\\b": "several"

@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "'in order to' is always just 'to'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bin order to\\b": "to"

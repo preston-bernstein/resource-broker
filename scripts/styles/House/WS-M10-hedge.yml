@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Vague hedge. Say the thing or cut it. ('seems' softening one named aesthetic judgment is the allowed exception and is not flagged here.)"
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:generally speaking|arguably|to some extent|it'?s worth noting that)\\b"

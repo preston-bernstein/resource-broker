@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'most'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\b(?:a|the) majority of\\b": "most"

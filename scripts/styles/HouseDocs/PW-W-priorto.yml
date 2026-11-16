@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'before'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bprior to\\b": "before"

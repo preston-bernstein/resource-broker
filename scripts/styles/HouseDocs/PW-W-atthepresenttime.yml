@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'now'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bat the present time\\b": "now"

@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'consider'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\btake[sn]? into consideration\\b": "consider"

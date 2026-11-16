@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'seamless'. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\bseamless(?:ly)?\\b": "smooth"
