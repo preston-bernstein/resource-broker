@@ -15,6 +15,12 @@ permissions:
   contents: read
 
 jobs:
+  ci:
+    uses: preston-bernstein/ci-workflows/.github/workflows/go.yml@980585f4e9c3c1ef982cb934e153f925121fe0c0 # v1
+
+  workflows:
+    uses: preston-bernstein/ci-workflows/.github/workflows/actions-lint.yml@980585f4e9c3c1ef982cb934e153f925121fe0c0 # v1
+
   # Each gate runs once, here. The same scripts run in .githooks/pre-commit.
   gates:
     name: gates
