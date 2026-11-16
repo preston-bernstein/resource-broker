@@ -1,6 +1,7 @@
 package broker_test
 
 import (
+	"context"
 	"os/exec"
 	"testing"
 )
@@ -17,7 +18,7 @@ func TestSpecFolderFilesAreNotGitignored(t *testing.T) {
 		"docs/some-feature/TASKS.md",
 	} {
 		// git check-ignore exits 0 when the path IS ignored, 1 when it is not.
-		err := exec.Command("git", "-C", "..", "check-ignore", "-q", "--no-index", path).Run() //nolint:gosec // path comes from the fixed list above, not from input
+		err := exec.CommandContext(context.Background(), "git", "-C", "..", "check-ignore", "-q", "--no-index", path).Run() //nolint:gosec // path comes from the fixed list above, not from input
 		if err == nil {
 			t.Errorf("%s is gitignored; the runner cannot commit it", path)
 		}
