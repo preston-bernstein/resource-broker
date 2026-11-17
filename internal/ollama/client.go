@@ -47,6 +47,16 @@ type GenerateRequest struct {
 // final token count, or ctx.Err() if the call is cancelled (job cancel, yield,
 // or preemption) — the partial response is discarded in that case.
 func (c *Client) Generate(ctx context.Context, req GenerateRequest, onTokens func(int)) (string, int, error) {
+	resp, err := c.postGenerate(ctx, req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer drainClose(resp)
+	return readGenerateStream(ctx, resp.Body, onTokens)
+}
+
+// generateBody is the /api/generate JSON body for req.
+func generateBody(req GenerateRequest) map[string]any {
 	body := map[string]any{"model": req.Model, "prompt": req.Prompt, "stream": true}
 	for k, v := range req.Options {
 		// Never let caller options override the fields the broker controls.
@@ -55,39 +65,52 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, onTokens fun
 		}
 		body[k] = v
 	}
-	payload, err := json.Marshal(body)
+	return body
+}
+
+// postGenerate sends the request and returns the open response, which the
+// caller must drainClose. A non-200 status is an error and closes the body.
+func (c *Client) postGenerate(ctx context.Context, req GenerateRequest) (*http.Response, error) {
+	payload, err := json.Marshal(generateBody(req))
 	if err != nil {
-		return "", 0, err
+		return nil, fmt.Errorf("encode generate request: %w", err)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/api/generate"), bytes.NewReader(payload))
 	if err != nil {
-		return "", 0, err
+		return nil, fmt.Errorf("build generate request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := c.gen.Do(httpReq)
 	if err != nil {
-		return "", 0, err
+		return nil, fmt.Errorf("ollama /api/generate: %w", err)
 	}
-	defer drainClose(resp)
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("ollama /api/generate: status %d", resp.StatusCode)
+		drainClose(resp)
+		return nil, fmt.Errorf("ollama /api/generate: status %d", resp.StatusCode)
 	}
+	return resp, nil
+}
 
+// generateChunk is one NDJSON line of the /api/generate stream.
+type generateChunk struct {
+	Response  string `json:"response"`
+	Done      bool   `json:"done"`
+	EvalCount int    `json:"eval_count"`
+	Error     string `json:"error"`
+}
+
+// readGenerateStream accumulates the response text from the NDJSON stream r.
+func readGenerateStream(ctx context.Context, r io.Reader, onTokens func(int)) (string, int, error) {
 	var sb strings.Builder
 	tokens := 0
-	sc := bufio.NewScanner(resp.Body)
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // tolerate long NDJSON lines
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
 			continue
 		}
-		var chunk struct {
-			Response  string `json:"response"`
-			Done      bool   `json:"done"`
-			EvalCount int    `json:"eval_count"`
-			Error     string `json:"error"`
-		}
+		var chunk generateChunk
 		if err := json.Unmarshal(line, &chunk); err != nil {
 			return "", tokens, fmt.Errorf("decode stream chunk: %w", err)
 		}
@@ -102,25 +125,32 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, onTokens fun
 			}
 		}
 		if chunk.Done {
-			if chunk.EvalCount > 0 {
-				tokens = chunk.EvalCount
-			}
-			return sb.String(), tokens, nil
+			return sb.String(), finalTokenCount(tokens, chunk), nil
 		}
 	}
-	if err := sc.Err(); err != nil {
-		// Context cancellation surfaces here as a read error; report it as such.
-		if ctx.Err() != nil {
-			return "", tokens, ctx.Err()
-		}
-		return "", tokens, err
+	return "", tokens, streamEndError(ctx, sc.Err())
+}
+
+// finalTokenCount prefers the count Ollama reports on the done chunk.
+func finalTokenCount(counted int, done generateChunk) int {
+	if done.EvalCount > 0 {
+		return done.EvalCount
+	}
+	return counted
+}
+
+// streamEndError explains why the stream ended without a done chunk.
+func streamEndError(ctx context.Context, scanErr error) error {
+	// Context cancellation surfaces as a read error; report it as such.
+	if ctx.Err() != nil {
+		return fmt.Errorf("ollama generate: %w", ctx.Err())
+	}
+	if scanErr != nil {
+		return fmt.Errorf("read generate stream: %w", scanErr)
 	}
 	// Stream ended without a done marker (e.g. upstream closed) — treat as error
 	// so the Job can retry rather than persist a truncated result as success.
-	if ctx.Err() != nil {
-		return "", tokens, ctx.Err()
-	}
-	return "", tokens, fmt.Errorf("ollama stream ended without done")
+	return fmt.Errorf("ollama stream ended without done")
 }
 
 // LoadedModels returns the names of models currently resident in memory,
@@ -128,11 +158,11 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, onTokens fun
 func (c *Client) LoadedModels(ctx context.Context) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/api/ps"), nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("LoadedModels: build request: %w", err)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("LoadedModels: send request: %w", err)
 	}
 	defer drainClose(resp)
 	if resp.StatusCode != http.StatusOK {
@@ -144,7 +174,7 @@ func (c *Client) LoadedModels(ctx context.Context) ([]string, error) {
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("LoadedModels: decode response: %w", err)
 	}
 	names := make([]string, 0, len(body.Models))
 	for _, m := range body.Models {
@@ -182,12 +212,12 @@ func (c *Client) unloadOne(ctx context.Context, model string) error {
 	payload, _ := json.Marshal(map[string]any{"model": model, "keep_alive": 0})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/api/generate"), bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return fmt.Errorf("unloadOne: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("unloadOne: send request: %w", err)
 	}
 	defer drainClose(resp)
 	if resp.StatusCode != http.StatusOK {
@@ -199,8 +229,8 @@ func (c *Client) unloadOne(ctx context.Context, model string) error {
 // drainClose reads any remaining body and closes it so the keep-alive
 // connection can be reused instead of leaking.
 func drainClose(resp *http.Response) {
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 }
 
 func (c *Client) url(path string) string {

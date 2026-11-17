@@ -8,8 +8,6 @@
 LOG="/var/log/resource-manager.log"
 STATE_FILE="/tmp/resource-manager-state"
 QUEUE_DIR="/var/lib/batch-jobs/queue"
-# shellcheck disable=SC2034 # existing pattern; unchanged in the pack-compliance pass
-OLLAMA_API="http://localhost:11434/api"
 
 # Create queue directory if it doesn't exist
 mkdir -p "$QUEUE_DIR"
@@ -66,8 +64,8 @@ add_to_queue() {
   local QUEUE_FILE="${QUEUE_DIR}/${PRIORITY}-${JOB_ID}.job"
 
   # Create job metadata (command needs to be JSON-escaped)
-  # shellcheck disable=SC2155 # existing pattern; unchanged in the pack-compliance pass
-  local COMMAND_JSON=$(echo "$COMMAND" | jq -Rs .)
+  local COMMAND_JSON
+  COMMAND_JSON=$(echo "$COMMAND" | jq -Rs .)
 
   cat >"$QUEUE_FILE" <<EOF
 {
@@ -92,16 +90,16 @@ get_job_info() {
   local PID=$1
 
   # Read command line to extract job details
-  # shellcheck disable=SC2086,SC2155 # existing pattern; unchanged in the pack-compliance pass
-  local CMDLINE=$(cat /proc/$PID/cmdline 2>/dev/null | tr '\0' ' ')
+  local CMDLINE
+  CMDLINE=$(cat /proc/"$PID"/cmdline 2>/dev/null | tr '\0' ' ')
 
   # Try to extract job ID from command line
-  # shellcheck disable=SC2155 # existing pattern; unchanged in the pack-compliance pass
-  local JOB_ID=$(echo "$CMDLINE" | grep -o '\--job-id [^ ]*' | awk '{print $2}')
+  local JOB_ID
+  JOB_ID=$(echo "$CMDLINE" | grep -o '\--job-id [^ ]*' | awk '{print $2}')
 
   # Try to extract full command (everything after --command)
-  # shellcheck disable=SC2155 # existing pattern; unchanged in the pack-compliance pass
-  local COMMAND=$(echo "$CMDLINE" | sed -n 's/.*--command \(.*\)/\1/p')
+  local COMMAND
+  COMMAND=$(echo "$CMDLINE" | sed -n 's/.*--command \(.*\)/\1/p')
 
   # If we can't extract details, generate generic ones
   if [ -z "$JOB_ID" ]; then
@@ -119,8 +117,12 @@ process_queue() {
   log "=== Processing job queue ==="
 
   # Count jobs
-  # shellcheck disable=SC2012,SC2155 # existing pattern; unchanged in the pack-compliance pass
-  local JOB_COUNT=$(ls "$QUEUE_DIR"/*.job 2>/dev/null | wc -l)
+  local job_files=()
+  local queued_file
+  for queued_file in "$QUEUE_DIR"/*.job; do
+    [ -e "$queued_file" ] && job_files+=("$queued_file")
+  done
+  local JOB_COUNT=${#job_files[@]}
 
   if [ "$JOB_COUNT" -eq 0 ]; then
     log "Queue empty, nothing to process"
@@ -130,8 +132,7 @@ process_queue() {
   log "Found $JOB_COUNT queued jobs"
 
   # Process jobs in priority order (1-* comes before 2-*)
-  # shellcheck disable=SC2012 # existing pattern; unchanged in the pack-compliance pass
-  for job_file in $(ls "$QUEUE_DIR"/*.job 2>/dev/null | sort); do
+  for job_file in "${job_files[@]}"; do
     # Check if resources still available (could have changed)
     if detect_resource_contention >/dev/null; then
       log "Resources contested again, stopping queue processing"
@@ -185,14 +186,13 @@ enter_high_resource_state() {
   log "Gaming/Plex gets 100% resources - queueing all Ollama requests"
 
   # Find and interrupt all running batch jobs
-  # shellcheck disable=SC2155 # existing pattern; unchanged in the pack-compliance pass
-  local BATCH_PIDS=$(pgrep -f "batch-job-wrapper")
+  local BATCH_PIDS
+  BATCH_PIDS=$(pgrep -f "batch-job-wrapper")
 
   if [ -n "$BATCH_PIDS" ]; then
     for pid in $BATCH_PIDS; do
       # Get job info before killing
-      # shellcheck disable=SC2086 # existing pattern; unchanged in the pack-compliance pass
-      JOB_INFO=$(get_job_info $pid)
+      JOB_INFO=$(get_job_info "$pid")
       JOB_ID=$(echo "$JOB_INFO" | cut -d'|' -f1)
       COMMAND=$(echo "$JOB_INFO" | cut -d'|' -f2-)
 
@@ -200,8 +200,7 @@ enter_high_resource_state() {
       add_to_queue "$JOB_ID" 1 "$COMMAND" "$REASON"
 
       # Kill the job
-      # shellcheck disable=SC2086 # existing pattern; unchanged in the pack-compliance pass
-      kill $pid 2>/dev/null
+      kill "$pid" 2>/dev/null
       log "Killed batch job PID $pid, added to queue: $JOB_ID"
     done
   else
@@ -218,8 +217,8 @@ enter_high_resource_state() {
 
 # Exit high-resource state (resources freed)
 exit_high_resource_state() {
-  # shellcheck disable=SC2155 # existing pattern; unchanged in the pack-compliance pass
-  local PREVIOUS_REASON=$(cat "$STATE_FILE" 2>/dev/null | cut -d':' -f2)
+  local PREVIOUS_REASON
+  PREVIOUS_REASON=$(cat "$STATE_FILE" 2>/dev/null | cut -d':' -f2)
 
   log "=== RESOURCES FREED (was: $PREVIOUS_REASON) ==="
   log "Ollama now has full access: 16 cores, 30GB RAM, full GPU"

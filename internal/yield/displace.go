@@ -1,6 +1,7 @@
 package yield
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -61,8 +62,7 @@ func (c *Controller) ConfigureDisplace(displace map[int][]int) {
 			continue
 		}
 		c.idleUnloaded[i].Store(true)
-		wait, done := c.startAction(i)
-		go c.doUnload(i, wait, done, triggerIdle)
+		go c.doUnload(context.Background(), c.startAction(i), triggerIdle)
 	}
 }
 
@@ -93,52 +93,66 @@ func (c *Controller) isDisplaced(j int) bool {
 // reconcileDisplacedLocked starts or stops each displaced unit to match the
 // rule above. Called from refresh, after applyLocked and checkIdleLocked, so
 // it sees this tick's yield and idle-unload decisions. Caller holds c.mu.
-func (c *Controller) reconcileDisplacedLocked() {
+func (c *Controller) reconcileDisplacedLocked(ctx context.Context) {
 	if c.displacers == nil || c.pollCount < c.confirmPolls {
 		return
 	}
 	now := time.Now()
 	for j, ds := range c.displacers {
-		if len(ds) == 0 {
-			continue
+		if len(ds) > 0 {
+			c.reconcileUnitLocked(ctx, j, ds, now)
 		}
-		want := !c.effective
-		for _, i := range ds {
-			if !c.idleUnloaded[i].Load() {
-				want = false
-			}
-		}
-		if !want {
-			c.unitFreeSince[j] = time.Time{}
-		} else if c.unitFreeSince[j].IsZero() {
-			c.unitFreeSince[j] = now
-		}
-		if want == c.unitWant[j] {
-			continue
-		}
-		if want && now.Sub(c.unitFreeSince[j]) < c.unitHoldoff {
-			continue
-		}
-		c.unitWant[j] = want
-		if !want {
-			wait, done := c.startAction(j)
-			go c.doUnload(j, wait, done, triggerDisplace)
-			continue
-		}
-		// Start only after every displacer's pending stop has finished.
-		waits := []<-chan struct{}{c.actionDone[j]}
-		for _, i := range ds {
-			waits = append(waits, c.actionDone[i])
-		}
-		_, done := c.startAction(j)
-		go c.doReload(j, afterAll(waits...), done, triggerDisplace)
-		slog.Info("displaced unit resumes", "unit", c.labels[j])
 	}
+}
+
+// reconcileUnitLocked starts or stops displaced unit j, whose displacers are
+// ds, to match the rule above. Caller holds c.mu.
+func (c *Controller) reconcileUnitLocked(ctx context.Context, j int, ds []int, now time.Time) {
+	want := c.unitMayRunLocked(ds)
+	if !want {
+		c.unitFreeSince[j] = time.Time{}
+	} else if c.unitFreeSince[j].IsZero() {
+		c.unitFreeSince[j] = now
+	}
+	if want == c.unitWant[j] {
+		return
+	}
+	if want && now.Sub(c.unitFreeSince[j]) < c.unitHoldoff {
+		return
+	}
+	c.unitWant[j] = want
+	if !want {
+		go c.doUnload(ctx, c.startAction(j), triggerDisplace)
+		return
+	}
+	// Start only after every displacer's pending stop has finished.
+	waits := []<-chan struct{}{c.actionDone[j]}
+	for _, i := range ds {
+		waits = append(waits, c.actionDone[i])
+	}
+	a := c.startAction(j)
+	a.wait = afterAll(waits...)
+	go c.doReload(ctx, a, triggerDisplace)
+	slog.Info("displaced unit resumes", "unit", c.labels[j])
+}
+
+// unitMayRunLocked reports whether a unit may run: the Broker is not yielding
+// and every displacer is idle-unloaded. Caller holds c.mu.
+func (c *Controller) unitMayRunLocked(displacers []int) bool {
+	if c.effective {
+		return false
+	}
+	for _, i := range displacers {
+		if !c.idleUnloaded[i].Load() {
+			return false
+		}
+	}
+	return true
 }
 
 // stopDisplacedLocked stops instance i's displaced units ahead of its wake and
 // returns the channels its reload must wait for. Caller holds c.mu.
-func (c *Controller) stopDisplacedLocked(i int) []<-chan struct{} {
+func (c *Controller) stopDisplacedLocked(ctx context.Context, i int) []<-chan struct{} {
 	if c.displaces == nil {
 		return nil
 	}
@@ -146,8 +160,7 @@ func (c *Controller) stopDisplacedLocked(i int) []<-chan struct{} {
 	for _, j := range c.displaces[i] {
 		if c.unitWant[j] {
 			c.unitWant[j] = false
-			wait, done := c.startAction(j)
-			go c.doUnload(j, wait, done, triggerDisplace)
+			go c.doUnload(ctx, c.startAction(j), triggerDisplace)
 			slog.Info("displaced unit stops for a wake", "unit", c.labels[j], "by", c.labels[i])
 		}
 		// Even a unit already commanded to stop may still be stopping.

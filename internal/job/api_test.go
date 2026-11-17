@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 func newAPI(t *testing.T) (*Service, Store, http.Handler) {
@@ -18,16 +20,23 @@ func newAPI(t *testing.T) (*Service, Store, http.Handler) {
 	return svc, store, svc.Routes()
 }
 
-func do(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+// postJob sends POST /jobs with body and headers.
+func postJob(t *testing.T, h http.Handler, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
-	var r io.Reader
-	if body != "" {
-		r = strings.NewReader(body)
-	}
-	req := httptest.NewRequest(method, path, r)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/jobs", strings.NewReader(body))
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	return serve(h, req)
+}
+
+// call sends a body-less request.
+func call(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	return serve(h, httptest.NewRequestWithContext(context.Background(), method, path, nil))
+}
+
+func serve(h http.Handler, req *http.Request) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -35,7 +44,7 @@ func do(t *testing.T, h http.Handler, method, path, body string, headers map[str
 
 func TestAPISubmitRequiresIdempotencyKey(t *testing.T) {
 	_, _, h := newAPI(t)
-	rec := do(t, h, "POST", "/jobs", `{"model":"m","prompt":"p"}`, nil)
+	rec := postJob(t, h, `{"model":"m","prompt":"p"}`, nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
@@ -43,7 +52,7 @@ func TestAPISubmitRequiresIdempotencyKey(t *testing.T) {
 
 func TestAPISubmitRequiresModel(t *testing.T) {
 	_, _, h := newAPI(t)
-	rec := do(t, h, "POST", "/jobs", `{"prompt":"p"}`, map[string]string{"Idempotency-Key": "k"})
+	rec := postJob(t, h, `{"prompt":"p"}`, map[string]string{"Idempotency-Key": "k"})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
@@ -53,26 +62,26 @@ func TestAPISubmitIdempotent(t *testing.T) {
 	_, _, h := newAPI(t)
 	hdr := map[string]string{"Idempotency-Key": "dup"}
 
-	rec := do(t, h, "POST", "/jobs", `{"model":"m","prompt":"p"}`, hdr)
+	rec := postJob(t, h, `{"model":"m","prompt":"p"}`, hdr)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("first submit status = %d, want 201", rec.Code)
 	}
 	var first struct {
 		JobID string `json:"job_id"`
 	}
-	json.Unmarshal(rec.Body.Bytes(), &first)
+	_ = json.Unmarshal(rec.Body.Bytes(), &first)
 	if first.JobID == "" {
 		t.Fatal("no job_id returned")
 	}
 
-	rec2 := do(t, h, "POST", "/jobs", `{"model":"m2","prompt":"other"}`, hdr)
+	rec2 := postJob(t, h, `{"model":"m2","prompt":"other"}`, hdr)
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("replay status = %d, want 200", rec2.Code)
 	}
 	var second struct {
 		JobID string `json:"job_id"`
 	}
-	json.Unmarshal(rec2.Body.Bytes(), &second)
+	_ = json.Unmarshal(rec2.Body.Bytes(), &second)
 	if second.JobID != first.JobID {
 		t.Fatalf("replay job_id = %s, want %s", second.JobID, first.JobID)
 	}
@@ -82,17 +91,17 @@ func TestAPIGetAndPosition(t *testing.T) {
 	svc, _, h := newAPI(t)
 	id := submitJob(t, svc, "g")
 
-	rec := do(t, h, "GET", "/jobs/"+id, "", nil)
+	rec := call(t, h, "GET", "/jobs/"+id)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("get status = %d", rec.Code)
 	}
 	var st Status
-	json.Unmarshal(rec.Body.Bytes(), &st)
+	_ = json.Unmarshal(rec.Body.Bytes(), &st)
 	if st.State != StateQueued || st.Position != 1 {
 		t.Fatalf("status = %+v, want QUEUED position 1", st)
 	}
 
-	if r := do(t, h, "GET", "/jobs/nope", "", nil); r.Code != http.StatusNotFound {
+	if r := call(t, h, "GET", "/jobs/nope"); r.Code != http.StatusNotFound {
 		t.Fatalf("unknown get = %d, want 404", r.Code)
 	}
 }
@@ -103,22 +112,22 @@ func TestAPIResultLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	// Not ready while queued.
-	if r := do(t, h, "GET", "/jobs/"+id+"/result", "", nil); r.Code != http.StatusConflict {
+	if r := call(t, h, "GET", "/jobs/"+id+"/result"); r.Code != http.StatusConflict {
 		t.Fatalf("premature result = %d, want 409", r.Code)
 	}
 
 	// Drive it to SUCCEEDED directly through the store.
-	store.ClaimNext(ctx)
-	store.Succeed(ctx, id, "the output")
+	_, _ = store.ClaimNext(ctx)
+	_ = store.Succeed(ctx, id, "the output")
 
-	r := do(t, h, "GET", "/jobs/"+id+"/result", "", nil)
+	r := call(t, h, "GET", "/jobs/"+id+"/result")
 	if r.Code != http.StatusOK {
 		t.Fatalf("result status = %d", r.Code)
 	}
 	var body struct {
 		Result string `json:"result"`
 	}
-	json.Unmarshal(r.Body.Bytes(), &body)
+	_ = json.Unmarshal(r.Body.Bytes(), &body)
 	if body.Result != "the output" {
 		t.Fatalf("result = %q", body.Result)
 	}
@@ -129,14 +138,14 @@ func TestAPIListFilter(t *testing.T) {
 	a := submitJobWith(t, svc, "la", "alice")
 	_ = submitJobWith(t, svc, "lb", "bob")
 
-	rec := do(t, h, "GET", "/jobs?owner=alice", "", nil)
+	rec := call(t, h, "GET", "/jobs?owner=alice")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list status = %d", rec.Code)
 	}
 	var body struct {
 		Jobs []Status `json:"jobs"`
 	}
-	json.Unmarshal(rec.Body.Bytes(), &body)
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	if len(body.Jobs) != 1 || body.Jobs[0].ID != a {
 		t.Fatalf("filtered list = %+v, want only %s", body.Jobs, a)
 	}
@@ -145,7 +154,7 @@ func TestAPIListFilter(t *testing.T) {
 func TestAPICancel(t *testing.T) {
 	svc, _, h := newAPI(t)
 	id := submitJob(t, svc, "can")
-	rec := do(t, h, "POST", "/jobs/"+id+"/cancel", "", nil)
+	rec := call(t, h, "POST", "/jobs/"+id+"/cancel")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("cancel status = %d", rec.Code)
 	}
@@ -159,19 +168,20 @@ func TestAPIEventsTerminalSnapshot(t *testing.T) {
 	svc, store, _ := newAPI(t)
 	id := submitJob(t, svc, "ev")
 	ctx := context.Background()
-	store.ClaimNext(ctx)
-	store.Succeed(ctx, id, "done")
+	_, _ = store.ClaimNext(ctx)
+	_ = store.Succeed(ctx, id, "done")
 
 	// A real server so the SSE handler's Flusher works.
 	srv := httptest.NewServer(svc.Routes())
 	t.Cleanup(srv.Close)
 
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(srv.URL + "/jobs/" + id + "/events")
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	resp, err := testhttp.Do(ctx, http.MethodGet, srv.URL+"/jobs/"+id+"/events", nil)
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	body := string(b)
 	if !strings.Contains(body, "event: state") || !strings.Contains(body, "event: done") {

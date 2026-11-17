@@ -190,14 +190,37 @@ type Config struct {
 	ParkDrainBurst int
 }
 
-// Load reads configuration from the environment, applying defaults.
+// Load reads configuration from the environment, applying defaults. Each step
+// reads one group of variables into cfg; the first failure wins, so the order
+// below is the order errors are reported in.
 func Load() (*Config, error) {
+	cfg := &Config{}
+	steps := []func(*Config) error{
+		loadUpstream,
+		loadInfinity,
+		loadWaitsAndLimits,
+		loadPark,
+		loadRoutes,
+		loadYieldUnits,
+		loadPlainSettings,
+	}
+	for _, step := range steps {
+		if err := step(cfg); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
+}
+
+// loadUpstream reads the default backend: UPSTREAM_BACKEND, its URL, API key
+// and systemd unit.
+func loadUpstream(cfg *Config) error {
 	// UPSTREAM_BACKEND selects which upstream API family is active. It gates
 	// which of OLLAMA_URL / UPSTREAM_URL is required below (FR-3/FR-4/FR-5,
 	// FR-23, AC-2/AC-3/AC-16).
-	backend := getenv("UPSTREAM_BACKEND", "ollama")
-	if backend != "ollama" && backend != "openai" {
-		return nil, fmt.Errorf("UPSTREAM_BACKEND %q must be one of: ollama, openai", backend)
+	cfg.UpstreamBackend = getenv("UPSTREAM_BACKEND", "ollama")
+	if cfg.UpstreamBackend != "ollama" && cfg.UpstreamBackend != "openai" {
+		return fmt.Errorf("UPSTREAM_BACKEND %q must be one of: ollama, openai", cfg.UpstreamBackend)
 	}
 
 	// OLLAMA_URL is required/validated only when the active backend is
@@ -206,312 +229,157 @@ func Load() (*Config, error) {
 	// to-default behavior (via getenv's def parameter) is unchanged: an
 	// unset/empty OLLAMA_URL still resolves to "http://127.0.0.1:11434" and
 	// loads successfully; only a truly malformed value fails.
-	var ollamaURL *url.URL
-	if backend == "ollama" {
-		rawURL := getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-		u, err := parseBaseURL("OLLAMA_URL", rawURL)
+	var err error
+	if cfg.UpstreamBackend == "ollama" {
+		cfg.OllamaURL, err = parseBaseURL("OLLAMA_URL", getenv("OLLAMA_URL", "http://127.0.0.1:11434"))
 		if err != nil {
-			return nil, err
+			return err
 		}
-		ollamaURL = u
 	}
 
 	// UPSTREAM_URL (the OpenAI-compatible upstream base URL) is required/
 	// validated only when the active backend is "openai", using the same
 	// scheme+host check as OLLAMA_URL above (FR-5, AC-3).
-	var upstreamURL *url.URL
-	if backend == "openai" {
-		rawURL := getenv("UPSTREAM_URL", "")
-		u, err := parseBaseURL("UPSTREAM_URL", rawURL)
+	if cfg.UpstreamBackend == "openai" {
+		cfg.UpstreamURL, err = parseBaseURL("UPSTREAM_URL", getenv("UPSTREAM_URL", ""))
 		if err != nil {
-			return nil, err
+			return err
 		}
-		upstreamURL = u
 	}
 
 	// UPSTREAM_API_KEY is optional. When set, it must not contain a CR or LF
 	// control character, which would allow HTTP header injection into the
 	// outbound "Authorization: Bearer <value>" header (FR-24, AC-17).
-	upstreamAPIKey := getenv("UPSTREAM_API_KEY", "")
-	if strings.ContainsAny(upstreamAPIKey, "\r\n") {
-		return nil, fmt.Errorf("UPSTREAM_API_KEY must not contain control characters")
+	cfg.UpstreamAPIKey = getenv("UPSTREAM_API_KEY", "")
+	if strings.ContainsAny(cfg.UpstreamAPIKey, "\r\n") {
+		return fmt.Errorf("UPSTREAM_API_KEY must not contain control characters")
 	}
 
-	// UPSTREAM_UNIT_NAME is read once, here, into a local var reused both by
-	// the cross-instance unit-name dedup logic below and the final Config
-	// field — there must be exactly one place this env var is read from.
-	unitName := strings.TrimSpace(getenv("UPSTREAM_UNIT_NAME", ""))
+	// UPSTREAM_UNIT_NAME is read once, here, and reused by the cross-instance
+	// unit-name dedup logic and the idle-timeout check — there must be exactly
+	// one place this env var is read from.
+	cfg.UpstreamUnitName = strings.TrimSpace(getenv("UPSTREAM_UNIT_NAME", ""))
+	return nil
+}
 
-	// INFINITY_URL is optional; when set it must be a valid absolute URL. Empty
-	// leaves InfinityURL nil and the embed lane is not started.
-	var infinityURL *url.URL
-	if raw := getenv("INFINITY_URL", ""); raw != "" {
-		iu, err := parseBaseURL("INFINITY_URL", raw)
-		if err != nil {
-			return nil, err
+// loadInfinity reads INFINITY_URL. It is optional; when set it must be a valid
+// absolute URL. Empty leaves InfinityURL nil and the embed lane is not started.
+func loadInfinity(cfg *Config) error {
+	raw := getenv("INFINITY_URL", "")
+	if raw == "" {
+		return nil
+	}
+	u, err := parseBaseURL("INFINITY_URL", raw)
+	if err != nil {
+		return err
+	}
+	cfg.InfinityURL = u
+	return nil
+}
+
+// loadWaitsAndLimits reads the durations and counts whose bad values fail Load.
+func loadWaitsAndLimits(cfg *Config) error {
+	settings := []func() error{
+		durSetting("BROKER_INTERACTIVE_WAIT", 30*time.Second, &cfg.InteractiveWait),
+		durSetting("BROKER_BATCH_WAIT", 5*time.Second, &cfg.BatchWait),
+		durSetting("BROKER_EMBED_TIMEOUT", 30*time.Second, &cfg.EmbedTimeout),
+		durSetting("BROKER_DETECT_INTERVAL", 3*time.Second, &cfg.DetectInterval),
+		durSetting("UPSTREAM_IDLE_TIMEOUT", 0, &cfg.UpstreamIdleTimeout),
+		func() error { return checkUpstreamIdle(cfg) },
+		intSetting("BROKER_YIELD_CONFIRM_POLLS", 2, &cfg.YieldConfirmPolls),
+		intSetting("BROKER_MAX_WAITERS", 256, &cfg.MaxWaiters),
+		intSetting("BROKER_MAX_INFLIGHT", 1, &cfg.MaxInflight),
+		durSetting("BROKER_BATCH_QUANTUM", 10*time.Second, &cfg.BatchQuantum),
+		intSetting("BROKER_JOB_MAX_ATTEMPTS", 3, &cfg.JobMaxAttempts),
+		durSetting("BROKER_JOB_PRUNE_INTERVAL", 10*time.Minute, &cfg.JobPruneInterval),
+		durSetting("BROKER_JOB_FETCHED_GRACE", time.Hour, &cfg.JobFetchedGrace),
+		durSetting("BROKER_JOB_HARD_CAP", 7*24*time.Hour, &cfg.JobHardCap),
+		intSetting("BROKER_TDARR_GPU_WORKERS", 1, &cfg.TdarrGPUWorkers),
+	}
+	for _, read := range settings {
+		if err := read(); err != nil {
+			return err
 		}
-		infinityURL = iu
 	}
+	return nil
+}
 
-	iw, err := getdur("BROKER_INTERACTIVE_WAIT", 30*time.Second)
-	if err != nil {
-		return nil, err
+func durSetting(key string, def time.Duration, dst *time.Duration) func() error {
+	return func() (err error) {
+		*dst, err = getdur(key, def)
+		return err
 	}
-	bw, err := getdur("BROKER_BATCH_WAIT", 5*time.Second)
-	if err != nil {
-		return nil, err
+}
+
+func intSetting(key string, def int, dst *int) func() error {
+	return func() (err error) {
+		*dst, err = getint(key, def)
+		return err
 	}
-	et, err := getdur("BROKER_EMBED_TIMEOUT", 30*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	di, err := getdur("BROKER_DETECT_INTERVAL", 3*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	uit, err := getdur("UPSTREAM_IDLE_TIMEOUT", 0)
-	if err != nil {
-		return nil, err
-	}
+}
+
+// checkUpstreamIdle rejects a negative UPSTREAM_IDLE_TIMEOUT, and a nonzero one
+// without a unit name to stop.
+func checkUpstreamIdle(cfg *Config) error {
+	uit := cfg.UpstreamIdleTimeout
 	if uit < 0 {
-		return nil, fmt.Errorf("UPSTREAM_IDLE_TIMEOUT must not be negative, got %v", uit)
+		return fmt.Errorf("UPSTREAM_IDLE_TIMEOUT must not be negative, got %v", uit)
 	}
-	if uit != 0 && unitName == "" {
-		return nil, fmt.Errorf("UPSTREAM_IDLE_TIMEOUT is set but UPSTREAM_UNIT_NAME is empty; idle-unload requires a unit name")
+	if uit != 0 && cfg.UpstreamUnitName == "" {
+		return fmt.Errorf("UPSTREAM_IDLE_TIMEOUT is set but UPSTREAM_UNIT_NAME is empty; idle-unload requires a unit name")
 	}
-	ycp, err := getint("BROKER_YIELD_CONFIRM_POLLS", 2)
-	if err != nil {
-		return nil, err
-	}
-	mw, err := getint("BROKER_MAX_WAITERS", 256)
-	if err != nil {
-		return nil, err
-	}
-	mi, err := getint("BROKER_MAX_INFLIGHT", 1)
-	if err != nil {
-		return nil, err
-	}
-	bq, err := getdur("BROKER_BATCH_QUANTUM", 10*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	jma, err := getint("BROKER_JOB_MAX_ATTEMPTS", 3)
-	if err != nil {
-		return nil, err
-	}
-	jpi, err := getdur("BROKER_JOB_PRUNE_INTERVAL", 10*time.Minute)
-	if err != nil {
-		return nil, err
-	}
-	jfg, err := getdur("BROKER_JOB_FETCHED_GRACE", time.Hour)
-	if err != nil {
-		return nil, err
-	}
-	jhc, err := getdur("BROKER_JOB_HARD_CAP", 7*24*time.Hour)
-	if err != nil {
-		return nil, err
-	}
-	tgw, err := getint("BROKER_TDARR_GPU_WORKERS", 1)
-	if err != nil {
-		return nil, err
-	}
+	return nil
+}
 
-	// Park config is intentionally non-fatal to load: a bad park var must
-	// never keep the Broker from starting (parking is a resilience feature
-	// layered on top of the core proxy, not core config like OLLAMA_URL).
-	// Invalid values are logged via slog and fall back to the default,
-	// rather than failing Load() like getdur/getint above.
-	ph := getdurWarn("BROKER_PARK_HOLD", 600*time.Second)
+// loadPark reads the park config. It is intentionally non-fatal to load: a bad
+// park var must never keep the Broker from starting (parking is a resilience
+// feature layered on top of the core proxy, not core config like OLLAMA_URL).
+// Invalid values are logged via slog and fall back to the default, rather than
+// failing Load() like getdur/getint above.
+func loadPark(cfg *Config) error {
+	cfg.ParkHold = getdurWarn("BROKER_PARK_HOLD", 600*time.Second)
 	// BROKER_PARK_MAX_QUEUE=0 is the documented kill-switch (parking
 	// disabled) — getintMin permits 0 and only rejects (warns+defaults on)
 	// values below min, unlike getint which rejects anything < 1.
-	pmq := getintMin("BROKER_PARK_MAX_QUEUE", 32, 0)
-	pdb := getintMin("BROKER_PARK_DRAIN_BURST", 8, 1)
+	cfg.ParkMaxQueue = getintMin("BROKER_PARK_MAX_QUEUE", 32, 0)
+	cfg.ParkDrainBurst = getintMin("BROKER_PARK_DRAIN_BURST", 8, 1)
+	return nil
+}
 
-	// BROKER_ROUTE_<N>_* (N = 1..maxRouteIndex) define per-model routing
-	// rules. An unset/empty BROKER_ROUTE_1_MODELS means routing is fully
-	// disabled (routes stays nil), matching the UPSTREAM_UNIT_NAME
-	// empty-disables-it precedent (FR-9/AC-5).
-	const maxRouteIndex = 32
-	const maxRoutes = 16
-
-	// Bounded scan to find the highest index with BROKER_ROUTE_<N>_MODELS
-	// configured; indices beyond maxRouteIndex are never examined.
-	highestRoute := 0
-	for i := 1; i <= maxRouteIndex; i++ {
-		if getenv(fmt.Sprintf("BROKER_ROUTE_%d_MODELS", i), "") != "" {
-			highestRoute = i
-		}
-	}
-
-	var routes []RouteBackend
-	if highestRoute > 0 {
-		if highestRoute > maxRoutes {
-			return nil, fmt.Errorf("too many configured routes: index %d exceeds max %d", highestRoute, maxRoutes)
-		}
-
-		// Cross-instance uniqueness: no two instances (default backend
-		// and/or any route) may share a resolved unit name or URL, and no
-		// model name may be routed by more than one rule.
-		seenModels := make(map[string]int, highestRoute)
-		seenUnitNames := make(map[string]string, highestRoute+1)
-		seenURLs := make(map[string]string, highestRoute+1)
-
-		var defaultURL *url.URL
-		if backend == "ollama" {
-			defaultURL = ollamaURL
-		} else {
-			defaultURL = upstreamURL
-		}
-		if defaultURL != nil {
-			seenURLs[defaultURL.String()] = "the default backend"
-		}
-		if unitName != "" {
-			seenUnitNames[unitName] = "the default backend"
-		}
-
-		for i := 1; i <= highestRoute; i++ {
-			prefix := fmt.Sprintf("BROKER_ROUTE_%d_", i)
-			source := fmt.Sprintf("BROKER_ROUTE_%d", i)
-
-			rawModels := getenv(prefix+"MODELS", "")
-			if rawModels == "" {
-				// Any index below highestRoute without _MODELS set is a
-				// gap, not a silent stop — fail loudly rather than
-				// silently limiting the table.
-				return nil, fmt.Errorf("%sMODELS is unset but BROKER_ROUTE_%d_MODELS is configured (index gap not allowed)", prefix, highestRoute)
-			}
-
-			parts := strings.Split(rawModels, ",")
-			models := make([]string, 0, len(parts))
-			localSeen := make(map[string]bool, len(parts))
-			for _, p := range parts {
-				m := strings.TrimSpace(p)
-				if m == "" {
-					return nil, fmt.Errorf("%sMODELS %q contains an empty model name", prefix, rawModels)
-				}
-				if localSeen[m] {
-					return nil, fmt.Errorf("%sMODELS %q lists model %q more than once", prefix, rawModels, m)
-				}
-				localSeen[m] = true
-				if existingSource, ok := seenModels[m]; ok {
-					return nil, fmt.Errorf("model %q is routed by both BROKER_ROUTE_%d and %s; a model may be routed to at most one backend", m, existingSource, source)
-				}
-				seenModels[m] = i
-				models = append(models, m)
-			}
-
-			routeBackend := getenv(prefix+"BACKEND", "openai")
-			if routeBackend != "ollama" && routeBackend != "openai" {
-				return nil, fmt.Errorf("%sBACKEND %q must be one of: ollama, openai", prefix, routeBackend)
-			}
-
-			rawURL := getenv(prefix+"URL", "")
-			routeURL, err := parseBaseURL(prefix+"URL", rawURL)
-			if err != nil {
-				return nil, err
-			}
-			if existingSource, ok := seenURLs[routeURL.String()]; ok {
-				return nil, fmt.Errorf("%sURL %q duplicates the URL already used by %s", prefix, rawURL, existingSource)
-			}
-			seenURLs[routeURL.String()] = source
-
-			routeAPIKey := getenv(prefix+"API_KEY", "")
-			if strings.ContainsAny(routeAPIKey, "\r\n") {
-				return nil, fmt.Errorf("%sAPI_KEY must not contain control characters", prefix)
-			}
-
-			routeUnitName := strings.TrimSpace(getenv(prefix+"UNIT_NAME", ""))
-			if routeUnitName != "" {
-				if existingSource, ok := seenUnitNames[routeUnitName]; ok {
-					return nil, fmt.Errorf("%sUNIT_NAME %q duplicates the unit name already used by %s", prefix, routeUnitName, existingSource)
-				}
-				seenUnitNames[routeUnitName] = source
-			}
-
-			routeIdleTimeout, err := getdur(prefix+"IDLE_TIMEOUT", 0)
-			if err != nil {
-				return nil, err
-			}
-			if routeIdleTimeout < 0 {
-				return nil, fmt.Errorf("%sIDLE_TIMEOUT must not be negative, got %v", prefix, routeIdleTimeout)
-			}
-			if routeIdleTimeout != 0 && routeUnitName == "" {
-				return nil, fmt.Errorf("%sIDLE_TIMEOUT is set but %sUNIT_NAME is empty; idle-unload requires a unit name", prefix, prefix)
-			}
-
-			lane := getenv(prefix+"LANE", "")
-			if lane != "" && lane != "interactive" && lane != "batch" {
-				return nil, fmt.Errorf("%sLANE %q must be one of: \"\", interactive, batch", prefix, lane)
-			}
-
-			routes = append(routes, RouteBackend{
-				Models:      models,
-				Backend:     routeBackend,
-				URL:         routeURL,
-				APIKey:      routeAPIKey,
-				UnitName:    routeUnitName,
-				IdleTimeout: routeIdleTimeout,
-				Lane:        lane,
-				Displaces:   splitList(getenv(prefix+"DISPLACES", "")),
-			})
-		}
-	}
-
-	yieldUnits, err := parseYieldUnits(getenv("BROKER_YIELD_UNITS", ""), unitName, routes)
+// loadYieldUnits reads BROKER_YIELD_UNITS and everything that depends on it.
+func loadYieldUnits(cfg *Config) error {
+	var err error
+	cfg.YieldUnits, err = parseYieldUnits(getenv("BROKER_YIELD_UNITS", ""), cfg.UpstreamUnitName, cfg.Routes)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := checkDisplaces(routes, yieldUnits); err != nil {
-		return nil, err
+	if err := checkDisplaces(cfg.Routes, cfg.YieldUnits); err != nil {
+		return err
 	}
-	urh, err := getdur("BROKER_YIELD_UNIT_RESUME_HOLDOFF", 0)
+	cfg.UnitResumeHoldoff, err = getdur("BROKER_YIELD_UNIT_RESUME_HOLDOFF", 0)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if urh < 0 {
-		return nil, fmt.Errorf("BROKER_YIELD_UNIT_RESUME_HOLDOFF must not be negative, got %v", urh)
+	if cfg.UnitResumeHoldoff < 0 {
+		return fmt.Errorf("BROKER_YIELD_UNIT_RESUME_HOLDOFF must not be negative, got %v", cfg.UnitResumeHoldoff)
 	}
+	return nil
+}
 
-	return &Config{
-		InteractiveAddr:     getenv("BROKER_INTERACTIVE_ADDR", ":11435"),
-		BatchAddr:           getenv("BROKER_BATCH_ADDR", ":11436"),
-		EmbedAddr:           getenv("BROKER_EMBED_ADDR", ":11438"),
-		EmbedTimeout:        et,
-		UpstreamBackend:     backend,
-		OllamaURL:           ollamaURL,
-		UpstreamURL:         upstreamURL,
-		UpstreamAPIKey:      upstreamAPIKey,
-		UpstreamUnitName:    unitName,
-		UpstreamIdleTimeout: uit,
-		Routes:              routes,
-		InfinityURL:         infinityURL,
-		InteractiveWait:     iw,
-		BatchWait:           bw,
-		ControlAddr:         getenv("BROKER_CONTROL_ADDR", ":11437"),
-		ControlToken:        getenv("BROKER_CONTROL_TOKEN", ""),
-		DetectInterval:      di,
-		YieldConfirmPolls:   ycp,
-		PlexURL:             getenv("PLEX_URL", "http://localhost:32400"),
-		PlexToken:           getenv("PLEX_TOKEN", ""),
-		MaxWaiters:          mw,
-		MaxInflight:         mi,
-		YieldUnits:          yieldUnits,
-		UnitResumeHoldoff:   urh,
-		CPUModels:           splitList(getenv("BROKER_CPU_MODELS", "")),
-		BatchQuantum:        bq,
-		JobDBPath:           getenv("BROKER_JOB_DB", "broker-jobs.db"),
-		JobMaxAttempts:      jma,
-		JobPruneInterval:    jpi,
-		JobFetchedGrace:     jfg,
-		JobHardCap:          jhc,
-		TdarrURL:            getenv("BROKER_TDARR_URL", ""),
-		TdarrNodeID:         getenv("BROKER_TDARR_NODE_ID", ""),
-		TdarrGPUWorkers:     tgw,
-		ParkHold:            ph,
-		ParkMaxQueue:        pmq,
-		ParkDrainBurst:      pdb,
-	}, nil
+// loadPlainSettings reads the settings that cannot fail: strings and lists.
+func loadPlainSettings(cfg *Config) error {
+	cfg.InteractiveAddr = getenv("BROKER_INTERACTIVE_ADDR", ":11435")
+	cfg.BatchAddr = getenv("BROKER_BATCH_ADDR", ":11436")
+	cfg.EmbedAddr = getenv("BROKER_EMBED_ADDR", ":11438")
+	cfg.ControlAddr = getenv("BROKER_CONTROL_ADDR", ":11437")
+	cfg.ControlToken = getenv("BROKER_CONTROL_TOKEN", "")
+	cfg.PlexURL = getenv("PLEX_URL", "http://localhost:32400")
+	cfg.PlexToken = getenv("PLEX_TOKEN", "")
+	cfg.CPUModels = splitList(getenv("BROKER_CPU_MODELS", ""))
+	cfg.JobDBPath = getenv("BROKER_JOB_DB", "broker-jobs.db")
+	cfg.TdarrURL = getenv("BROKER_TDARR_URL", "")
+	cfg.TdarrNodeID = getenv("BROKER_TDARR_NODE_ID", "")
+	return nil
 }
 
 // parseBaseURL parses raw and validates it includes both a scheme and a
@@ -531,60 +399,6 @@ func parseBaseURL(key, raw string) (*url.URL, error) {
 
 // splitList splits a comma-separated value, trimming spaces and dropping
 // empty entries. It returns nil when nothing is left.
-// parseYieldUnits reads BROKER_YIELD_UNITS. A unit already stopped and
-// started by the default backend or a route would get two controllers
-// racing each other on every yield, so that is rejected, as is a repeat.
-func parseYieldUnits(raw, upstreamUnit string, routes []RouteBackend) ([]string, error) {
-	owners := map[string]string{}
-	if upstreamUnit != "" {
-		owners[upstreamUnit] = "UPSTREAM_UNIT_NAME"
-	}
-	for i, rb := range routes {
-		if rb.UnitName != "" {
-			owners[rb.UnitName] = fmt.Sprintf("BROKER_ROUTE_%d_UNIT_NAME", i+1)
-		}
-	}
-	units := splitList(raw)
-	for _, u := range units {
-		if owner, ok := owners[u]; ok {
-			return nil, fmt.Errorf("BROKER_YIELD_UNITS: %q is already used by %s", u, owner)
-		}
-		owners[u] = "BROKER_YIELD_UNITS"
-	}
-	return units, nil
-}
-
-// checkDisplaces validates every BROKER_ROUTE_<N>_DISPLACES (ADR-0020). A
-// displaced unit must be a yield unit, since only those have a controller of
-// their own to start and stop. A displacer needs an idle timeout, or it would
-// keep the units off forever after its first request.
-func checkDisplaces(routes []RouteBackend, yieldUnits []string) error {
-	known := map[string]bool{}
-	for _, u := range yieldUnits {
-		known[u] = true
-	}
-	for i, rb := range routes {
-		if len(rb.Displaces) == 0 {
-			continue
-		}
-		key := fmt.Sprintf("BROKER_ROUTE_%d_DISPLACES", i+1)
-		if rb.IdleTimeout == 0 {
-			return fmt.Errorf("%s is set but BROKER_ROUTE_%d_IDLE_TIMEOUT is not; a displacing route must idle-unload to hand the GPU back", key, i+1)
-		}
-		seen := map[string]bool{}
-		for _, u := range rb.Displaces {
-			if !known[u] {
-				return fmt.Errorf("%s: %q is not in BROKER_YIELD_UNITS", key, u)
-			}
-			if seen[u] {
-				return fmt.Errorf("%s: %q is listed twice", key, u)
-			}
-			seen[u] = true
-		}
-	}
-	return nil
-}
-
 func splitList(raw string) []string {
 	var out []string
 	for _, part := range strings.Split(raw, ",") {

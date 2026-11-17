@@ -60,51 +60,10 @@ func parseSSEStream(ctx context.Context, body io.Reader, onTokens func(int)) (st
 // convention (each intermediate line carries its slice of the response, not
 // an empty placeholder) rather than a content-free progress signal.
 func parseSSEStreamChunks(ctx context.Context, body io.Reader, onChunk func(delta string, total int)) (string, int, error) {
-	var sb strings.Builder
-	tokens := 0
-	usageTokens := -1 // -1 means "no usage field seen"
+	r := &sseReader{usageTokens: -1, onChunk: onChunk}
 
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), 4<<20) // tolerate large single SSE chunks (default ~64KB is too small)
-
-	var dataLines []string
-	flush := func() (bool, error) {
-		if len(dataLines) == 0 {
-			return false, nil
-		}
-		data := strings.Join(dataLines, "\n")
-		dataLines = dataLines[:0]
-
-		if data == "[DONE]" {
-			return true, nil
-		}
-
-		var chunk sseChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			return false, fmt.Errorf("decode SSE chunk: %w", err)
-		}
-		if chunk.Error != nil {
-			msg := chunk.Error.Message
-			if msg == "" {
-				msg = "unknown error"
-			}
-			return false, fmt.Errorf("openai upstream: %s", msg)
-		}
-		if len(chunk.Choices) > 0 {
-			content := chunk.Choices[0].Delta.Content
-			if content != "" {
-				sb.WriteString(content)
-				tokens++
-				if onChunk != nil {
-					onChunk(content, tokens)
-				}
-			}
-		}
-		if chunk.Usage != nil {
-			usageTokens = chunk.Usage.CompletionTokens
-		}
-		return false, nil
-	}
 
 	for sc.Scan() {
 		// A caller-side context cancellation doesn't necessarily tear down
@@ -116,54 +75,109 @@ func parseSSEStreamChunks(ctx context.Context, body io.Reader, onChunk func(delt
 		// flaky under CI's slower/busier runners — the mock's post-pause
 		// write could still be scanned before the connection actually broke).
 		if err := ctx.Err(); err != nil {
-			return "", tokens, err
+			return "", r.tokens, fmt.Errorf("openai upstream: %w", err)
 		}
-
-		line := sc.Text()
-		trimmed := strings.TrimSpace(line)
-
-		if trimmed == "" {
-			// Blank line: event boundary.
-			isDone, err := flush()
-			if err != nil {
-				return "", tokens, err
-			}
-			if isDone {
-				final := tokens
-				if usageTokens >= 0 {
-					final = usageTokens
-				}
-				return sb.String(), final, nil
-			}
-			continue
-		}
-
-		data, ok := cutPrefix(trimmed, "data:")
-		if !ok {
+		trimmed := strings.TrimSpace(sc.Text())
+		if trimmed != "" {
 			// Ignore non-data SSE fields (event:, id:, comments, etc.).
+			if data, ok := cutPrefix(trimmed, "data:"); ok {
+				r.dataLines = append(r.dataLines, data)
+			}
 			continue
 		}
-		dataLines = append(dataLines, data)
+		// Blank line: event boundary.
+		isDone, err := r.flush()
+		if err != nil {
+			return "", r.tokens, err
+		}
+		if isDone {
+			return r.success()
+		}
+	}
+	return r.finish(ctx, sc.Err())
+}
+
+// sseReader accumulates one SSE response: the text so far, the running token
+// count, the usage count if the upstream sent one, and the data lines of the
+// event being read.
+type sseReader struct {
+	sb          strings.Builder
+	tokens      int
+	usageTokens int // -1 means "no usage field seen"
+	dataLines   []string
+	onChunk     func(delta string, total int)
+}
+
+// flush decodes the buffered event. It reports whether that event was the
+// [DONE] sentinel.
+func (r *sseReader) flush() (bool, error) {
+	if len(r.dataLines) == 0 {
+		return false, nil
+	}
+	data := strings.Join(r.dataLines, "\n")
+	r.dataLines = r.dataLines[:0]
+
+	if data == "[DONE]" {
+		return true, nil
 	}
 
-	if err := sc.Err(); err != nil {
-		if ctx.Err() != nil {
-			return "", tokens, ctx.Err()
+	var chunk sseChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return false, fmt.Errorf("decode SSE chunk: %w", err)
+	}
+	if chunk.Error != nil {
+		msg := chunk.Error.Message
+		if msg == "" {
+			msg = "unknown error"
 		}
-		return "", tokens, err
+		return false, fmt.Errorf("openai upstream: %s", msg)
+	}
+	r.apply(chunk)
+	return false, nil
+}
+
+// apply adds one decoded chunk's delta text and usage to the totals.
+func (r *sseReader) apply(chunk sseChunk) {
+	if len(chunk.Choices) > 0 {
+		if content := chunk.Choices[0].Delta.Content; content != "" {
+			r.sb.WriteString(content)
+			r.tokens++
+			if r.onChunk != nil {
+				r.onChunk(content, r.tokens)
+			}
+		}
+	}
+	if chunk.Usage != nil {
+		r.usageTokens = chunk.Usage.CompletionTokens
+	}
+}
+
+// success returns the accumulated text and the final token count: the
+// upstream's usage count when it sent one, else the running count.
+func (r *sseReader) success() (string, int, error) {
+	if r.usageTokens >= 0 {
+		return r.sb.String(), r.usageTokens, nil
+	}
+	return r.sb.String(), r.tokens, nil
+}
+
+// finish ends a stream whose scanner stopped without a blank line + [DONE]:
+// scanErr is the scanner's own error, if any.
+func (r *sseReader) finish(ctx context.Context, scanErr error) (string, int, error) {
+	if scanErr != nil {
+		if ctx.Err() != nil {
+			return "", r.tokens, fmt.Errorf("openai upstream: %w", ctx.Err())
+		}
+		return "", r.tokens, fmt.Errorf("read SSE stream: %w", scanErr)
 	}
 
 	// Flush any trailing event that wasn't followed by a final blank line.
-	isDone, err := flush()
+	isDone, err := r.flush()
 	if err != nil {
-		return "", tokens, err
+		return "", r.tokens, err
 	}
 	if isDone {
-		final := tokens
-		if usageTokens >= 0 {
-			final = usageTokens
-		}
-		return sb.String(), final, nil
+		return r.success()
 	}
 
 	// Stream ended without a [DONE] sentinel (e.g. upstream closed
@@ -171,9 +185,9 @@ func parseSSEStreamChunks(ctx context.Context, body io.Reader, onChunk func(delt
 	// success, mirroring ollama.Client.Generate's "stream ended without
 	// done" guard.
 	if ctx.Err() != nil {
-		return "", tokens, ctx.Err()
+		return "", r.tokens, fmt.Errorf("openai upstream: %w", ctx.Err())
 	}
-	return "", tokens, fmt.Errorf("openai upstream: stream ended without done")
+	return "", r.tokens, fmt.Errorf("openai upstream: stream ended without done")
 }
 
 // cutPrefix trims an SSE field prefix (e.g. "data:") from s and returns the

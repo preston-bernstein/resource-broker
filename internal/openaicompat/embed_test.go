@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -15,24 +16,20 @@ import (
 // array order: the mock server deliberately returns index 1's embedding
 // before index 0's, and uses distinguishable per-input values (AC-22).
 func TestClientEmbed_PreservesInputOrder(t *testing.T) {
-	var gotPath string
-	var gotAuth string
-	var gotBody struct {
-		Model string   `json:"model"`
-		Input []string `json:"input"`
-	}
+	var gotPath, gotAuth string
+	var gotBody EmbedRequest
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := startServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-			t.Fatalf("mock server: decode request: %v", err)
+			t.Errorf("mock server: decode request: %v", err)
 		}
 
 		// Deliberately out of order: index 1 before index 0, plus a third
 		// entry for index 2 to prove more than a simple two-element swap.
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"model": "test-embed-model",
 			"data": [
 				{"index": 1, "embedding": [2.0, 2.0]},
@@ -41,20 +38,10 @@ func TestClientEmbed_PreservesInputOrder(t *testing.T) {
 			]
 		}`))
 	}))
-	defer srv.Close()
+	client := New(mustParseURL(t, srv.URL), "test-key")
 
-	base, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse test server URL: %v", err)
-	}
-	client := New(base, "test-key")
-
-	req := EmbedRequest{
-		Model: "test-embed-model",
-		Input: []string{"first", "second", "third"},
-	}
-
-	resp, err := client.Embed(context.Background(), req)
+	wantReq := EmbedRequest{Model: "test-embed-model", Input: []string{"first", "second", "third"}}
+	resp, err := client.Embed(context.Background(), wantReq)
 	if err != nil {
 		t.Fatalf("Embed returned error: %v", err)
 	}
@@ -65,26 +52,16 @@ func TestClientEmbed_PreservesInputOrder(t *testing.T) {
 	if gotAuth != "Bearer test-key" {
 		t.Errorf("expected Authorization header %q, got %q", "Bearer test-key", gotAuth)
 	}
-	if gotBody.Model != "test-embed-model" {
-		t.Errorf("expected upstream model %q, got %q", "test-embed-model", gotBody.Model)
-	}
-	if len(gotBody.Input) != 3 || gotBody.Input[0] != "first" || gotBody.Input[1] != "second" || gotBody.Input[2] != "third" {
-		t.Errorf("expected upstream input [first second third], got %v", gotBody.Input)
+	if !reflect.DeepEqual(gotBody, wantReq) {
+		t.Errorf("expected upstream request %+v, got %+v", wantReq, gotBody)
 	}
 
 	if resp.Model != "test-embed-model" {
 		t.Errorf("expected response model %q, got %q", "test-embed-model", resp.Model)
 	}
-	if len(resp.Embeddings) != 3 {
-		t.Fatalf("expected 3 embeddings, got %d", len(resp.Embeddings))
-	}
-
 	want := [][]float64{{1.0, 1.0}, {2.0, 2.0}, {3.0, 3.0}}
-	for i, w := range want {
-		got := resp.Embeddings[i]
-		if len(got) != len(w) || got[0] != w[0] || got[1] != w[1] {
-			t.Errorf("embeddings[%d] = %v, want %v (order must match request input order)", i, got, w)
-		}
+	if !reflect.DeepEqual(resp.Embeddings, want) {
+		t.Errorf("embeddings = %v, want %v (order must match request input order)", resp.Embeddings, want)
 	}
 }
 
@@ -97,7 +74,7 @@ func TestClientEmbed_NoAuthHeaderWhenKeyEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, authHeaderPresent = r.Header["Authorization"]
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"model":"m","data":[{"index":0,"embedding":[0.1]}]}`))
+		_, _ = w.Write([]byte(`{"model":"m","data":[{"index":0,"embedding":[0.1]}]}`))
 	}))
 	defer srv.Close()
 
@@ -151,7 +128,7 @@ func TestClientEmbed_IndexEqualToLengthIsOutOfRange(t *testing.T) {
 		// One input, but the upstream reports index 1 (== len(embeddings),
 		// one past the only valid index 0) — must be rejected, not silently
 		// indexed out of range.
-		w.Write([]byte(`{"model":"m","data":[{"index":1,"embedding":[0.1]}]}`))
+		_, _ = w.Write([]byte(`{"model":"m","data":[{"index":1,"embedding":[0.1]}]}`))
 	}))
 	defer srv.Close()
 
@@ -180,7 +157,7 @@ func TestClientEmbed_IndexEqualToLengthIsOutOfRange(t *testing.T) {
 func TestClientEmbed_EmptyUpstreamModelFallsBackToRequestModel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"model":"","data":[{"index":0,"embedding":[0.1]}]}`))
+		_, _ = w.Write([]byte(`{"model":"","data":[{"index":0,"embedding":[0.1]}]}`))
 	}))
 	defer srv.Close()
 

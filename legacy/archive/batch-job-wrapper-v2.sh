@@ -26,14 +26,12 @@ wait_for_gaming_end() {
     wait_count=$((wait_count + 1))
     # Log every minute
     if [ $((wait_count % 6)) -eq 0 ]; then
-      # shellcheck disable=SC2004 # existing pattern; unchanged in the pack-compliance pass
-      log "Still waiting for gaming to end ($(($wait_count * 10))s elapsed)..."
+      log "Still waiting for gaming to end ($((wait_count * 10))s elapsed)..."
     fi
   done
 
   if [ $wait_count -gt 0 ]; then
-    # shellcheck disable=SC2004 # existing pattern; unchanged in the pack-compliance pass
-    log "Gaming ended after $(($wait_count * 10))s, ready to retry"
+    log "Gaming ended after $((wait_count * 10))s, ready to retry"
   fi
 }
 
@@ -50,8 +48,7 @@ while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
   log "Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
 
   # Run the batch job
-  # shellcheck disable=SC2086 # existing pattern; unchanged in the pack-compliance pass
-  ollama run $LARGE_MODEL "$PROMPT"
+  ollama run "$LARGE_MODEL" "$PROMPT"
   EXIT_CODE=$?
 
   if [ $EXIT_CODE -eq 0 ]; then

@@ -3,10 +3,12 @@ package job
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
 
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/queue"
 )
 
@@ -26,9 +28,9 @@ type Yielder interface {
 	ServeContext() context.Context
 }
 
-// Generator runs one inference, streaming token-count progress via onTokens.
+// Generator runs one inference, streaming token-count progress via req.OnTokens.
 type Generator interface {
-	Generate(ctx context.Context, model, prompt string, options map[string]any, onTokens func(int)) (string, error)
+	Generate(ctx context.Context, req inference.Request) (string, error)
 }
 
 // Worker drains the durable Job queue one Job at a time through the shared
@@ -45,55 +47,61 @@ type Worker struct {
 	poll    time.Duration
 }
 
-// NewWorker builds a Worker. quantum is the batch min-run window before
-// interactive may preempt (ADR-0004); poll is how often the loop re-checks for
-// work while idle or yielding.
-func NewWorker(svc *Service, gate Gate, yld Yielder, gen Generator, quantum, poll time.Duration) *Worker {
-	if quantum <= 0 {
-		quantum = 10 * time.Second
+// WorkerConfig is everything NewWorker needs. Quantum is the batch min-run
+// window before interactive may preempt (ADR-0004); Poll is how often the loop
+// re-checks for work while idle or yielding. A zero Quantum or Poll takes its
+// default.
+type WorkerConfig struct {
+	Service   *Service
+	Gate      Gate
+	Yielder   Yielder
+	Generator Generator
+	Quantum   time.Duration
+	Poll      time.Duration
+}
+
+// NewWorker builds a Worker from cfg.
+func NewWorker(cfg WorkerConfig) *Worker {
+	if cfg.Quantum <= 0 {
+		cfg.Quantum = 10 * time.Second
 	}
-	if poll <= 0 {
-		poll = 500 * time.Millisecond
+	if cfg.Poll <= 0 {
+		cfg.Poll = 500 * time.Millisecond
 	}
-	return &Worker{svc: svc, gate: gate, yld: yld, gen: gen, quantum: quantum, poll: poll}
+	return &Worker{svc: cfg.Service, gate: cfg.Gate, yld: cfg.Yielder, gen: cfg.Generator, quantum: cfg.Quantum, poll: cfg.Poll}
 }
 
 // Run drains the queue until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
+	for ctx.Err() == nil {
+		if w.tryRunNext(ctx) {
+			continue
+		}
+		if !w.sleep(ctx) {
 			return
 		}
-		// Hold the line while yielding to gaming/Plex — don't claim work the GPU
-		// can't run.
-		if yielding, _ := w.yld.Yielding(); yielding {
-			if !w.sleep(ctx) {
-				return
-			}
-			continue
-		}
-		// Cheap peek so we don't take a GPU slot just to find the queue empty.
-		has, err := w.svc.store.HasQueued(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
+	}
+}
+
+// tryRunNext runs one Job if the GPU is free and one is queued. It returns
+// false when the caller should back off.
+func (w *Worker) tryRunNext(ctx context.Context) bool {
+	// Hold the line while yielding to gaming/Plex — don't claim work the GPU
+	// can't run.
+	if yielding, _ := w.yld.Yielding(); yielding {
+		return false
+	}
+	// Cheap peek so we don't take a GPU slot just to find the queue empty.
+	has, err := w.svc.store.HasQueued(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
 			slog.Warn("job peek", "err", err)
 		}
-		if err != nil || !has {
-			if !w.sleep(ctx) {
-				return
-			}
-			continue
-		}
-		// Acquire the slot first, then claim — so a Job only becomes RUNNING once
-		// it actually holds the GPU, never while merely waiting in line.
-		if !w.runNext(ctx) {
-			if !w.sleep(ctx) {
-				return
-			}
-		}
+		return false
 	}
+	// Acquire the slot first, then claim — so a Job only becomes RUNNING once
+	// it actually holds the GPU, never while merely waiting in line.
+	return has && w.runNext(ctx)
 }
 
 func (w *Worker) sleep(ctx context.Context) bool {
@@ -124,7 +132,7 @@ func (w *Worker) runNext(ctx context.Context) bool {
 	}
 
 	j, err := w.svc.store.ClaimNext(ctx)
-	if err == ErrNotFound {
+	if errors.Is(err, ErrNotFound) {
 		return false
 	}
 	if err != nil {
@@ -137,70 +145,93 @@ func (w *Worker) runNext(ctx context.Context) bool {
 	return true
 }
 
+// attempt is one try at running a Job and how it ended.
+type attempt struct {
+	job       *Job
+	genErr    error
+	run       time.Duration
+	serveDone <-chan struct{}
+	preempted *atomic.Bool
+}
+
 func (w *Worker) runJob(ctx context.Context, j *Job) {
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	rs := w.svc.startRun(j.ID, cancel)
 	defer w.svc.endRun(j.ID)
 
-	var preempted atomic.Bool
-	serveDone := w.yld.ServeContext().Done()
-	go w.monitor(jobCtx, serveDone, w.svc.now(), cancel, &preempted)
+	a := &attempt{job: j, serveDone: w.yld.ServeContext().Done(), preempted: &atomic.Bool{}}
+	go w.monitor(jobCtx, a.serveDone, w.svc.now(), cancel, a.preempted)
 
 	opts := decodeOptions(j.ParamsJSON)
-	text, genErr := w.gen.Generate(jobCtx, j.Model, j.Prompt, opts, func(n int) {
+	text, genErr := w.gen.Generate(jobCtx, inference.Request{Model: j.Model, Prompt: j.Prompt, Options: opts, OnTokens: func(n int) {
 		w.svc.reportTokens(j.ID, rs, n)
-	})
+	}})
+	a.genErr = genErr
+	a.run = w.svc.now().Sub(rs.startedAt)
 
-	// Terminal writes must survive worker-loop shutdown, so use a fresh context.
-	bg, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Terminal writes must survive worker-loop shutdown, so they get a context
+	// that keeps ctx's values but not its cancellation.
+	bg, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer bgCancel()
-
-	run := w.svc.now().Sub(rs.startedAt)
-
 	if genErr == nil {
-		if err := w.svc.store.Succeed(bg, j.ID, text); err != nil {
-			slog.Warn("job succeed", "id", j.ID, "err", err)
-			return
-		}
-		w.svc.publishTerminal(j.ID, StateSucceeded)
-		w.svc.recordJob("succeeded", run)
-		slog.Info("job done", "id", j.ID, "state", StateSucceeded)
+		w.succeed(bg, a, text)
 		return
 	}
+	w.classifyAbort(ctx, bg, a)
+}
 
-	// The generation aborted. Classify why, preferring "requeue" causes over
-	// "fail" so transient interruptions never burn an attempt.
-	switch {
-	case w.svc.isCanceled(bg, j.ID):
-		// Explicit Cancel already set CANCELED and published the terminal event.
-		slog.Info("job canceled", "id", j.ID)
-	case ctx.Err() != nil:
-		w.requeue(j.ID) // broker shutting down
-	case isClosed(serveDone):
-		w.requeue(j.ID) // gaming/Plex took the GPU
-		w.svc.recordJob("preempted", run)
-		slog.Info("job preempted", "id", j.ID, "by", "gaming")
-	case preempted.Load():
-		w.requeue(j.ID) // interactive request preempted past quantum
-		w.svc.recordJob("preempted", run)
-		slog.Info("job preempted", "id", j.ID, "by", "interactive")
-	default:
-		failed, err := w.svc.store.FailOrRetry(bg, j.ID, genErr.Error(), w.svc.maxAttempts)
-		if err != nil {
-			slog.Warn("job fail", "id", j.ID, "err", err)
-			return
-		}
-		if failed {
-			w.svc.publishTerminal(j.ID, StateFailed)
-			w.svc.recordJob("failed", run)
-			slog.Info("job failed", "id", j.ID, "err", genErr)
-		} else {
-			w.svc.bus.publish(j.ID, Event{Type: EventState, State: StateQueued})
-			w.svc.recordJob("retried", run)
-			slog.Info("job retry", "id", j.ID, "err", genErr)
-		}
+func (w *Worker) succeed(bg context.Context, a *attempt, text string) {
+	id := a.job.ID
+	if err := w.svc.store.Succeed(bg, id, text); err != nil {
+		slog.Warn("job succeed", "id", id, "err", err)
+		return
 	}
+	w.svc.publishTerminal(id, StateSucceeded)
+	w.svc.recordJob("succeeded", a.run)
+	slog.Info("job done", "id", id, "state", StateSucceeded)
+}
+
+// classifyAbort handles a generation that aborted. It classifies why,
+// preferring "requeue" causes over "fail" so transient interruptions never
+// burn an attempt.
+func (w *Worker) classifyAbort(ctx, bg context.Context, a *attempt) {
+	id := a.job.ID
+	switch {
+	case w.svc.isCanceled(bg, id):
+		// Explicit Cancel already set CANCELED and published the terminal event.
+		slog.Info("job canceled", "id", id)
+	case ctx.Err() != nil:
+		w.requeue(ctx, id) // broker shutting down
+	case isClosed(a.serveDone):
+		w.requeue(ctx, id) // gaming/Plex took the GPU
+		w.svc.recordJob("preempted", a.run)
+		slog.Info("job preempted", "id", id, "by", "gaming")
+	case a.preempted.Load():
+		w.requeue(ctx, id) // interactive request preempted past quantum
+		w.svc.recordJob("preempted", a.run)
+		slog.Info("job preempted", "id", id, "by", "interactive")
+	default:
+		w.failOrRetry(bg, a)
+	}
+}
+
+func (w *Worker) failOrRetry(bg context.Context, a *attempt) {
+	id := a.job.ID
+	failed, err := w.svc.store.FailOrRetry(bg, id, a.genErr.Error(), w.svc.maxAttempts)
+	if err != nil {
+		slog.Warn("job fail", "id", id, "err", err)
+		return
+	}
+	if failed {
+		w.svc.publishTerminal(id, StateFailed)
+		w.svc.recordJob("failed", a.run)
+		slog.Info("job failed", "id", id, "err", a.genErr)
+		return
+	}
+	w.svc.bus.publish(id, Event{Type: EventState, State: StateQueued})
+	w.svc.recordJob("retried", a.run)
+	slog.Info("job retry", "id", id, "err", a.genErr)
 }
 
 // monitor cancels the job context when the GPU must be surrendered: immediately
@@ -237,8 +268,8 @@ func (w *Worker) shouldPreempt(start time.Time) bool {
 	return w.svc.now().Sub(start) >= w.quantum && w.gate.Stats().Interactive > 0
 }
 
-func (w *Worker) requeue(id string) {
-	bg, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (w *Worker) requeue(ctx context.Context, id string) {
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := w.svc.store.Preempt(bg, id); err != nil {
 		slog.Warn("job requeue", "id", id, "err", err)

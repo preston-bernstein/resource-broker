@@ -52,6 +52,3 @@ formatters:
     - gofmt
     - goimports
 
-# Existing findings are accepted as of this commit; only new code is checked. Fix old ones when the file is touched.
-issues:
-  new-from-rev: aa3905d33297f734668491524cffa28a828b3de4

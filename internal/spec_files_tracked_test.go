@@ -1,8 +1,8 @@
 package broker_test
 
 import (
-	"context"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -10,17 +10,23 @@ import (
 // including .ctx.md and TASKS.md. A .gitignore line for either made the commit
 // fail ("paths are ignored by one of your .gitignore files").
 func TestSpecFolderFilesAreNotGitignored(t *testing.T) {
-	for _, path := range []string{
+	paths := []string{
 		"docs/some-feature/requirements.md",
 		"docs/some-feature/plan.md",
 		"docs/some-feature/steps.md",
 		"docs/some-feature/.ctx.md",
 		"docs/some-feature/TASKS.md",
-	} {
-		// git check-ignore exits 0 when the path IS ignored, 1 when it is not.
-		err := exec.CommandContext(context.Background(), "git", "-C", "..", "check-ignore", "-q", "--no-index", path).Run() //nolint:gosec // path comes from the fixed list above, not from input
-		if err == nil {
-			t.Errorf("%s is gitignored; the runner cannot commit it", path)
-		}
+	}
+	// The paths go in on stdin so every command argument stays constant.
+	// git check-ignore exits 0 and lists the paths that ARE ignored, and exits
+	// 1 when none are.
+	cmd := exec.CommandContext(t.Context(), "git", "-C", "..", "check-ignore", "--no-index", "--stdin")
+	cmd.Stdin = strings.NewReader(strings.Join(paths, "\n") + "\n")
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	for _, path := range strings.Fields(string(out)) {
+		t.Errorf("%s is gitignored; the runner cannot commit it", path)
 	}
 }

@@ -56,117 +56,174 @@ func newLogger() *slog.Logger {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+// broker is the wired-up process: everything run needs after construction.
+//
+// Per-model backend routing (docs/adr/0015-per-model-backend-routing.md):
+// when no routes are configured (the default, and today's exact
+// pre-feature behavior), router stays nil and every call site uses
+// the backend directly — zero Router construction, zero body-peeking, byte-for-
+// byte identical to before this feature existed. When one or more routes
+// are configured, router fronts both Gates via ProxyForLane (never via
+// its own Proxy(), which has no lane context) and active becomes
+// router for the Job worker and healthCheck, since Router.Generate/
+// Reachable already dispatch/check correctly on its own.
+type broker struct {
+	cfg        *config.Config
+	sched      *queue.Scheduler
+	ctrl       *yield.Controller
+	reg        *metrics.Registry
+	router     *backend.Router
+	active     backend.Backend
+	idleStatus func() any
+}
+
+// startupFailure logs why the process cannot start and returns its exit code.
+func startupFailure(stage string, err error) int {
+	slog.Error(stage, "err", err)
+	return 1
+}
+
+func run() int {
 	slog.SetDefault(newLogger())
 
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("config", "err", err)
-		os.Exit(1)
+		return startupFailure("config", err)
 	}
 
 	be, err := backend.New(cfg)
 	if err != nil {
-		slog.Error("backend", "err", err)
-		os.Exit(1)
+		return startupFailure("backend", err)
 	}
 
+	detector := newDetector(cfg)
+	router, activeBackend, ctrl, idleStatus, err := buildBroker(cfg, detector, be)
+	if err != nil {
+		return startupFailure("build broker", err)
+	}
+	b := &broker{cfg: cfg, sched: newScheduler(cfg), ctrl: ctrl, reg: metrics.New(),
+		router: router, active: activeBackend, idleStatus: idleStatus}
+	// Contention detection failing open (couldn't read /proc) must not be
+	// silent — see internal/detect/detect.go's Detect() and the
+	// broker_detect_errors_total counter (2026-08-01 audit fix).
+	detector.SetErrorRecorder(b.reg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.startControlLoops(ctx)
+	tdarrStatus := b.startTdarr(ctx)
+
+	store, err := job.OpenSQLite(ctx, cfg.JobDBPath)
+	if err != nil {
+		return startupFailure("open job store", err)
+	}
+	defer closeJobStore(store)
+	jobSvc, err := b.startJobs(ctx, store)
+	if err != nil {
+		return startupFailure("job recovery", err)
+	}
+
+	servers := b.servers(ctx, jobSvc, store, tdarrStatus)
+	return b.serve(cancel, servers)
+}
+
+// startJobs starts the durable Job system (ADR-0006/0007) on store: a
+// SQLite-backed queue and worker that share the scheduler and yield gate with
+// the synchronous proxy. It recovers Jobs a crash left running, then starts
+// the worker.
+func (b *broker) startJobs(ctx context.Context, store *job.SQLiteStore) (*job.Service, error) {
+	cfg := b.cfg
+	jobSvc := job.NewService(store, cfg.JobMaxAttempts)
+	jobSvc.SetRecorder(b.reg)
+	if err := jobSvc.Recover(ctx); err != nil {
+		return nil, fmt.Errorf("startJobs: recover jobs: %w", err)
+	}
+	worker := job.NewWorker(job.WorkerConfig{Service: jobSvc, Gate: b.sched, Yielder: b.ctrl, Generator: b.active, Quantum: cfg.BatchQuantum})
+	go worker.Run(ctx)
+	go jobSvc.RunPrune(ctx, cfg.JobPruneInterval, cfg.JobFetchedGrace, cfg.JobHardCap)
+	return jobSvc, nil
+}
+
+func closeJobStore(store *job.SQLiteStore) {
+	if err := store.Close(); err != nil {
+		slog.Warn("job store close", "err", err)
+	}
+}
+
+func newScheduler(cfg *config.Config) *queue.Scheduler {
 	sched := queue.New()
 	sched.SetMaxWaiters(cfg.MaxWaiters)
 	sched.SetMaxInflight(cfg.MaxInflight)
 	sched.SetCPUModels(cfg.CPUModels) // ADR-0018: CPU-only models skip the GPU slot
 	sched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
+	return sched
+}
+
+func newDetector(cfg *config.Config) *detect.Detector {
 	detector := detect.New(detect.ProcLister)
 	if cfg.PlexToken != "" {
 		detector.SetPlexChecker(plex.New(cfg.PlexURL, cfg.PlexToken))
 		slog.Info("plex session corroboration enabled", "url", cfg.PlexURL)
 	}
-	// Per-model backend routing (docs/adr/0015-per-model-backend-routing.md):
-	// when no routes are configured (the default, and today's exact
-	// pre-feature behavior), router stays nil and every call site below uses
-	// be directly — zero Router construction, zero body-peeking, byte-for-
-	// byte identical to before this feature existed. When one or more routes
-	// are configured, router fronts both Gates via ProxyForLane (never via
-	// its own Proxy(), which has no lane context) and activeBackend becomes
-	// router for the Job worker and healthCheck, since Router.Generate/
-	// Reachable already dispatch/check correctly on its own.
-	router, activeBackend, ctrl, idleStatus, err := buildBroker(cfg, detector, be)
-	if err != nil {
-		slog.Error("build broker", "err", err)
-		os.Exit(1)
-	}
-	// yieldingFn adapts ctrl.Yielding()'s (bool, string) signature to the
-	// plain closure RunParkDrain expects (ADR-0009's Core redesign: the park
-	// drain loop is a plain ticker poll, not a yield.Controller broadcast).
-	// Shared by sched and embedSched below — both watch the same ctrl.
-	yieldingFn := func() bool {
-		y, _ := ctrl.Yielding()
-		return y
-	}
-	reg := metrics.New()
-	// Contention detection failing open (couldn't read /proc) must not be
-	// silent — see internal/detect/detect.go's Detect() and the
-	// broker_detect_errors_total counter (2026-08-01 audit fix).
-	detector.SetErrorRecorder(reg)
+	return detector
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sched.SetShutdownContext(ctx)
-	go ctrl.Run(ctx)
-	go sched.RunParkDrain(ctx, yieldingFn)
+// yielding adapts ctrl.Yielding()'s (bool, string) signature to the plain
+// closure RunParkDrain expects (ADR-0009's Core redesign: the park drain loop
+// is a plain ticker poll, not a yield.Controller broadcast). Shared by the main
+// scheduler and the embed lane's — both watch the same ctrl.
+func (b *broker) yielding() bool {
+	y, _ := b.ctrl.Yielding()
+	return y
+}
 
-	// Tdarr cooperative GPU management: pause GPU transcoding when gaming/Plex
-	// takes the GPU (via yield controller), and during the internal-scraper-service window.
-	// Lowest priority consumer: gaming/Plex > Ollama inference > Tdarr.
-	var tdarrClient *tdarr.Client
-	var tdarrStatusFn admin.TdarrStatusFn
-	if cfg.TdarrURL != "" && cfg.TdarrNodeID != "" {
-		tdarrClient = tdarr.New(cfg.TdarrURL, cfg.TdarrNodeID, cfg.TdarrGPUWorkers)
-		ctrl.SetGPUManager(tdarrClient)
-		go runTdarrSchedule(ctx, tdarrClient)
-		tdarrStatusFn = func() *admin.TdarrStatus {
-			gpu, err := tdarrClient.WorkerLimits(context.Background())
-			if err != nil {
-				return &admin.TdarrStatus{Managed: true, GPUWorkers: -1}
-			}
-			return &admin.TdarrStatus{Managed: true, GPUWorkers: gpu}
+func (b *broker) startControlLoops(ctx context.Context) {
+	b.sched.SetShutdownContext(ctx)
+	go b.ctrl.Run(ctx)
+	go b.sched.RunParkDrain(ctx, b.yielding)
+}
+
+// startTdarr wires Tdarr cooperative GPU management: pause GPU transcoding
+// when gaming/Plex takes the GPU (via yield controller), and during the
+// internal-scraper-service window. Lowest priority consumer: gaming/Plex >
+// Ollama inference > Tdarr. It returns nil when Tdarr is not configured.
+func (b *broker) startTdarr(ctx context.Context) admin.TdarrStatusFn {
+	cfg := b.cfg
+	if cfg.TdarrURL == "" || cfg.TdarrNodeID == "" {
+		return nil
+	}
+	tdarrClient := tdarr.New(cfg.TdarrURL, cfg.TdarrNodeID, cfg.TdarrGPUWorkers)
+	b.ctrl.SetGPUManager(tdarrClient)
+	go runTdarrSchedule(ctx, tdarrClient)
+	slog.Info("tdarr integration enabled", "url", cfg.TdarrURL, "node", cfg.TdarrNodeID)
+	return func(ctx context.Context) *admin.TdarrStatus {
+		gpu, err := tdarrClient.WorkerLimits(ctx)
+		if err != nil {
+			return &admin.TdarrStatus{Managed: true, GPUWorkers: -1}
 		}
-		slog.Info("tdarr integration enabled", "url", cfg.TdarrURL, "node", cfg.TdarrNodeID)
+		return &admin.TdarrStatus{Managed: true, GPUWorkers: gpu}
 	}
+}
 
-	// Durable Job system (ADR-0006/0007): SQLite-backed queue + worker, sharing
-	// the scheduler and yield gate with the synchronous proxy.
-	store, err := job.OpenSQLite(cfg.JobDBPath)
-	if err != nil {
-		slog.Error("open job store", "err", err)
-		os.Exit(1)
-	}
-	defer func() {
-		if err := store.Close(); err != nil {
-			slog.Warn("job store close", "err", err)
-		}
-	}()
-	jobSvc := job.NewService(store, cfg.JobMaxAttempts)
-	jobSvc.SetRecorder(reg)
-	if err := jobSvc.Recover(ctx); err != nil {
-		slog.Error("job recovery", "err", err)
-		os.Exit(1)
-	}
-	worker := job.NewWorker(jobSvc, sched, ctrl, activeBackend, cfg.BatchQuantum, 0)
-	go worker.Run(ctx)
-	go jobSvc.RunPrune(ctx, cfg.JobPruneInterval, cfg.JobFetchedGrace, cfg.JobHardCap)
-
-	jobCounts := func() job.Counts {
-		c, err := jobSvc.Counts(context.Background())
+// jobCountsFn returns the Job counts, logging (not failing) a store error.
+func jobCountsFn(jobSvc *job.Service) func(context.Context) job.Counts {
+	return func(ctx context.Context) job.Counts {
+		c, err := jobSvc.Counts(ctx)
 		if err != nil {
 			slog.Warn("job counts", "err", err)
 		}
 		return c
 	}
+}
 
-	metricsHandler := reg.Handler(func() metrics.Gauges {
-		st := sched.Stats()
-		yielding, _ := ctrl.Yielding()
-		c := jobCounts()
+func (b *broker) metricsHandler(jobCounts func(context.Context) job.Counts) http.Handler {
+	return b.reg.Handler(func(ctx context.Context) metrics.Gauges {
+		st := b.sched.Stats()
+		yielding, _ := b.ctrl.Yielding()
+		c := jobCounts(ctx)
 		return metrics.Gauges{
 			Yielding:     yielding,
 			Busy:         st.Busy,
@@ -182,118 +239,163 @@ func main() {
 			JobCanceled:  c.Canceled,
 		}
 	})
+}
 
-	jobStatus := func() any { return jobCounts() }
+// detectStaleFactor: see ADR-0010: >3 missed polls is a stalled loop, not a slow one.
+const detectStaleFactor = 3
 
-	// healthCheck backs /healthz with the three things "the process is up"
-	// says nothing about (ADR-0010): can we reach the upstream, can we read
-	// the durable job store, and is the contention-detection loop still
-	// actually polling. Any one failing means the broker cannot do its job
-	// even though systemd shows it active — the exact clamd-shaped defect the
-	// 2026-08-01 audit flagged against the old hardcoded "ok".
-	const detectStaleFactor = 3 // see ADR-0010: >3 missed polls is a stalled loop, not a slow one
-	healthCheck := func(ctx context.Context) error {
-		if err := activeBackend.Reachable(ctx); err != nil {
+// healthCheck backs /healthz with the three things "the process is up"
+// says nothing about (ADR-0010): can we reach the upstream, can we read
+// the durable job store, and is the contention-detection loop still
+// actually polling. Any one failing means the broker cannot do its job
+// even though systemd shows it active — the exact clamd-shaped defect the
+// 2026-08-01 audit flagged against the old hardcoded "ok".
+func (b *broker) healthCheck(store *job.SQLiteStore) admin.HealthCheck {
+	return func(ctx context.Context) error {
+		if err := b.active.Reachable(ctx); err != nil {
 			return fmt.Errorf("upstream unreachable: %w", err)
 		}
 		if _, err := store.HasQueued(ctx); err != nil {
 			return fmt.Errorf("job store unreadable: %w", err)
 		}
-		if maxAge := detectStaleFactor * cfg.DetectInterval; ctrl.PollAge() > maxAge {
+		if maxAge := detectStaleFactor * b.cfg.DetectInterval; b.ctrl.PollAge() > maxAge {
 			return fmt.Errorf("contention detector stalled: no poll in over %s (want under %s)",
-				ctrl.PollAge().Round(time.Second), maxAge)
+				b.ctrl.PollAge().Round(time.Second), maxAge)
 		}
 		return nil
 	}
+}
 
-	// batchServer fronts bulk/background traffic (LightRAG's embedding calls
-	// among it) — exactly the workload that repeatedly hit a "server
-	// disconnected without sending a response" failure during sustained
-	// multi-minute runs (2026-07-15), even after removing every timer on the
-	// broker's own inbound and outbound sides that could plausibly explain a
-	// stale-connection race (see IdleTimeout comment above, IdleConnTimeout
-	// and retryTransport in internal/proxy/proxy.go). The broker's own access
-	// log showed every request "served" cleanly on the outbound (Ollama) leg
-	// right up to the crash, and the retry layer never activated — narrowing
-	// the failure to the final hop, writing the response back over an
-	// already-established connection that something (the client's own pool,
-	// or the network path) killed without either endpoint logging why.
-	// SetKeepAlivesEnabled(false) removes connection reuse entirely on this
-	// lane: every request gets a fresh TCP connection, so there is no pooled
-	// connection left for either side to race on reusing. Scoped to the
-	// batch lane only (not interactive) since the extra per-request TCP
-	// handshake is negligible on a LAN but this trades a little latency for
-	// eliminating an entire failure class — not worth paying on the
-	// low-latency interactive lane where the race hasn't been observed.
-	// interactiveProxy/batchProxy: router.ProxyForLane's own doc comment notes
-	// Proxy() (no lane context) is not what production wiring should call —
-	// these two lines are that production wiring, always passing a real lane
-	// (queue.Class.String()) when routes are configured. When router is nil
-	// (zero routes), activeBackend.Proxy() is the exact pre-feature code path
-	// (no Router construction, no body-peeking) EXCEPT that activeBackend —
-	// not the pre-buildBroker local be — must be used here: buildBroker's
-	// no-routes branch may have reassigned its own be parameter to a
-	// backend.WithActivityTracking-decorated wrapper (idle-unload enabled)
-	// and returned that decorated value as activeBackend. be is a plain Go
-	// interface value passed to buildBroker by copy, so buildBroker
-	// reassigning its own be parameter never changes this be — only
-	// activeBackend carries the decoration back out. Using be.Proxy() here
-	// silently drops idle-activity tracking for every interactive/batch
-	// request on the no-routes path (verified live: /status kept reporting
-	// idle_unloaded=true and since_last_dispatch kept climbing across a real
-	// served request, with no wake-triggered reload log line, until this was
-	// fixed to reference activeBackend instead).
-	var interactiveProxy, batchProxy http.Handler
-	if router != nil {
-		interactiveProxy = router.ProxyForLane(queue.Interactive.String())
-		batchProxy = router.ProxyForLane(queue.Batch.String())
-	} else {
-		interactiveProxy = activeBackend.Proxy()
-		batchProxy = activeBackend.Proxy()
+// laneProxies picks the handlers behind the interactive and batch gates.
+// router.ProxyForLane's own doc comment notes Proxy() (no lane context) is not
+// what production wiring should call — this is that production wiring, always
+// passing a real lane (queue.Class.String()) when routes are configured. When
+// router is nil (zero routes), activeBackend.Proxy() is the exact pre-feature
+// code path (no Router construction, no body-peeking) EXCEPT that activeBackend
+// — not the pre-buildBroker local be — must be used here: buildBroker's
+// no-routes branch may have reassigned its own be parameter to a
+// backend.WithActivityTracking-decorated wrapper (idle-unload enabled)
+// and returned that decorated value as activeBackend. be is a plain Go
+// interface value passed to buildBroker by copy, so buildBroker
+// reassigning its own be parameter never changes this be — only
+// activeBackend carries the decoration back out. Using be.Proxy() here
+// silently drops idle-activity tracking for every interactive/batch
+// request on the no-routes path (verified live: /status kept reporting
+// idle_unloaded=true and since_last_dispatch kept climbing across a real
+// served request, with no wake-triggered reload log line, until this was
+// fixed to reference activeBackend instead).
+func (b *broker) laneProxies() (interactive, batch http.Handler) {
+	if b.router != nil {
+		return b.router.ProxyForLane(queue.Interactive.String()), b.router.ProxyForLane(queue.Batch.String())
 	}
+	return b.active.Proxy(), b.active.Proxy()
+}
+
+// servers builds every listener: interactive, batch, control, and the optional
+// embed lane.
+func (b *broker) servers(ctx context.Context, jobSvc *job.Service, store *job.SQLiteStore, tdarrStatus admin.TdarrStatusFn) []*http.Server {
+	cfg := b.cfg
+	jobCounts := jobCountsFn(jobSvc)
+	interactiveProxy, batchProxy := b.laneProxies()
 
 	var routingStatus func() any
-	if router != nil {
-		routingStatus = router.RoutingSummary
+	if b.router != nil {
+		routingStatus = b.router.RoutingSummary
 	}
-
-	batchServer := newServer(cfg.BatchAddr, sched.Gate(queue.Batch, cfg.BatchWait, 0, ctrl, reg, batchProxy))
-	batchServer.SetKeepAlivesEnabled(false)
 
 	servers := []*http.Server{
-		newServer(cfg.InteractiveAddr, sched.Gate(queue.Interactive, cfg.InteractiveWait, 0, ctrl, reg, interactiveProxy)),
-		batchServer,
-		newServer(cfg.ControlAddr, admin.Mux(ctrl, sched, healthCheck, metricsHandler, jobSvc.Routes(), jobStatus, tdarrStatusFn, routingStatus, idleStatus, cfg.ControlToken)),
+		newServer(cfg.InteractiveAddr, b.sched.Gate(queue.GateConfig{Class: queue.Interactive, Wait: cfg.InteractiveWait, Admission: b.ctrl, Recorder: b.reg}, interactiveProxy)),
+		b.batchServer(batchProxy),
+		newServer(cfg.ControlAddr, admin.Mux(admin.Options{
+			Controller:    b.ctrl,
+			Stats:         b.sched,
+			Health:        b.healthCheck(store),
+			Metrics:       b.metricsHandler(jobCounts),
+			Jobs:          jobSvc.Routes(),
+			JobStatus:     func(ctx context.Context) any { return jobCounts(ctx) },
+			TdarrStatus:   tdarrStatus,
+			RoutingStatus: routingStatus,
+			IdleStatus:    b.idleStatus,
+			ControlToken:  cfg.ControlToken,
+		})),
 	}
-
-	// Image-embedding lane (optional): fronts an Infinity SigLIP server on CPU
-	// for the internal-scraper-service durable corpus. It shares the yield controller —
-	// so it backs off the moment gaming/Plex is detected, exactly like Ollama —
-	// but runs on its OWN scheduler: CPU embedding and GPU inference use
-	// different hardware, so they must not contend for the single GPU slot.
-	// Disabled (lane not started) when INFINITY_URL is unset.
-	//
-	// Gate's upstreamTimeout is set here (cfg.EmbedTimeout, ADR-0013) and
-	// nowhere else: this lane's own MaxInflight is hardcoded to 1 (line
-	// below), so one stuck Infinity call — no response, connection just
-	// hangs — wedges the lane's single slot forever with no bound to free
-	// it, unlike Ollama's interactive/batch lanes where a legitimate
-	// generation can legitimately run for minutes and must NOT be cut off.
 	if cfg.InfinityURL != nil {
-		embedSched := queue.New()
-		embedSched.SetMaxWaiters(cfg.MaxWaiters)
-		embedSched.SetMaxInflight(1) // Infinity saturates all CPU cores per request
-		embedSched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
-		embedSched.SetShutdownContext(ctx)
-		go embedSched.RunParkDrain(ctx, yieldingFn)
-		// embed lane always fronts Infinity directly, never routed through
-		// backend.New() — UPSTREAM_BACKEND has no effect here.
-		embedUpstream := proxy.NewEmbed(cfg.InfinityURL)
-		servers = append(servers, newServer(cfg.EmbedAddr,
-			embedSched.Gate(queue.Batch, cfg.BatchWait, cfg.EmbedTimeout, ctrl, reg, embedUpstream)))
-		slog.Info("embed lane enabled", "addr", cfg.EmbedAddr, "upstream", cfg.InfinityURL.String(), "embed_timeout", cfg.EmbedTimeout.String())
+		servers = append(servers, b.embedServer(ctx))
 	}
+	return servers
+}
 
+// batchServer fronts bulk/background traffic (LightRAG's embedding calls
+// among it) — exactly the workload that repeatedly hit a "server
+// disconnected without sending a response" failure during sustained
+// multi-minute runs (2026-07-15), even after removing every timer on the
+// broker's own inbound and outbound sides that could plausibly explain a
+// stale-connection race (see newServer's IdleTimeout comment, IdleConnTimeout
+// and retryTransport in internal/proxy/proxy.go). The broker's own access
+// log showed every request "served" cleanly on the outbound (Ollama) leg
+// right up to the crash, and the retry layer never activated — narrowing
+// the failure to the final hop, writing the response back over an
+// already-established connection that something (the client's own pool,
+// or the network path) killed without either endpoint logging why.
+// SetKeepAlivesEnabled(false) removes connection reuse entirely on this
+// lane: every request gets a fresh TCP connection, so there is no pooled
+// connection left for either side to race on reusing. Scoped to the
+// batch lane only (not interactive) since the extra per-request TCP
+// handshake is negligible on a LAN but this trades a little latency for
+// eliminating an entire failure class — not worth paying on the
+// low-latency interactive lane where the race hasn't been observed.
+func (b *broker) batchServer(proxy http.Handler) *http.Server {
+	srv := newServer(b.cfg.BatchAddr, b.sched.Gate(queue.GateConfig{Class: queue.Batch, Wait: b.cfg.BatchWait, Admission: b.ctrl, Recorder: b.reg}, proxy))
+	srv.SetKeepAlivesEnabled(false)
+	return srv
+}
+
+// embedServer builds the image-embedding lane: it fronts an Infinity SigLIP
+// server on CPU for the internal-scraper-service durable corpus. It shares the
+// yield controller — so it backs off the moment gaming/Plex is detected,
+// exactly like Ollama — but runs on its OWN scheduler: CPU embedding and GPU
+// inference use different hardware, so they must not contend for the single
+// GPU slot. The lane is not started when INFINITY_URL is unset.
+//
+// Gate's UpstreamTimeout is set here (cfg.EmbedTimeout, ADR-0013) and
+// nowhere else: this lane's own MaxInflight is hardcoded to 1 (line
+// below), so one stuck Infinity call — no response, connection just
+// hangs — wedges the lane's single slot forever with no bound to free
+// it, unlike Ollama's interactive/batch lanes where a legitimate
+// generation can legitimately run for minutes and must NOT be cut off.
+func (b *broker) embedServer(ctx context.Context) *http.Server {
+	cfg := b.cfg
+	embedSched := queue.New()
+	embedSched.SetMaxWaiters(cfg.MaxWaiters)
+	embedSched.SetMaxInflight(1) // Infinity saturates all CPU cores per request
+	embedSched.SetParkConfig(cfg.ParkHold, cfg.ParkMaxQueue, cfg.ParkDrainBurst)
+	embedSched.SetShutdownContext(ctx)
+	go embedSched.RunParkDrain(ctx, b.yielding)
+	// embed lane always fronts Infinity directly, never routed through
+	// backend.New() — UPSTREAM_BACKEND has no effect here.
+	embedUpstream := proxy.NewEmbed(cfg.InfinityURL)
+	srv := newServer(cfg.EmbedAddr,
+		embedSched.Gate(queue.GateConfig{Class: queue.Batch, Wait: cfg.BatchWait, UpstreamTimeout: cfg.EmbedTimeout, Admission: b.ctrl, Recorder: b.reg}, embedUpstream))
+	slog.Info("embed lane enabled", "addr", cfg.EmbedAddr, "upstream", cfg.InfinityURL.String(), "embed_timeout", cfg.EmbedTimeout.String())
+	return srv
+}
+
+// upstreamURL returns the URL of the active backend. cfg.OllamaURL is nil
+// under UPSTREAM_BACKEND=openai (and cfg.UpstreamURL is nil under the default
+// "ollama" backend) — config.Load() only populates the URL matching the active
+// backend, so the log line must pick whichever one is actually set.
+func upstreamURL(cfg *config.Config) string {
+	if cfg.UpstreamBackend == "ollama" {
+		return cfg.OllamaURL.String()
+	}
+	return cfg.UpstreamURL.String()
+}
+
+// serve runs every server until an OS signal or a fatal listener error, then
+// shuts them down gracefully. Both paths run the same shutdown so nothing is
+// hard-killed mid-flight. It returns the process exit code.
+func (b *broker) serve(cancel context.CancelFunc, servers []*http.Server) int {
+	cfg := b.cfg
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(servers))
 	for _, srv := range servers {
@@ -306,20 +408,8 @@ func main() {
 			}
 		}(srv)
 	}
-	// cfg.OllamaURL is nil under UPSTREAM_BACKEND=openai (and cfg.UpstreamURL
-	// is nil under the default "ollama" backend) — config.Load() only
-	// populates the URL matching the active backend, so this log line must
-	// pick whichever one is actually set rather than assuming OllamaURL.
-	var upstreamURLStr string
-	if cfg.UpstreamBackend == "ollama" {
-		upstreamURLStr = cfg.OllamaURL.String()
-	} else {
-		upstreamURLStr = cfg.UpstreamURL.String()
-	}
-	slog.Info("broker up", "backend", cfg.UpstreamBackend, "upstream", upstreamURLStr, "detect_interval", cfg.DetectInterval.String(), "yield_confirm_polls", cfg.YieldConfirmPolls)
+	slog.Info("broker up", "backend", cfg.UpstreamBackend, "upstream", upstreamURL(cfg), "detect_interval", cfg.DetectInterval.String(), "yield_confirm_polls", cfg.YieldConfirmPolls)
 
-	// Shut down on either an OS signal or a fatal listener error — both paths
-	// run the same graceful shutdown so nothing is hard-killed mid-flight.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -337,13 +427,40 @@ func main() {
 		}
 	}
 	wg.Wait()
+	return 0
+}
+
+// newUnitUnloader builds the Unloader for one BROKER_YIELD_UNITS entry. A
+// variable so tests can record stop/start without running systemctl.
+var newUnitUnloader = backend.NewUnitUnloader
+
+// routeUnloader returns route rb's Unloader. A variable for the same reason as
+// newUnitUnloader: ConfigureDisplace stops a displacing route at construction.
+var routeUnloader = func(_ config.RouteBackend, b backend.Backend) yield.Unloader { return b.Unloader() }
+
+// yieldUnits are the BROKER_YIELD_UNITS (ADR-0019) Unloaders and their labels.
+// They go after the default backend and every route, so the orig indexes
+// 0..len(cfg.Routes) keep their meaning. They never idle-unload: their idle
+// timeout is always 0.
+type yieldUnits struct {
+	unloaders []yield.Unloader
+	labels    []string
+}
+
+func newYieldUnits(cfg *config.Config) yieldUnits {
+	var units yieldUnits
+	for _, u := range cfg.YieldUnits {
+		units.unloaders = append(units.unloaders, newUnitUnloader(u))
+		units.labels = append(units.labels, "unit:"+u)
+	}
+	return units
 }
 
 // buildBroker performs the pure (no network I/O, no os.Exit) wiring that
 // used to live inline in main(): constructing the yield.Controller, the
 // optional per-model Router, and the idle-unload decoration of whichever
 // backend(s) are actually in play. It exists so this logic has a real test
-// seam — main() itself blocks on ListenAndServe/signal handling and can't
+// seam — run() itself blocks on ListenAndServe/signal handling and can't
 // easily be driven by a unit test.
 //
 // THE ORDERING BUG THIS FIXES: it is tempting to build the Router first
@@ -358,137 +475,150 @@ func main() {
 // test that constructs Router directly. The fix is strict ordering: ctrl
 // must exist, and every backend must be decorated, BEFORE backend.NewRouter
 // and the AddRoute loop ever run.
-// newUnitUnloader builds the Unloader for one BROKER_YIELD_UNITS entry. A
-// variable so tests can record stop/start without running systemctl.
-var newUnitUnloader = backend.NewUnitUnloader
-
-// routeUnloader returns route rb's Unloader. A variable for the same reason as
-// newUnitUnloader: ConfigureDisplace stops a displacing route at construction.
-var routeUnloader = func(_ config.RouteBackend, b backend.Backend) yield.Unloader { return b.Unloader() }
-
 func buildBroker(cfg *config.Config, detector yield.Detector, be backend.Backend) (router *backend.Router, activeBackend backend.Backend, ctrl *yield.Controller, idleStatus func() any, err error) {
-	// BROKER_YIELD_UNITS (ADR-0019) go after the default backend and every
-	// route, so the orig indexes 0..len(cfg.Routes) keep their meaning. They
-	// never idle-unload: their idle timeout is always 0.
-	var unitUnloaders []yield.Unloader
-	var unitLabels []string
-	for _, u := range cfg.YieldUnits {
-		unitUnloaders = append(unitUnloaders, newUnitUnloader(u))
-		unitLabels = append(unitLabels, "unit:"+u)
-	}
-
-	if len(cfg.Routes) == 0 && len(unitUnloaders) > 0 {
-		unloaders := append([]yield.Unloader{be.Unloader()}, unitUnloaders...)
-		labels := append([]string{"default"}, unitLabels...)
-		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
-		idleTimeouts := make([]time.Duration, len(unloaders))
-		idleTimeouts[0] = cfg.UpstreamIdleTimeout
-		ctrl.ConfigureIdle(idleTimeouts)
-		if cfg.UpstreamIdleTimeout != 0 {
-			be = backend.WithActivityTracking(be, ctrl, 0)
+	units := newYieldUnits(cfg)
+	switch {
+	case len(cfg.Routes) > 0:
+		router, ctrl, err = buildRouted(cfg, detector, be, units)
+		if err != nil {
+			return nil, nil, nil, nil, err
 		}
-		activeBackend = be
-	} else if len(cfg.Routes) == 0 {
-		// unl may be a true nil yield.Unloader (e.g. an openai backend with no
-		// configured unit name) — NewWithConfirm then passes NewWithConfirmMulti
-		// a zero-length unloaders slice (it does not keep a nil placeholder for
-		// a nil single unloader), so ctrl.origToFiltered ends up length 0 in
-		// that case. Calling ConfigureIdle would then panic on a length
-		// mismatch against a 1-element idleTimeouts slice. config.Load()
-		// already guarantees UpstreamIdleTimeout is 0 whenever there is no
-		// Unloader to act on, so skipping ConfigureIdle/decoration entirely
-		// when unl is nil loses nothing.
-		unl := be.Unloader()
-		ctrl = yield.NewWithConfirm(detector, unl, cfg.DetectInterval, cfg.YieldConfirmPolls)
-		if unl != nil {
-			ctrl.ConfigureIdle([]time.Duration{cfg.UpstreamIdleTimeout})
-			if cfg.UpstreamIdleTimeout != 0 {
-				be = backend.WithActivityTracking(be, ctrl, 0)
-			}
-		}
-		activeBackend = be
-	} else {
-		routeBackends, routeUnloaders, labels, buildErr := buildRoutes(cfg)
-		if buildErr != nil {
-			return nil, nil, nil, nil, fmt.Errorf("route construction: %w", buildErr)
-		}
-		// unloaders/labels are computed, and ctrl constructed, BEFORE
-		// backend.NewRouter/AddRoute run below — see this function's doc
-		// comment for why the order matters.
-		unloaders := append([]yield.Unloader{be.Unloader()}, routeUnloaders...)
-		unloaders = append(unloaders, unitUnloaders...)
-		labels = append([]string{"default"}, labels...)
-		labels = append(labels, unitLabels...)
-		ctrl = yield.NewWithConfirmMulti(detector, unloaders, labels, cfg.DetectInterval, cfg.YieldConfirmPolls)
-
-		// idleTimeouts is index-aligned with unloaders/labels above: orig index
-		// 0 is the default backend, orig index i+1 is cfg.Routes[i], and the
-		// BROKER_YIELD_UNITS entries follow with a 0 timeout. Unlike the
-		// single-unloader branch, this slice's length always matches
-		// ctrl.origToFiltered's length regardless of any individual nil
-		// Unloader, since the unloaders slice above is always exactly
-		// 1+len(cfg.Routes)+len(cfg.YieldUnits) long (append never drops a
-		// nil element by position).
-		idleTimeouts := make([]time.Duration, len(unloaders))
-		idleTimeouts[0] = cfg.UpstreamIdleTimeout
-		for i, rb := range cfg.Routes {
-			idleTimeouts[i+1] = rb.IdleTimeout
-		}
-		ctrl.ConfigureIdle(idleTimeouts)
-
-		// BROKER_ROUTE_<N>_DISPLACES (ADR-0020), in the same orig index space:
-		// route i is i+1, yield unit k is 1+len(cfg.Routes)+k.
-		unitOrig := map[string]int{}
-		for k, u := range cfg.YieldUnits {
-			unitOrig[u] = 1 + len(cfg.Routes) + k
-		}
-		displace := map[int][]int{}
-		for i, rb := range cfg.Routes {
-			for _, u := range rb.Displaces {
-				displace[i+1] = append(displace[i+1], unitOrig[u])
-			}
-		}
-		ctrl.ConfigureDisplace(displace)
-		ctrl.SetUnitResumeHoldoff(cfg.UnitResumeHoldoff)
-
-		// Decorate in place — orig index 0 is the default backend, i+1 is
-		// route i — BEFORE NewRouter/AddRoute below capture these values.
-		if cfg.UpstreamIdleTimeout != 0 {
-			be = backend.WithActivityTracking(be, ctrl, 0)
-		}
-		for i := range cfg.Routes {
-			if cfg.Routes[i].IdleTimeout != 0 {
-				routeBackends[i] = backend.WithActivityTracking(routeBackends[i], ctrl, i+1)
-			}
-		}
-
-		r := backend.NewRouter(be)
-		for i, rb := range cfg.Routes {
-			for _, model := range rb.Models {
-				r.AddRoute(model, rb.Lane, routeBackends[i])
-			}
-		}
-		router = r
 		activeBackend = router
-
-		var routeSummary []string
-		for _, rb := range cfg.Routes {
-			routeSummary = append(routeSummary, fmt.Sprintf("%v->%s(%s)", rb.Models, rb.Backend, rb.URL.String()))
-		}
-		slog.Info("routing configured", "routes", routeSummary)
+	case len(units.unloaders) > 0:
+		ctrl, activeBackend = buildUnitsOnly(cfg, detector, be, units)
+	default:
+		ctrl, activeBackend = buildSingle(cfg, detector, be)
 	}
-
-	idleConfigured := cfg.UpstreamIdleTimeout != 0
-	for _, rb := range cfg.Routes {
-		if rb.IdleTimeout != 0 {
-			idleConfigured = true
-		}
-	}
-	if idleConfigured {
+	if hasIdleTimeout(cfg) {
 		idleStatus = ctrl.IdleSummary
 	}
-
 	return router, activeBackend, ctrl, idleStatus, nil
+}
+
+func hasIdleTimeout(cfg *config.Config) bool {
+	if cfg.UpstreamIdleTimeout != 0 {
+		return true
+	}
+	for _, rb := range cfg.Routes {
+		if rb.IdleTimeout != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// buildUnitsOnly wires the default backend plus BROKER_YIELD_UNITS, no routes.
+func buildUnitsOnly(cfg *config.Config, detector yield.Detector, be backend.Backend, units yieldUnits) (*yield.Controller, backend.Backend) {
+	unloaders := append([]yield.Unloader{be.Unloader()}, units.unloaders...)
+	labels := append([]string{"default"}, units.labels...)
+	ctrl := yield.NewWithConfirmMulti(detector, unloaders, labels, yield.Polling{Interval: cfg.DetectInterval, ConfirmPolls: cfg.YieldConfirmPolls})
+	idleTimeouts := make([]time.Duration, len(unloaders))
+	idleTimeouts[0] = cfg.UpstreamIdleTimeout
+	ctrl.ConfigureIdle(idleTimeouts)
+	if cfg.UpstreamIdleTimeout != 0 {
+		be = backend.WithActivityTracking(be, ctrl, 0)
+	}
+	return ctrl, be
+}
+
+// buildSingle wires the default backend alone: no routes, no yield units.
+func buildSingle(cfg *config.Config, detector yield.Detector, be backend.Backend) (*yield.Controller, backend.Backend) {
+	// unl may be a true nil yield.Unloader (e.g. an openai backend with no
+	// configured unit name) — NewWithConfirm then passes NewWithConfirmMulti
+	// a zero-length unloaders slice (it does not keep a nil placeholder for
+	// a nil single unloader), so ctrl.origToFiltered ends up length 0 in
+	// that case. Calling ConfigureIdle would then panic on a length
+	// mismatch against a 1-element idleTimeouts slice. config.Load()
+	// already guarantees UpstreamIdleTimeout is 0 whenever there is no
+	// Unloader to act on, so skipping ConfigureIdle/decoration entirely
+	// when unl is nil loses nothing.
+	unl := be.Unloader()
+	ctrl := yield.NewWithConfirm(detector, unl, cfg.DetectInterval, cfg.YieldConfirmPolls)
+	if unl == nil {
+		return ctrl, be
+	}
+	ctrl.ConfigureIdle([]time.Duration{cfg.UpstreamIdleTimeout})
+	if cfg.UpstreamIdleTimeout != 0 {
+		be = backend.WithActivityTracking(be, ctrl, 0)
+	}
+	return ctrl, be
+}
+
+// buildRouted wires the default backend, every route and the yield units
+// behind a Router.
+func buildRouted(cfg *config.Config, detector yield.Detector, be backend.Backend, units yieldUnits) (*backend.Router, *yield.Controller, error) {
+	routeBackends, routeUnloaders, routeLabels, err := buildRoutes(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("route construction: %w", err)
+	}
+	// unloaders/labels are computed, and ctrl constructed, BEFORE
+	// backend.NewRouter/AddRoute run below — see buildBroker's doc
+	// comment for why the order matters.
+	unloaders := append([]yield.Unloader{be.Unloader()}, routeUnloaders...)
+	unloaders = append(unloaders, units.unloaders...)
+	labels := append([]string{"default"}, routeLabels...)
+	labels = append(labels, units.labels...)
+	ctrl := yield.NewWithConfirmMulti(detector, unloaders, labels, yield.Polling{Interval: cfg.DetectInterval, ConfirmPolls: cfg.YieldConfirmPolls})
+	configureRoutedController(cfg, ctrl, len(unloaders))
+
+	// Decorate in place — orig index 0 is the default backend, i+1 is
+	// route i — BEFORE NewRouter/AddRoute below capture these values.
+	if cfg.UpstreamIdleTimeout != 0 {
+		be = backend.WithActivityTracking(be, ctrl, 0)
+	}
+	for i := range cfg.Routes {
+		if cfg.Routes[i].IdleTimeout != 0 {
+			routeBackends[i] = backend.WithActivityTracking(routeBackends[i], ctrl, i+1)
+		}
+	}
+
+	r := backend.NewRouter(be)
+	for i, rb := range cfg.Routes {
+		for _, model := range rb.Models {
+			r.AddRoute(model, rb.Lane, routeBackends[i])
+		}
+	}
+	var routeSummary []string
+	for _, rb := range cfg.Routes {
+		routeSummary = append(routeSummary, fmt.Sprintf("%v->%s(%s)", rb.Models, rb.Backend, rb.URL.String()))
+	}
+	slog.Info("routing configured", "routes", routeSummary)
+	return r, ctrl, nil
+}
+
+// configureRoutedController sets idle timeouts, displacement and the unit
+// resume holdoff on ctrl. unloaderCount is the length of the unloaders slice
+// ctrl was built from.
+func configureRoutedController(cfg *config.Config, ctrl *yield.Controller, unloaderCount int) {
+	// idleTimeouts is index-aligned with unloaders/labels: orig index
+	// 0 is the default backend, orig index i+1 is cfg.Routes[i], and the
+	// BROKER_YIELD_UNITS entries follow with a 0 timeout. Unlike the
+	// single-unloader branch, this slice's length always matches
+	// ctrl.origToFiltered's length regardless of any individual nil
+	// Unloader, since the unloaders slice is always exactly
+	// 1+len(cfg.Routes)+len(cfg.YieldUnits) long (append never drops a
+	// nil element by position).
+	idleTimeouts := make([]time.Duration, unloaderCount)
+	idleTimeouts[0] = cfg.UpstreamIdleTimeout
+	for i, rb := range cfg.Routes {
+		idleTimeouts[i+1] = rb.IdleTimeout
+	}
+	ctrl.ConfigureIdle(idleTimeouts)
+
+	// BROKER_ROUTE_<N>_DISPLACES (ADR-0020), in the same orig index space:
+	// route i is i+1, yield unit k is 1+len(cfg.Routes)+k.
+	unitOrig := map[string]int{}
+	for k, u := range cfg.YieldUnits {
+		unitOrig[u] = 1 + len(cfg.Routes) + k
+	}
+	displace := map[int][]int{}
+	for i, rb := range cfg.Routes {
+		for _, u := range rb.Displaces {
+			displace[i+1] = append(displace[i+1], unitOrig[u])
+		}
+	}
+	ctrl.ConfigureDisplace(displace)
+	ctrl.SetUnitResumeHoldoff(cfg.UnitResumeHoldoff)
 }
 
 // buildRoutes constructs one Backend per cfg.Routes[i] via backend.NewInstance
@@ -525,20 +655,27 @@ func runTdarrSchedule(ctx context.Context, tc *tdarr.Client) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			shouldPause := !schedule.SafeForBackgroundGPU(now)
-			if shouldPause && !paused {
-				if err := tc.PauseGPU(ctx); err == nil {
-					paused = true
-					slog.Info("tdarr schedule pause: internal-scraper-service window active")
-				}
-			} else if !shouldPause && paused {
-				if err := tc.ResumeGPU(ctx); err == nil {
-					paused = false
-					slog.Info("tdarr schedule resume: internal-scraper-service window ended")
-				}
-			}
+			paused = reconcileTdarr(ctx, tc, paused, !schedule.SafeForBackgroundGPU(now))
 		}
 	}
+}
+
+// reconcileTdarr moves Tdarr toward shouldPause and returns the new paused
+// state. A failed call leaves the state unchanged so the next tick retries.
+func reconcileTdarr(ctx context.Context, tc *tdarr.Client, paused, shouldPause bool) bool {
+	switch {
+	case shouldPause && !paused:
+		if err := tc.PauseGPU(ctx); err == nil {
+			slog.Info("tdarr schedule pause: internal-scraper-service window active")
+			return true
+		}
+	case !shouldPause && paused:
+		if err := tc.ResumeGPU(ctx); err == nil {
+			slog.Info("tdarr schedule resume: internal-scraper-service window ended")
+			return false
+		}
+	}
+	return paused
 }
 
 func newServer(addr string, h http.Handler) *http.Server {

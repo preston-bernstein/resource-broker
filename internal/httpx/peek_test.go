@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -15,7 +16,7 @@ func TestRequestModelRestoresBody(t *testing.T) {
 		`not json`:                             "",
 	}
 	for body, want := range cases {
-		req, _ := http.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "/", strings.NewReader(body))
 		if got := RequestModel(req); got != want {
 			t.Errorf("RequestModel(%q) = %q, want %q", body, got, want)
 		}
@@ -24,7 +25,7 @@ func TestRequestModelRestoresBody(t *testing.T) {
 			t.Errorf("body after peek = %q, want it restored to %q", rest, body)
 		}
 	}
-	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
 	if got := RequestModel(req); got != "" {
 		t.Errorf("RequestModel(no body) = %q, want empty", got)
 	}

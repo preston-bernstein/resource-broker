@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 // A model configured as CPU-only (BROKER_CPU_MODELS) never touches the GPU,
@@ -19,9 +21,9 @@ import (
 func holdSlot(t *testing.T, s *Scheduler, srv *httptest.Server) {
 	t.Helper()
 	go func() {
-		resp, err := http.Post(srv.URL+"/hold", "application/json", strings.NewReader(`{"model":"qwen3.6:35b-a3b"}`))
+		resp, err := testhttp.Post(srv.URL+"/hold", "application/json", strings.NewReader(`{"model":"qwen3.6:35b-a3b"}`))
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}()
 	deadline := time.Now().Add(2 * time.Second)
@@ -51,7 +53,7 @@ func TestGateCPUModelBypassesHeldSlot(t *testing.T) {
 
 	s := New()
 	s.SetCPUModels([]string{"bge-m3-cpu"})
-	srv := httptest.NewServer(s.Gate(Batch, 100*time.Millisecond, 0, alwaysServe{}, nil, cpuBypassUpstream(release, &gotBody)))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 100 * time.Millisecond, Admission: alwaysServe{}}, cpuBypassUpstream(release, &gotBody)))
 	// Release the holder before Close, which waits for in-flight handlers.
 	defer func() { close(release); srv.Close() }()
 	holdSlot(t, s, srv)
@@ -59,11 +61,11 @@ func TestGateCPUModelBypassesHeldSlot(t *testing.T) {
 	// ":latest" is how Ollama names the same model, so it must match too.
 	for _, model := range []string{"bge-m3-cpu", "bge-m3-cpu:latest"} {
 		body := `{"model":"` + model + `","input":["hello"]}`
-		resp, err := http.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(body))
+		resp, err := testhttp.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(body))
 		if err != nil {
 			t.Fatalf("%s: post: %v", model, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s: status = %d, want 200 (CPU model must not wait on the GPU slot)", model, resp.StatusCode)
 		}
@@ -79,16 +81,16 @@ func TestGateGPUModelStillWaitsOnHeldSlot(t *testing.T) {
 
 	s := New()
 	s.SetCPUModels([]string{"bge-m3-cpu"})
-	srv := httptest.NewServer(s.Gate(Batch, 100*time.Millisecond, 0, alwaysServe{}, nil, cpuBypassUpstream(release, &gotBody)))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 100 * time.Millisecond, Admission: alwaysServe{}}, cpuBypassUpstream(release, &gotBody)))
 	// Release the holder before Close, which waits for in-flight handlers.
 	defer func() { close(release); srv.Close() }()
 	holdSlot(t, s, srv)
 
-	resp, err := http.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(`{"model":"bge-m3","input":["hello"]}`))
+	resp, err := testhttp.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(`{"model":"bge-m3","input":["hello"]}`))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (a GPU model must still wait for the slot)", resp.StatusCode)
 	}
@@ -98,14 +100,14 @@ func TestGateCPUModelServedWhileYielding(t *testing.T) {
 	var gotBody string
 	s := New()
 	s.SetCPUModels([]string{"bge-m3-cpu"})
-	srv := httptest.NewServer(s.Gate(Interactive, 100*time.Millisecond, 0, alwaysYield{}, nil, cpuBypassUpstream(nil, &gotBody)))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Interactive, Wait: 100 * time.Millisecond, Admission: alwaysYield{}}, cpuBypassUpstream(nil, &gotBody)))
 	defer srv.Close()
 
-	resp, err := http.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(`{"model":"bge-m3-cpu","input":["x"]}`))
+	resp, err := testhttp.Post(srv.URL+"/api/embed", "application/json", strings.NewReader(`{"model":"bge-m3-cpu","input":["x"]}`))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (gaming/Plex contention is GPU-only; a CPU model is unaffected)", resp.StatusCode)
 	}

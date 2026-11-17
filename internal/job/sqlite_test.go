@@ -9,11 +9,11 @@ import (
 
 func newStore(t *testing.T) *SQLiteStore {
 	t.Helper()
-	s, err := OpenSQLite(":memory:")
+	s, err := OpenSQLite(t.Context(), ":memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -130,14 +130,12 @@ func TestFailOrRetryCap(t *testing.T) {
 		if cur.Attempts != i {
 			t.Fatalf("after fail %d attempts=%d", i, cur.Attempts)
 		}
-		if i < max {
-			if failed || cur.State != StateQueued {
-				t.Fatalf("fail %d: failed=%v state=%s, want retry", i, failed, cur.State)
-			}
-		} else {
-			if !failed || cur.State != StateFailed {
-				t.Fatalf("fail %d: failed=%v state=%s, want FAILED", i, failed, cur.State)
-			}
+		wantFailed, wantState := i == max, StateQueued
+		if wantFailed {
+			wantState = StateFailed
+		}
+		if failed != wantFailed || cur.State != wantState {
+			t.Fatalf("fail %d: failed=%v state=%s, want failed=%v state=%s", i, failed, cur.State, wantFailed, wantState)
 		}
 	}
 }
@@ -204,8 +202,8 @@ func TestStampFetchedAndPrune(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	j := submit(t, s, "f")
-	s.ClaimNext(ctx)
-	s.Succeed(ctx, j.ID, "out")
+	_, _ = s.ClaimNext(ctx)
+	_ = s.Succeed(ctx, j.ID, "out")
 
 	if err := s.StampFetched(ctx, j.ID); err != nil {
 		t.Fatalf("stamp: %v", err)
@@ -216,7 +214,7 @@ func TestStampFetchedAndPrune(t *testing.T) {
 	}
 	// Second stamp must not move the timestamp.
 	time.Sleep(2 * time.Millisecond)
-	s.StampFetched(ctx, j.ID)
+	_ = s.StampFetched(ctx, j.ID)
 	second, _ := s.Get(ctx, j.ID)
 	if !second.FetchedAt.Equal(*first.FetchedAt) {
 		t.Fatal("fetched_at changed on re-stamp")
@@ -239,7 +237,7 @@ func TestCounts(t *testing.T) {
 	submit(t, s, "q1")
 	submit(t, s, "q2")
 	j := submit(t, s, "run")
-	s.ClaimNext(ctx) // q1 -> RUNNING (lowest position)
+	_, _ = s.ClaimNext(ctx) // q1 -> RUNNING (lowest position)
 
 	c, err := s.Counts(ctx)
 	if err != nil {

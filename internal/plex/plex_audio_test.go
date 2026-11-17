@@ -24,7 +24,7 @@ const realAudioSessionXML = `<?xml version="1.0" encoding="UTF-8"?>
 func serving(t *testing.T, body string) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(body))
+		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
 	return New(srv.URL, "tok")

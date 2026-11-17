@@ -2,7 +2,7 @@ package queue
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -148,36 +148,21 @@ func TestParkGhostCleanup(t *testing.T) {
 
 	// Exit path 1: hold-bound expiry. Park one entry, let it age out, and
 	// require the depth to return to zero (not just the right result code).
-	r1 := make(chan parkResult, 1)
-	go func() { r1 <- s.parkFor(context.Background()) }()
-	waitFor(t, func() bool { return s.Stats().Parked == 1 })
-	if got := <-r1; got != parkExpired {
-		t.Fatalf("entry1 result = %v, want parkExpired", got)
-	}
-	waitFor(t, func() bool { return s.Stats().Parked == 0 })
+	r1 := parkAsync(context.Background(), t, s)
+	requireParkResult(t, s, r1, parkExpired)
 
 	// Exit path 2: caller-context cancellation.
 	ctx2, cancel2 := context.WithCancel(context.Background())
-	r2 := make(chan parkResult, 1)
-	go func() { r2 <- s.parkFor(ctx2) }()
-	waitFor(t, func() bool { return s.Stats().Parked == 1 })
+	r2 := parkAsync(ctx2, t, s)
 	cancel2()
-	if got := <-r2; got != parkCanceled {
-		t.Fatalf("entry2 result = %v, want parkCanceled", got)
-	}
-	waitFor(t, func() bool { return s.Stats().Parked == 0 })
+	requireParkResult(t, s, r2, parkCanceled)
 
 	// Exit path 3: shutdown signal.
 	shutCtx, shutCancel := context.WithCancel(context.Background())
 	s.SetShutdownContext(shutCtx)
-	r3 := make(chan parkResult, 1)
-	go func() { r3 <- s.parkFor(context.Background()) }()
-	waitFor(t, func() bool { return s.Stats().Parked == 1 })
+	r3 := parkAsync(context.Background(), t, s)
 	shutCancel()
-	if got := <-r3; got != parkShutdown {
-		t.Fatalf("entry3 result = %v, want parkShutdown", got)
-	}
-	waitFor(t, func() bool { return s.Stats().Parked == 0 })
+	requireParkResult(t, s, r3, parkShutdown)
 
 	s.park.mu.Lock()
 	depth := len(s.park.q)
@@ -193,22 +178,38 @@ func TestParkGhostCleanup(t *testing.T) {
 	// After all three non-release exits, the queue must accept a full refill
 	// up to the ceiling — proving no ghost entry is eating capacity.
 	const refill = 3
-	rns := make([]chan parkResult, refill)
-	for i := 0; i < refill; i++ {
-		rns[i] = make(chan parkResult, 1)
-		idx := i
-		go func() { rns[idx] <- s.parkFor(context.Background()) }()
-		waitFor(t, func() bool { return s.Stats().Parked == idx+1 })
+	rns := make([]<-chan parkResult, refill)
+	for i := range rns {
+		rns[i] = parkAsync(context.Background(), t, s)
+		waitFor(t, func() bool { return s.Stats().Parked == i+1 })
 	}
 	if st := s.Stats(); st.Parked != refill {
 		t.Fatalf("re-park after cleanup: Parked = %d, want %d (ghost depth drift)", st.Parked, refill)
 	}
 
 	s.park.drainOneBurst(refill)
-	for i := 0; i < refill; i++ {
-		if got := <-rns[i]; got != parkReleased {
-			t.Fatalf("re-park[%d] result = %v, want parkReleased", i, got)
-		}
+	for _, r := range rns {
+		requireParkResult(t, s, r, parkReleased)
+	}
+}
+
+// parkAsync parks one request on s and waits until it is queued. The result
+// arrives on the returned channel once the park ends.
+func parkAsync(ctx context.Context, t *testing.T, s *Scheduler) <-chan parkResult {
+	t.Helper()
+	before := s.Stats().Parked
+	ch := make(chan parkResult, 1)
+	go func() { ch <- s.parkFor(ctx) }()
+	waitFor(t, func() bool { return s.Stats().Parked == before+1 })
+	return ch
+}
+
+// requireParkResult checks the park ended with want, then that the queue is
+// empty again: every exit path must splice its entry out.
+func requireParkResult(t *testing.T, s *Scheduler, ch <-chan parkResult, want parkResult) {
+	t.Helper()
+	if got := <-ch; got != want {
+		t.Fatalf("park result = %v, want %v", got, want)
 	}
 	waitFor(t, func() bool { return s.Stats().Parked == 0 })
 }
@@ -228,48 +229,14 @@ func TestParkConcurrentCeilingRace(t *testing.T) {
 	// release accounting below.
 	s.SetParkConfig(30*time.Second, maxQueue, maxQueue)
 
-	results := make(chan parkResult, total)
-	var ready sync.WaitGroup
-	ready.Add(total)
-	var gate sync.WaitGroup
-	gate.Add(1)
-	var wg sync.WaitGroup
-	for i := 0; i < total; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ready.Done()
-			gate.Wait() // every goroutine released at once, maximizing contention
-			results <- s.parkFor(context.Background())
-		}()
-	}
-	ready.Wait() // every goroutine has started and is waiting at the gate
-
+	results, wg, startRace := launchParkers(s, total)
 	stop := make(chan struct{})
-	var overshoot int32
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if st := s.Stats(); st.Parked > maxQueue {
-				atomic.StoreInt32(&overshoot, int32(st.Parked))
-			}
-			// Back off between samples: a hot Stats() spin contends the same
-			// mutexes parkFor needs and can starve the parkers under -race
-			// scheduling (observed as a waitFor deadline flake).
-			time.Sleep(100 * time.Microsecond)
-		}
-	}()
-	gate.Done()
+	overshoot := watchParkDepth(s, maxQueue, stop)
+	startRace()
 
-	// Wait until ALL racers are accounted for before draining: maxQueue
-	// parked AND the remaining `extra` already rejected (visible as buffered
-	// results). Draining earlier lets a late-scheduled goroutine find free
-	// space after the drain, park, and sit until hold expiry — the flake
-	// this guard exists to prevent.
+	// Wait for ALL racers before draining (maxQueue parked, `extra` rejected):
+	// draining earlier lets a late goroutine park after the drain and sit
+	// until hold expiry — the flake this guard exists to prevent.
 	waitFor(t, func() bool {
 		return s.Stats().Parked == maxQueue && len(results) == extra
 	})
@@ -278,7 +245,7 @@ func TestParkConcurrentCeilingRace(t *testing.T) {
 	close(stop)
 	close(results)
 
-	if got := atomic.LoadInt32(&overshoot); got != 0 {
+	if got := overshoot.Load(); got != 0 {
 		t.Fatalf("park depth overshot the ceiling: observed %d, maxQueue %d", got, maxQueue)
 	}
 
@@ -300,6 +267,51 @@ func TestParkConcurrentCeilingRace(t *testing.T) {
 		t.Fatalf("rejected = %d, want %d", rejected, extra)
 	}
 	waitFor(t, func() bool { return s.Stats().Parked == 0 })
+}
+
+// launchParkers starts n goroutines that each call parkFor. They all wait at a
+// gate until startRace is called, so they are released at once to maximize
+// contention.
+func launchParkers(s *Scheduler, n int) (results chan parkResult, wg *sync.WaitGroup, startRace func()) {
+	results = make(chan parkResult, n)
+	var ready, gate sync.WaitGroup
+	ready.Add(n)
+	gate.Add(1)
+	wg = &sync.WaitGroup{}
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready.Done()
+			gate.Wait()
+			results <- s.parkFor(context.Background())
+		}()
+	}
+	ready.Wait() // every goroutine has started and is waiting at the gate
+	return results, wg, gate.Done
+}
+
+// watchParkDepth samples the park depth until stop closes and records the
+// highest value seen above ceiling (0 when it never went over).
+func watchParkDepth(s *Scheduler, ceiling int, stop <-chan struct{}) *atomic.Int64 {
+	var overshoot atomic.Int64
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if st := s.Stats(); st.Parked > ceiling {
+				overshoot.Store(int64(st.Parked))
+			}
+			// Back off between samples: a hot Stats() spin contends the same
+			// mutexes parkFor needs and can starve the parkers under -race
+			// scheduling (observed as a waitFor deadline flake).
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+	return &overshoot
 }
 
 // TestRunParkDrainPacing proves the drain loop releases in bursts paced by
@@ -333,14 +345,7 @@ func TestRunParkDrainPacing(t *testing.T) {
 	yielding := func() bool { return false } // yield already ended; drain freely
 	start := time.Now()
 	go s.RunParkDrain(ctx, yielding)
-
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(6 * time.Second):
-		t.Fatal("not all parked requests were released")
-	}
+	waitOrFail(t, &wg, 6*time.Second, "not all parked requests were released")
 	cancel()
 
 	mu.Lock()
@@ -349,18 +354,29 @@ func TestRunParkDrainPacing(t *testing.T) {
 	if len(times) != maxQueue {
 		t.Fatalf("released count = %d, want %d", len(times), maxQueue)
 	}
-	sort.Slice(times, func(i, j int) bool { return times[i].Before(times[j]) })
+	slices.SortFunc(times, func(a, b time.Time) int { return a.Compare(b) })
 
 	// 6 parked at burst 2 releases across 3 ticks: [0,1] then [2,3] then
 	// [4,5]. The gap between the first release and the last-tick's first
 	// release should span roughly two drain intervals — proves pacing, not
 	// an eventual-consistency check alone.
-	gap := times[4].Sub(times[0])
-	if gap < 1500*time.Millisecond {
+	if gap := times[4].Sub(times[0]); gap < 1500*time.Millisecond {
 		t.Fatalf("releases too close together: burst1->burst3 gap = %v, want >= ~2 drain intervals", gap)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("drain took too long: %v", elapsed)
+	}
+}
+
+// waitOrFail waits for wg, failing with msg if it takes longer than d.
+func waitOrFail(t *testing.T, wg *sync.WaitGroup, d time.Duration, msg string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatal(msg)
 	}
 }
 

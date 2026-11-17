@@ -3,10 +3,13 @@
 package metrics
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -97,101 +100,126 @@ type Gauges struct {
 	JobCanceled  int
 }
 
-// Handler renders /metrics. gauges is sampled on each scrape.
-func (r *Registry) Handler(gauges func() Gauges) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+// Handler renders /metrics. gauges is sampled on each scrape, with the
+// scrape's context.
+func (r *Registry) Handler(gauges func(context.Context) Gauges) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		r.write(w, gauges())
+		r.write(w, gauges(req.Context()))
 	})
 }
 
-func (r *Registry) write(w io.Writer, g Gauges) {
-	fmt.Fprint(w, "# HELP broker_requests_total Requests by class and outcome.\n")
-	fmt.Fprint(w, "# TYPE broker_requests_total counter\n")
+// snapshot is a consistent copy of the cumulative counters.
+type snapshot struct {
+	counts        map[string]int64
+	waitSumMs     float64
+	waitCount     int64
+	parkWaitSumMs float64
+	parkWaitCount int64
+	jobCounts     map[string]int64
+	jobRunSumMs   float64
+	jobRunCount   int64
+	detectErrors  int64
+}
 
+func (r *Registry) snapshot() snapshot {
 	r.mu.Lock()
-	keys := make([]string, 0, len(r.counts))
-	for k := range r.counts {
-		keys = append(keys, k)
+	defer r.mu.Unlock()
+	return snapshot{
+		counts:        maps.Clone(r.counts),
+		waitSumMs:     r.waitSumMs,
+		waitCount:     r.waitCount,
+		parkWaitSumMs: r.parkWaitSumMs,
+		parkWaitCount: r.parkWaitCount,
+		jobCounts:     maps.Clone(r.jobCounts),
+		jobRunSumMs:   r.jobRunSumMs,
+		jobRunCount:   r.jobRunCount,
+		detectErrors:  r.detectErrors,
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
+}
+
+// exposition builds Prometheus text format.
+type exposition struct{ strings.Builder }
+
+// header writes the HELP and TYPE lines of one metric family.
+func (e *exposition) header(name, kind, help string) {
+	_, _ = fmt.Fprintf(e, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+}
+
+// sample writes one value line.
+func (e *exposition) sample(format string, args ...any) {
+	_, _ = fmt.Fprintf(e, format+"\n", args...)
+}
+
+// counter writes a one-sample counter family.
+func (e *exposition) counter(name, help, format string, value any) {
+	e.header(name, "counter", help)
+	e.sample(format, value)
+}
+
+// gauge writes a one-sample gauge family.
+func (e *exposition) gauge(name, help string, value int) {
+	e.header(name, "gauge", help)
+	e.sample("%s %d", name, value)
+}
+
+func (r *Registry) write(w io.Writer, g Gauges) {
+	snap := r.snapshot()
+	var e exposition
+	writeRequestCounters(&e, snap)
+	writeLiveGauges(&e, g)
+	writeParkMetrics(&e, snap, g)
+	writeJobMetrics(&e, snap, g)
+	_, _ = io.WriteString(w, e.String())
+}
+
+func writeRequestCounters(e *exposition, snap snapshot) {
+	e.header("broker_requests_total", "counter", "Requests by class and outcome.")
+	for _, k := range slices.Sorted(maps.Keys(snap.counts)) {
 		class, outcome := splitKey(k)
-		fmt.Fprintf(w, "broker_requests_total{class=%q,outcome=%q} %d\n", class, outcome, r.counts[k])
+		e.sample("broker_requests_total{class=%q,outcome=%q} %d", class, outcome, snap.counts[k])
 	}
-	sumMs, count := r.waitSumMs, r.waitCount
-	parkSumMs, parkCount := r.parkWaitSumMs, r.parkWaitCount
-	jobKeys := make([]string, 0, len(r.jobCounts))
-	for k := range r.jobCounts {
-		jobKeys = append(jobKeys, k)
+	e.counter("broker_wait_seconds_sum", "Total time served requests waited for the GPU slot.", "broker_wait_seconds_sum %g", snap.waitSumMs/1000.0)
+	e.counter("broker_wait_seconds_count", "Number of served requests.", "broker_wait_seconds_count %d", snap.waitCount)
+	e.counter("broker_detect_errors_total", "Contention-detection polls that failed and reported no contention (fail-open). Nonzero means the yield feature may be blind.", "broker_detect_errors_total %d", snap.detectErrors)
+}
+
+func writeLiveGauges(e *exposition, g Gauges) {
+	e.gauge("broker_yielding", "Whether the broker is currently yielding the GPU.", b2i(g.Yielding))
+	e.gauge("broker_busy", "Whether the single GPU slot is in use.", b2i(g.Busy))
+	e.gauge("broker_inflight", "In-flight requests reaching Ollama.", g.Inflight)
+	e.gauge("broker_max_inflight", "Configured concurrency limit.", g.MaxInflight)
+	e.header("broker_queue_depth", "gauge", "Waiters per class.")
+	e.sample("broker_queue_depth{class=\"interactive\"} %d", g.Interactive)
+	e.sample("broker_queue_depth{class=\"batch\"} %d", g.Batch)
+}
+
+func writeParkMetrics(e *exposition, snap snapshot, g Gauges) {
+	e.gauge("broker_parked_depth", "Batch-class park depth; Interactive never parks.", g.Parked)
+	e.counter("broker_park_wait_seconds_sum", "Total time requests spent parked waiting for yield to end.", "broker_park_wait_seconds_sum %g", snap.parkWaitSumMs/1000.0)
+	e.counter("broker_park_wait_seconds_count", "Number of requests that were parked and eventually served.", "broker_park_wait_seconds_count %d", snap.parkWaitCount)
+}
+
+func writeJobMetrics(e *exposition, snap snapshot, g Gauges) {
+	e.header("broker_jobs", "gauge", "Durable Jobs by state.")
+	for _, state := range []struct {
+		name  string
+		count int
+	}{
+		{"queued", g.JobQueued},
+		{"running", g.JobRunning},
+		{"succeeded", g.JobSucceeded},
+		{"failed", g.JobFailed},
+		{"canceled", g.JobCanceled},
+	} {
+		e.sample("broker_jobs{state=\"%s\"} %d", state.name, state.count)
 	}
-	sort.Strings(jobKeys)
-	jobCountsCopy := make(map[string]int64, len(r.jobCounts))
-	for k, v := range r.jobCounts {
-		jobCountsCopy[k] = v
+	e.header("broker_job_outcomes_total", "counter", "Terminal Job outcomes.")
+	for _, k := range slices.Sorted(maps.Keys(snap.jobCounts)) {
+		e.sample("broker_job_outcomes_total{outcome=%q} %d", k, snap.jobCounts[k])
 	}
-	jobRunSumMs, jobRunCount := r.jobRunSumMs, r.jobRunCount
-	detectErrors := r.detectErrors
-	r.mu.Unlock()
-
-	fmt.Fprint(w, "# HELP broker_wait_seconds_sum Total time served requests waited for the GPU slot.\n")
-	fmt.Fprint(w, "# TYPE broker_wait_seconds_sum counter\n")
-	fmt.Fprintf(w, "broker_wait_seconds_sum %g\n", sumMs/1000.0)
-	fmt.Fprint(w, "# HELP broker_wait_seconds_count Number of served requests.\n")
-	fmt.Fprint(w, "# TYPE broker_wait_seconds_count counter\n")
-	fmt.Fprintf(w, "broker_wait_seconds_count %d\n", count)
-
-	fmt.Fprint(w, "# HELP broker_detect_errors_total Contention-detection polls that failed and reported no contention (fail-open). Nonzero means the yield feature may be blind.\n")
-	fmt.Fprint(w, "# TYPE broker_detect_errors_total counter\n")
-	fmt.Fprintf(w, "broker_detect_errors_total %d\n", detectErrors)
-
-	fmt.Fprint(w, "# HELP broker_yielding Whether the broker is currently yielding the GPU.\n")
-	fmt.Fprint(w, "# TYPE broker_yielding gauge\n")
-	fmt.Fprintf(w, "broker_yielding %d\n", b2i(g.Yielding))
-	fmt.Fprint(w, "# HELP broker_busy Whether the single GPU slot is in use.\n")
-	fmt.Fprint(w, "# TYPE broker_busy gauge\n")
-	fmt.Fprintf(w, "broker_busy %d\n", b2i(g.Busy))
-	fmt.Fprint(w, "# HELP broker_inflight In-flight requests reaching Ollama.\n")
-	fmt.Fprint(w, "# TYPE broker_inflight gauge\n")
-	fmt.Fprintf(w, "broker_inflight %d\n", g.Inflight)
-	fmt.Fprint(w, "# HELP broker_max_inflight Configured concurrency limit.\n")
-	fmt.Fprint(w, "# TYPE broker_max_inflight gauge\n")
-	fmt.Fprintf(w, "broker_max_inflight %d\n", g.MaxInflight)
-	fmt.Fprint(w, "# HELP broker_queue_depth Waiters per class.\n")
-	fmt.Fprint(w, "# TYPE broker_queue_depth gauge\n")
-	fmt.Fprintf(w, "broker_queue_depth{class=\"interactive\"} %d\n", g.Interactive)
-	fmt.Fprintf(w, "broker_queue_depth{class=\"batch\"} %d\n", g.Batch)
-
-	fmt.Fprint(w, "# HELP broker_parked_depth Batch-class park depth; Interactive never parks.\n")
-	fmt.Fprint(w, "# TYPE broker_parked_depth gauge\n")
-	fmt.Fprintf(w, "broker_parked_depth %d\n", g.Parked)
-
-	fmt.Fprint(w, "# HELP broker_park_wait_seconds_sum Total time requests spent parked waiting for yield to end.\n")
-	fmt.Fprint(w, "# TYPE broker_park_wait_seconds_sum counter\n")
-	fmt.Fprintf(w, "broker_park_wait_seconds_sum %g\n", parkSumMs/1000.0)
-	fmt.Fprint(w, "# HELP broker_park_wait_seconds_count Number of requests that were parked and eventually served.\n")
-	fmt.Fprint(w, "# TYPE broker_park_wait_seconds_count counter\n")
-	fmt.Fprintf(w, "broker_park_wait_seconds_count %d\n", parkCount)
-
-	fmt.Fprint(w, "# HELP broker_jobs Durable Jobs by state.\n")
-	fmt.Fprint(w, "# TYPE broker_jobs gauge\n")
-	fmt.Fprintf(w, "broker_jobs{state=\"queued\"} %d\n", g.JobQueued)
-	fmt.Fprintf(w, "broker_jobs{state=\"running\"} %d\n", g.JobRunning)
-	fmt.Fprintf(w, "broker_jobs{state=\"succeeded\"} %d\n", g.JobSucceeded)
-	fmt.Fprintf(w, "broker_jobs{state=\"failed\"} %d\n", g.JobFailed)
-	fmt.Fprintf(w, "broker_jobs{state=\"canceled\"} %d\n", g.JobCanceled)
-
-	fmt.Fprint(w, "# HELP broker_job_outcomes_total Terminal Job outcomes.\n")
-	fmt.Fprint(w, "# TYPE broker_job_outcomes_total counter\n")
-	for _, k := range jobKeys {
-		fmt.Fprintf(w, "broker_job_outcomes_total{outcome=%q} %d\n", k, jobCountsCopy[k])
-	}
-	fmt.Fprint(w, "# HELP broker_job_run_seconds_sum Total time Jobs spent running to completion.\n")
-	fmt.Fprint(w, "# TYPE broker_job_run_seconds_sum counter\n")
-	fmt.Fprintf(w, "broker_job_run_seconds_sum %g\n", jobRunSumMs/1000.0)
-	fmt.Fprint(w, "# HELP broker_job_run_seconds_count Number of completed Job runs.\n")
-	fmt.Fprint(w, "# TYPE broker_job_run_seconds_count counter\n")
-	fmt.Fprintf(w, "broker_job_run_seconds_count %d\n", jobRunCount)
+	e.counter("broker_job_run_seconds_sum", "Total time Jobs spent running to completion.", "broker_job_run_seconds_sum %g", snap.jobRunSumMs/1000.0)
+	e.counter("broker_job_run_seconds_count", "Number of completed Job runs.", "broker_job_run_seconds_count %d", snap.jobRunCount)
 }
 
 func splitKey(k string) (class, outcome string) {
