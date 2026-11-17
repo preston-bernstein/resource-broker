@@ -38,12 +38,9 @@ get_gpu_usage() {
 # Force load small model (evicts large models from memory)
 load_small_model() {
   log "Loading small model: $SMALL_MODEL (evicting any large models)"
-  curl -s -X POST "$OLLAMA_API/generate" \
+  if curl -s -X POST "$OLLAMA_API/generate" \
     -d "{\"model\":\"$SMALL_MODEL\",\"prompt\":\"ready\"}" \
-    >/dev/null 2>&1
-
-  # shellcheck disable=SC2181 # existing pattern; unchanged in the pack-compliance pass
-  if [ $? -eq 0 ]; then
+    >/dev/null 2>&1; then
     log "Small model loaded successfully"
   else
     log "WARNING: Failed to load small model"

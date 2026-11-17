@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -43,7 +44,7 @@ func TestOpenAIBackendReachable(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"object":"list","data":[]}`))
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
 	}))
 	defer mock.Close()
 
@@ -113,7 +114,7 @@ func TestOpenAIBackendReachableSendsAPIKey(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		_, gotAuthPresent = r.Header["Authorization"]
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"object":"list","data":[]}`))
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
 	}))
 	defer mock.Close()
 
@@ -156,12 +157,12 @@ func TestOpenAIBackendReachableSendsAPIKey(t *testing.T) {
 func TestOpenAIBackendUnreachable(t *testing.T) {
 	// Grab a free port, then close the listener immediately so nothing is
 	// listening on it: connection refused.
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := l.Addr().String()
-	l.Close()
+	_ = l.Close()
 
 	ob := newTestOpenAIBackend(t, "http://"+addr)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -174,7 +175,7 @@ func TestOpenAIBackendUnreachable(t *testing.T) {
 func TestOpenAIBackendProxyServesHandler(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"model":"m","messages":[{"role":"assistant","content":"hi"}],"choices":[{"delta":{"content":"hi"}}]}`))
+		_, _ = w.Write([]byte(`{"model":"m","messages":[{"role":"assistant","content":"hi"}],"choices":[{"delta":{"content":"hi"}}]}`))
 	}))
 	defer mock.Close()
 
@@ -183,7 +184,7 @@ func TestOpenAIBackendProxyServesHandler(t *testing.T) {
 	// /api/tags has no OpenAI-compatible equivalent and must 404 (FR-28,
 	// AC-21) — a light structural check that Proxy() really is the
 	// openaicompat translating handler, not a transparent passthrough.
-	req := httptest.NewRequest(http.MethodGet, "/api/tags", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/tags", nil)
 	rec := httptest.NewRecorder()
 	ob.Proxy().ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -314,7 +315,6 @@ func TestOpenAIBackendFactoryWiresSystemdController(t *testing.T) {
 	if !ok {
 		t.Fatalf("newOpenAIBackend returned %T, want *openaiBackend", be)
 	}
-
 	ctrl, ok := ob.Unloader().(*systemdUnitController)
 	if !ok {
 		t.Fatalf("Unloader() = %T, want *systemdUnitController", ob.Unloader())
@@ -326,26 +326,27 @@ func TestOpenAIBackendFactoryWiresSystemdController(t *testing.T) {
 	if ctrl.run == nil {
 		t.Fatal("factory-built systemdUnitController.run is nil — newOpenAIBackend did not wire the real command runner (see newSystemdUnitController)")
 	}
+	requireRunInvokedWithVerbs(t, ctrl)
+}
 
-	// Defense in depth: substitute run with a spy post-construction and drive
-	// Unload/Reload through the exact object the factory returned, proving
-	// run is not just non-nil but actually invoked (with the right verbs) by
-	// the real methods on the real returned instance.
+// requireRunInvokedWithVerbs is the defense in depth: it substitutes run with
+// a spy and drives Unload/Reload through the exact object the factory
+// returned, proving run is non-nil and also invoked (with the
+// right verbs) by the real methods on the real returned instance.
+func requireRunInvokedWithVerbs(t *testing.T, ctrl *systemdUnitController) {
+	t.Helper()
 	var gotVerbs []string
 	ctrl.run = func(ctx context.Context, verb string) error {
 		gotVerbs = append(gotVerbs, verb)
 		return nil
 	}
-
 	if err := ctrl.Unload(context.Background()); err != nil {
 		t.Fatalf("Unload() = %v, want nil", err)
 	}
 	if err := ctrl.Reload(context.Background()); err != nil {
 		t.Fatalf("Reload() = %v, want nil", err)
 	}
-
-	want := []string{"stop", "start"}
-	if len(gotVerbs) != len(want) || gotVerbs[0] != want[0] || gotVerbs[1] != want[1] {
+	if want := []string{"stop", "start"}; !slices.Equal(gotVerbs, want) {
 		t.Errorf("run verbs recorded via factory-built controller = %v, want %v", gotVerbs, want)
 	}
 }
@@ -424,32 +425,8 @@ func TestSystemdUnitControllerErrorPropagates(t *testing.T) {
 // and a background watcher records whether it ever observed the in-progress
 // flag already set on entry (i.e. two calls overlapping).
 func TestSystemdUnitControllerSerializesUnloadAndReload(t *testing.T) {
-	var mu sync.Mutex
-	inProgress := false
-	overlapped := false
-
-	proceed := make(chan struct{})
-	entered := make(chan struct{}, 2)
-
-	u := &systemdUnitController{
-		unit: "vllm",
-		run: func(ctx context.Context, verb string) error {
-			mu.Lock()
-			if inProgress {
-				overlapped = true
-			}
-			inProgress = true
-			mu.Unlock()
-
-			entered <- struct{}{}
-			<-proceed // block until the test signals both goroutines have started
-
-			mu.Lock()
-			inProgress = false
-			mu.Unlock()
-			return nil
-		},
-	}
+	w := &overlapWatcher{proceed: make(chan struct{}), entered: make(chan struct{}, 2)}
+	u := &systemdUnitController{unit: "vllm", run: w.run}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -468,12 +445,40 @@ func TestSystemdUnitControllerSerializesUnloadAndReload(t *testing.T) {
 
 	// Wait for the first goroutine to enter run, then give the second a
 	// window to attempt entry too (it must block on mu, not on the channel).
-	<-entered
+	<-w.entered
 	time.Sleep(50 * time.Millisecond)
-	close(proceed)
+	close(w.proceed)
 	wg.Wait()
 
-	if overlapped {
+	if w.overlapped {
 		t.Error("run() was in-progress concurrently for Unload and Reload; systemdUnitController.mu did not serialize them")
 	}
+}
+
+// overlapWatcher is a stub run that blocks until signaled and records whether
+// it ever observed the in-progress flag already set on entry (two calls
+// overlapping).
+type overlapWatcher struct {
+	mu         sync.Mutex
+	inProgress bool
+	overlapped bool
+	proceed    chan struct{}
+	entered    chan struct{}
+}
+
+func (w *overlapWatcher) run(ctx context.Context, verb string) error {
+	w.mu.Lock()
+	if w.inProgress {
+		w.overlapped = true
+	}
+	w.inProgress = true
+	w.mu.Unlock()
+
+	w.entered <- struct{}{}
+	<-w.proceed // block until the test signals both goroutines have started
+
+	w.mu.Lock()
+	w.inProgress = false
+	w.mu.Unlock()
+	return nil
 }

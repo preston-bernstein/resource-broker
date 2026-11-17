@@ -167,9 +167,8 @@ log "Resources available, running job: $JOB_ID"
 START_TIME=$(date -Iseconds)
 START_TIMESTAMP=$(date +%s)
 
-# shellcheck disable=SC2086 # existing pattern; unchanged in the pack-compliance pass
 jq --arg start "$START_TIME" \
-  --argjson start_ts $START_TIMESTAMP \
+  --argjson start_ts "$START_TIMESTAMP" \
   '. + {status: "running", started_at: $start, started_timestamp: $start_ts}' \
   "$METRICS_DIR/${JOB_ID}.json" >"$METRICS_DIR/${JOB_ID}.json.tmp" \
   && mv "$METRICS_DIR/${JOB_ID}.json.tmp" "$METRICS_DIR/${JOB_ID}.json"
@@ -195,12 +194,11 @@ else
 fi
 
 # Update metadata (final)
-# shellcheck disable=SC2086 # existing pattern; unchanged in the pack-compliance pass
 jq --arg end "$END_TIME" \
-  --argjson end_ts $END_TIMESTAMP \
-  --argjson duration $DURATION \
-  --argjson exit_code $EXIT_CODE \
-  --argjson output_size $OUTPUT_SIZE \
+  --argjson end_ts "$END_TIMESTAMP" \
+  --argjson duration "$DURATION" \
+  --argjson exit_code "$EXIT_CODE" \
+  --argjson output_size "$OUTPUT_SIZE" \
   --arg status "$FINAL_STATUS" \
   '. + {
      status: $status,

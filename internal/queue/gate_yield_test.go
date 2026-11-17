@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 type alwaysServe struct{}
@@ -35,17 +38,17 @@ func TestGateRefusesWhenYielding(t *testing.T) {
 	var hit bool
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hit = true
-		io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok")
 	})
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, alwaysYield{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 2 * time.Second, Admission: alwaysYield{}}, upstream))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL)
+	resp, err := testhttp.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
@@ -69,19 +72,20 @@ func TestGateInteractiveNeverParksWhenConfigured(t *testing.T) {
 	var hit bool
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hit = true
-		io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok")
 	})
 	s := New()
 	s.SetParkConfig(time.Second, 32, 8) // parking on; still must not affect Interactive
-	srv := httptest.NewServer(s.Gate(Interactive, 2*time.Second, 0, alwaysYield{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Interactive, Wait: 2 * time.Second, Admission: alwaysYield{}}, upstream))
 	defer srv.Close()
 
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := client.Get(srv.URL)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	resp, err := testhttp.Do(ctx, http.MethodGet, srv.URL, nil)
 	if err != nil {
 		t.Fatalf("get (should return immediately, not park): %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
@@ -97,73 +101,6 @@ func TestGateInteractiveNeverParksWhenConfigured(t *testing.T) {
 	}
 }
 
-// --- park test fixtures -----------------------------------------------
-
-// yieldFlag is a thread-safe bool driving both an Admission.Yielding()
-// probe and the plain yielding closure RunParkDrain expects — mirroring how
-// gate.go and RunParkDrain each read yield.Controller independently in
-// production (see the yieldingFn adapter in cmd/broker/main.go).
-type yieldFlag struct {
-	mu sync.Mutex
-	v  bool
-}
-
-func newYieldFlag(v bool) *yieldFlag { return &yieldFlag{v: v} }
-
-func (f *yieldFlag) set(v bool) {
-	f.mu.Lock()
-	f.v = v
-	f.mu.Unlock()
-}
-
-func (f *yieldFlag) get() bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.v
-}
-
-// flagAdm adapts a *yieldFlag to Admission for park tests. ServeContext
-// never fires: park tests don't exercise in-flight preemption — that's
-// TestGateCancelsInFlightOnYield's job in gate_cancel_test.go.
-type flagAdm struct{ f *yieldFlag }
-
-func (a flagAdm) Yielding() (bool, string) {
-	if a.f.get() {
-		return true, "test-yield"
-	}
-	return false, ""
-}
-func (a flagAdm) ServeContext() context.Context { return context.Background() }
-
-// countRec is a minimal Recorder fake for park tests: tallies outcomes by
-// name and captures each RecordPark wait, without pulling in
-// internal/metrics.
-type countRec struct {
-	mu        sync.Mutex
-	outcomes  map[string]int
-	parkWaits []time.Duration
-}
-
-func newCountRec() *countRec { return &countRec{outcomes: map[string]int{}} }
-
-func (r *countRec) Record(class, outcome string, wait time.Duration) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.outcomes[outcome]++
-}
-
-func (r *countRec) RecordPark(wait time.Duration) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.parkWaits = append(r.parkWaits, wait)
-}
-
-func (r *countRec) count(outcome string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.outcomes[outcome]
-}
-
 // TestGateParksDuringYield proves AC-1: a Batch request arriving while
 // Yielding() is true, with parking configured, does not return until
 // yielding clears, then is served normally — upstream is hit and the
@@ -172,34 +109,20 @@ func TestGateParksDuringYield(t *testing.T) {
 	var hit int32
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hit, 1)
-		io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok")
 	})
 	s := New()
 	s.SetParkConfig(3*time.Second, 4, 4)
 	rec := newCountRec()
 	yf := newYieldFlag(true)
-	srv := httptest.NewServer(s.Gate(Batch, 3*time.Second, 0, flagAdm{yf}, rec, upstream))
-	defer srv.Close()
+	srv := startGate(t, s, GateConfig{Class: Batch, Wait: 3 * time.Second, Admission: flagAdm{yf}, Recorder: rec}, upstream)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go s.RunParkDrain(ctx, yf.get)
 
-	type result struct {
-		status int
-		header string
-	}
-	done := make(chan result, 1)
-	go func() {
-		resp, err := http.Get(srv.URL)
-		if err != nil {
-			t.Errorf("get: %v", err)
-			done <- result{}
-			return
-		}
-		defer resp.Body.Close()
-		done <- result{status: resp.StatusCode, header: resp.Header.Get("X-Broker-Status")}
-	}()
+	done := make(chan gateResult, 1)
+	go func() { done <- getResult(t, srv.URL) }()
 
 	waitFor(t, func() bool { return s.Stats().Parked == 1 })
 	yf.set(false) // yield ends; RunParkDrain releases on its next tick
@@ -237,15 +160,15 @@ func TestGateParkExpires(t *testing.T) {
 	s := New()
 	s.SetParkConfig(120*time.Millisecond, 4, 4) // short hold, never drained
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, alwaysYield{}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 2 * time.Second, Admission: alwaysYield{}, Recorder: rec}, upstream))
 	defer srv.Close()
 
 	start := time.Now()
-	resp, err := http.Get(srv.URL)
+	resp, err := testhttp.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	elapsed := time.Since(start)
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -281,8 +204,7 @@ func TestGateParkQueueCeiling(t *testing.T) {
 	s := New()
 	s.SetParkConfig(5*time.Second, maxQueue, maxQueue)
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, alwaysYield{}, rec, upstream))
-	defer srv.Close()
+	srv := startGate(t, s, GateConfig{Class: Batch, Wait: 5 * time.Second, Admission: alwaysYield{}, Recorder: rec}, upstream)
 
 	// Fill the ceiling with cancellable requests so they can be cleaned up
 	// quickly at the end of the test rather than waiting out the hold.
@@ -293,25 +215,19 @@ func TestGateParkQueueCeiling(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
-			resp, err := http.DefaultClient.Do(req)
-			if err == nil {
-				resp.Body.Close()
+			if resp, err := testhttp.Do(ctx, http.MethodGet, srv.URL, nil); err == nil {
+				_ = resp.Body.Close()
 			}
 		}()
 	}
 	waitFor(t, func() bool { return s.Stats().Parked == maxQueue })
 
 	start := time.Now()
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	defer resp.Body.Close()
+	r := getResult(t, srv.URL)
 	elapsed := time.Since(start)
 
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	if r.status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", r.status)
 	}
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("ceiling rejection took %v, want near-immediate (no blocking)", elapsed)
@@ -346,8 +262,7 @@ func TestGateParkDrainBurst(t *testing.T) {
 	s := New()
 	s.SetParkConfig(5*time.Second, n, burst)
 	yf := newYieldFlag(true)
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, flagAdm{yf}, nil, upstream))
-	defer srv.Close()
+	srv := startGate(t, s, GateConfig{Class: Batch, Wait: 5 * time.Second, Admission: flagAdm{yf}}, upstream)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -359,25 +274,17 @@ func TestGateParkDrainBurst(t *testing.T) {
 		id := i
 		go func() {
 			defer wg.Done()
-			resp, err := http.Get(fmt.Sprintf("%s?id=%d", srv.URL, id))
-			if err == nil {
-				resp.Body.Close()
+			if resp, err := testhttp.Get(fmt.Sprintf("%s?id=%d", srv.URL, id)); err == nil {
+				_ = resp.Body.Close()
 			}
 		}()
-		// Sequence enqueue order deterministically: don't fire request i+1
-		// until request i has actually parked.
+		// Sequence enqueue order: request i+1 waits until i has parked.
 		waitFor(t, func() bool { return s.Stats().Parked == id+1 })
 	}
 
 	yf.set(false) // yield ends; drain proceeds in bursts of `burst`
 
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(4 * time.Second):
-		t.Fatal("not all parked requests were released")
-	}
+	waitOrFail(t, &wg, 4*time.Second, "not all parked requests were released")
 
 	mu.Lock()
 	got := append([]int(nil), arrival...)
@@ -385,23 +292,22 @@ func TestGateParkDrainBurst(t *testing.T) {
 	if len(got) != n {
 		t.Fatalf("released count = %d, want %d", len(got), n)
 	}
+	requireFIFOGroups(t, got, [][]int{{0, 1}, {2, 3}})
+}
 
-	// Membership per burst group is FIFO (oldest waiters released first).
-	// Intra-group completion order is not asserted: maxInflight=1 serializes
-	// released waiters through the scheduler's own FIFO Acquire queue, whose
-	// exact interleaving among simultaneously-woken goroutines is not a
-	// contract this test needs to pin.
-	wantGroups := [][]int{{0, 1}, {2, 3}}
+// requireFIFOGroups checks membership per burst group is FIFO (oldest waiters
+// released first). Intra-group completion order is not asserted: maxInflight=1
+// serializes released waiters through the scheduler's own FIFO Acquire queue,
+// whose exact interleaving among simultaneously-woken goroutines is not a
+// contract this test needs to pin.
+func requireFIFOGroups(t *testing.T, got []int, wantGroups [][]int) {
+	t.Helper()
 	idx := 0
 	for _, want := range wantGroups {
 		group := got[idx : idx+len(want)]
 		idx += len(want)
-		seen := map[int]bool{}
-		for _, id := range group {
-			seen[id] = true
-		}
 		for _, id := range want {
-			if !seen[id] {
+			if !slices.Contains(group, id) {
 				t.Fatalf("burst group %v missing id %d (got %v); FIFO release order violated", want, id, group)
 			}
 		}
@@ -418,7 +324,7 @@ func TestGateParkClientDisconnect(t *testing.T) {
 	s := New()
 	s.SetParkConfig(5*time.Second, 5, 5)
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, alwaysYield{}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 5 * time.Second, Admission: alwaysYield{}, Recorder: rec}, upstream))
 	defer srv.Close()
 
 	baseGoroutines := runtime.NumGoroutine()
@@ -433,7 +339,7 @@ func TestGateParkClientDisconnect(t *testing.T) {
 	go func() {
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		close(done)
 	}()
@@ -471,25 +377,11 @@ func TestGateParkShutdown(t *testing.T) {
 	shutCtx, shutCancel := context.WithCancel(context.Background())
 	s.SetShutdownContext(shutCtx)
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 10*time.Second, 0, alwaysYield{}, rec, upstream))
-	defer srv.Close()
+	srv := startGate(t, s, GateConfig{Class: Batch, Wait: 10 * time.Second, Admission: alwaysYield{}, Recorder: rec}, upstream)
 
-	type result struct {
-		status int
-		header string
-	}
-	results := make(chan result, n)
+	results := make(chan gateResult, n)
 	for i := 0; i < n; i++ {
-		go func() {
-			resp, err := http.Get(srv.URL)
-			if err != nil {
-				t.Errorf("get: %v", err)
-				results <- result{}
-				return
-			}
-			defer resp.Body.Close()
-			results <- result{status: resp.StatusCode, header: resp.Header.Get("X-Broker-Status")}
-		}()
+		go func() { results <- getResult(t, srv.URL) }()
 	}
 	waitFor(t, func() bool { return s.Stats().Parked == n })
 

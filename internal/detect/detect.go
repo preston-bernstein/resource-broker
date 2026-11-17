@@ -1,6 +1,6 @@
 // Package detect identifies GPU contention from high-priority local processes
 // (gaming, Plex transcoding) by inspecting process command lines. The match
-// patterns are ported verbatim from the Bash V3 resource-manager so behaviour
+// patterns are ported verbatim from the Bash V3 resource-manager so behavior
 // does not regress.
 //
 // The "Plex Transcoder" process name alone is not a reliable signal: Plex
@@ -14,6 +14,7 @@
 package detect
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -51,7 +52,7 @@ var wineRe = regexp.MustCompile(`wine.*\.exe`)
 // install path, never from system32.
 var wineSystemDirRe = regexp.MustCompile(`(?i)windows[\\/]system32`)
 
-// headlessDisplay marks a Wine process launched under xvfb-run, a virtual X
+// headlessDisplay flags a Wine process launched under xvfb-run, a virtual X
 // server nobody can see, so it is a background tool (e.g. the Norgate Data
 // Updater run by `runuser -u agent -- xvfb-run -a wine ...`), never a game.
 // The runuser and xvfb-run wrapper command lines both carry the .exe path,
@@ -193,7 +194,7 @@ func ProcLister() ([]Process, error) {
 	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil, err // real failure on a platform where /proc should exist
+		return nil, fmt.Errorf("ProcLister: read dir: %w", err) // real failure on a platform where /proc should exist
 	}
 	var procs []Process
 	for _, e := range entries {
@@ -204,11 +205,11 @@ func ProcLister() ([]Process, error) {
 			continue // not a pid dir
 		}
 		base := filepath.Join("/proc", e.Name())
-		cmd, err := os.ReadFile(filepath.Join(base, "cmdline"))
+		cmd, err := os.ReadFile(filepath.Clean(filepath.Join(base, "cmdline")))
 		if err != nil {
 			continue // process gone or unreadable
 		}
-		comm, _ := os.ReadFile(filepath.Join(base, "comm"))
+		comm, _ := os.ReadFile(filepath.Clean(filepath.Join(base, "comm")))
 		procs = append(procs, Process{
 			Comm:    strings.TrimSpace(string(comm)),
 			Cmdline: strings.ReplaceAll(string(cmd), "\x00", " "),

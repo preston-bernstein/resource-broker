@@ -61,7 +61,7 @@ type Store interface {
 	// number of Jobs touched.
 	RecoverRunning(ctx context.Context, maxAttempts int) (int, error)
 
-	// Cancel marks a non-terminal Job CANCELED and returns it; terminal Jobs are
+	// Cancel sets a non-terminal Job to CANCELED and returns it; terminal Jobs are
 	// returned unchanged.
 	Cancel(ctx context.Context, id string) (*Job, error)
 
@@ -69,7 +69,7 @@ type Store interface {
 	// if it is not queued.
 	Position(ctx context.Context, id string) (int, error)
 
-	// StampFetched marks the first successful result read (retain-until-fetched).
+	// StampFetched records the first successful result read (retain-until-fetched).
 	StampFetched(ctx context.Context, id string) error
 
 	// Prune deletes terminal Jobs: SUCCEEDED ones fetchedGrace after their first

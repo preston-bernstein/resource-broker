@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -62,47 +63,62 @@ type retryTransport struct {
 }
 
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Buffer the body once so it can be replayed on retry — Ollama/Infinity
-	// request bodies here are small JSON payloads (a handful of texts per
-	// embed batch), so buffering is cheap.
-	if req.Body != nil && req.GetBody == nil {
-		body, err := io.ReadAll(req.Body)
-		req.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		req.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(body)), nil
-		}
+	if err := bufferBody(req); err != nil {
+		return nil, err
 	}
 
 	var lastErr error
 	for attempt := 0; attempt <= t.retries; attempt++ {
-		if attempt > 0 {
-			if req.Context().Err() != nil {
-				return nil, lastErr
-			}
-			if req.GetBody != nil {
-				b, err := req.GetBody()
-				if err != nil {
-					return nil, lastErr
-				}
-				req.Body = b
-			}
-			time.Sleep(t.backoff)
-			slog.Warn("retrying upstream request after connection error", "path", req.URL.Path, "attempt", attempt, "err", lastErr)
+		if attempt > 0 && !t.prepareRetry(req, attempt, lastErr) {
+			return nil, lastErr
 		}
 		resp, err := t.base.RoundTrip(req)
 		if err == nil {
 			return resp, nil
 		}
 		if req.Context().Err() != nil || !isRetryableConnError(err) {
-			return resp, err
+			return resp, fmt.Errorf("round trip: %w", err)
 		}
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+// bufferBody reads the request body once so it can be replayed on retry —
+// Ollama/Infinity request bodies here are small JSON payloads (a handful of
+// texts per embed batch), so buffering is cheap.
+func bufferBody(req *http.Request) error {
+	if req.Body == nil || req.GetBody != nil {
+		return nil
+	}
+	body, err := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	if err != nil {
+		return fmt.Errorf("buffer request body: %w", err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	return nil
+}
+
+// prepareRetry rewinds the body and waits out the backoff before attempt. It
+// returns false when the retry should not happen.
+func (t *retryTransport) prepareRetry(req *http.Request, attempt int, lastErr error) bool {
+	if req.Context().Err() != nil {
+		return false
+	}
+	if req.GetBody != nil {
+		b, err := req.GetBody()
+		if err != nil {
+			return false
+		}
+		req.Body = b
+	}
+	time.Sleep(t.backoff)
+	slog.Warn("retrying upstream request after connection error", "path", req.URL.Path, "attempt", attempt, "err", lastErr)
+	return true
 }
 
 // isRetryableConnError reports whether err looks like a connection-level

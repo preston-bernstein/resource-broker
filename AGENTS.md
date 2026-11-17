@@ -15,7 +15,7 @@ Install the gate tools with `bash ci/install-gate-tools.sh <dir>`, then put `<di
 - Fail loudly. Comments say why, not what. Delete dead code.
 - A behavior change ships with a test that fails without it.
 - Never edit a limit or a config to make a run pass. Fix the code. A waiver goes in `.core-allow` with a reason.
-- `.core-baseline.json` and `.core-allow` may only shrink.
+- There is no `.core-baseline.json`. Do not add one. `.core-allow` is for generated or vendored files only.
 - `scripts/` holds files copied unchanged from the stack packs. Do not edit them. Update them by copying the new pack version.
 
 ## Go rules
@@ -26,7 +26,7 @@ Install the gate tools with `bash ci/install-gate-tools.sh <dir>`, then put `<di
 - Every goroutine has a way to stop and something waits for it. No `init()` functions.
 - Log with `log/slog` and key-value pairs. No `fmt.Print*` or `log.Print*` in library code.
 - `//nolint` names the linter and gives a reason.
-- `.golangci.yml` accepts findings that exist at `issues.new-from-rev`. A new finding fails the gate. CI fetches full history for this.
+- `.golangci.yml` has no baseline: every finding fails the gate. A line-level `//nolint:<linter> // <reason>` is the only exception.
 
 ## GitHub Actions rules
 

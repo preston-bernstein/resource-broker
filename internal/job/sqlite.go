@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_scope ON jobs(source, owner, state);
 
 // OpenSQLite opens (creating if needed) the Job database at path and applies
 // the schema. Use ":memory:" for tests.
-func OpenSQLite(path string) (*SQLiteStore, error) {
+func OpenSQLite(ctx context.Context, path string) (*SQLiteStore, error) {
 	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	if path == ":memory:" {
 		// A uniquely-named shared in-memory DB so the *sql.DB pool sees one
@@ -57,31 +57,36 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("OpenSQLite: open database: %w", err)
 	}
 	// One writer at a time avoids SQLITE_BUSY churn on a home-scale workload.
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 	return &SQLiteStore{db: db}, nil
 }
 
 // Close releases the database handle.
-func (s *SQLiteStore) Close() error { return s.db.Close() }
+func (s *SQLiteStore) Close() error {
+	if err := s.db.Close(); err != nil {
+		return fmt.Errorf("close database: %w", err)
+	}
+	return nil
+}
 
 func (s *SQLiteStore) Submit(ctx context.Context, j *Job) (*Job, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("Submit: begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Idempotency: a retried submit with a known key returns the existing Job.
 	if existing, err := scanOne(tx.QueryRowContext(ctx,
 		selectCols+` FROM jobs WHERE idempotency_key = ?`, j.IdempotencyKey)); err == nil {
-		return existing, false, tx.Commit()
+		return existing, false, commit(tx)
 	} else if !errors.Is(err, ErrNotFound) {
 		return nil, false, err
 	}
@@ -89,7 +94,7 @@ func (s *SQLiteStore) Submit(ctx context.Context, j *Job) (*Job, bool, error) {
 	var nextHint int64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(position_hint), 0) + 1 FROM jobs`).Scan(&nextHint); err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("Submit: scan row: %w", err)
 	}
 	j.State = StateQueued
 	j.Attempts = 0
@@ -102,10 +107,10 @@ func (s *SQLiteStore) Submit(ctx context.Context, j *Job) (*Job, bool, error) {
 		 VALUES (?,?,?,?,?,?,?,?,?,'','',?,?)`,
 		j.ID, j.IdempotencyKey, j.Source, j.Owner, j.State, j.Attempts, j.Model, j.ParamsJSON, j.Prompt, j.PositionHint, j.CreatedAt.UnixNano())
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("Submit: exec: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("Submit: commit transaction: %w", err)
 	}
 	return j, true, nil
 }
@@ -138,9 +143,9 @@ func (s *SQLiteStore) List(ctx context.Context, f Filter) ([]*Job, error) {
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("List: query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []*Job
 	for rows.Next() {
 		j, err := scanRow(rows)
@@ -149,22 +154,25 @@ func (s *SQLiteStore) List(ctx context.Context, f Filter) ([]*Job, error) {
 		}
 		out = append(out, j)
 	}
-	return out, rows.Err()
+	return out, rowsErr(rows)
 }
 
 func (s *SQLiteStore) HasQueued(ctx context.Context) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM jobs WHERE state = ?)`, StateQueued).Scan(&n)
-	return n == 1, err
+	if err != nil {
+		return false, fmt.Errorf("HasQueued: scan row: %w", err)
+	}
+	return n == 1, nil
 }
 
 func (s *SQLiteStore) ClaimNext(ctx context.Context) (*Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ClaimNext: begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	j, err := scanOne(tx.QueryRowContext(ctx,
 		selectCols+` FROM jobs WHERE state = ? ORDER BY position_hint ASC, created_at ASC LIMIT 1`, StateQueued))
@@ -175,12 +183,12 @@ func (s *SQLiteStore) ClaimNext(ctx context.Context) (*Job, error) {
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET state = ?, started_at = ?, error = '' WHERE id = ? AND state = ?`,
 		StateRunning, now.UnixNano(), j.ID, StateQueued); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ClaimNext: exec: %w", err)
 	}
 	j.State = StateRunning
 	j.StartedAt = &now
 	j.Error = ""
-	return j, tx.Commit()
+	return j, commit(tx)
 }
 
 func (s *SQLiteStore) Succeed(ctx context.Context, id, result string) error {
@@ -204,9 +212,9 @@ func (s *SQLiteStore) Preempt(ctx context.Context, id string) error {
 func (s *SQLiteStore) FailOrRetry(ctx context.Context, id, errMsg string, maxAttempts int) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("FailOrRetry: begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var attempts int
 	var state State
@@ -214,7 +222,7 @@ func (s *SQLiteStore) FailOrRetry(ctx context.Context, id, errMsg string, maxAtt
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, ErrNotFound
 		}
-		return false, err
+		return false, fmt.Errorf("FailOrRetry: scan row: %w", err)
 	}
 	if state != StateRunning {
 		return false, ErrAlreadyTerminal
@@ -224,95 +232,114 @@ func (s *SQLiteStore) FailOrRetry(ctx context.Context, id, errMsg string, maxAtt
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE jobs SET state = ?, attempts = ?, error = ?, finished_at = ? WHERE id = ?`,
 			StateFailed, attempts, errMsg, time.Now().UnixNano(), id); err != nil {
-			return false, err
+			return false, fmt.Errorf("FailOrRetry: exec: %w", err)
 		}
-		return true, tx.Commit()
+		return true, commit(tx)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET state = ?, attempts = ?, error = ?, started_at = NULL, position_hint = (
 			SELECT COALESCE(MIN(position_hint), 0) - 1 FROM jobs WHERE state = ?
 		) WHERE id = ?`,
 		StateQueued, attempts, errMsg, StateQueued, id); err != nil {
-		return false, err
+		return false, fmt.Errorf("FailOrRetry: exec: %w", err)
 	}
-	return false, tx.Commit()
+	return false, commit(tx)
 }
 
+// RecoverRunning requeues every RUNNING Job a crash left behind, or fails it
+// once it has used maxAttempts. It returns how many Jobs it found.
 func (s *SQLiteStore) RecoverRunning(ctx context.Context, maxAttempts int) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("RecoverRunning: begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `SELECT id, attempts FROM jobs WHERE state = ? ORDER BY created_at ASC`, StateRunning)
+	recs, err := runningJobs(ctx, tx)
 	if err != nil {
 		return 0, err
 	}
-	type rec struct {
-		id       string
-		attempts int
-	}
-	var recs []rec
-	for rows.Next() {
-		var r rec
-		if err := rows.Scan(&r.id, &r.attempts); err != nil {
-			rows.Close()
+	now := time.Now().UnixNano()
+	for _, r := range recs {
+		if err := r.recover(ctx, tx, maxAttempts, now); err != nil {
 			return 0, err
+		}
+	}
+	return len(recs), commit(tx)
+}
+
+type runningRec struct {
+	id       string
+	attempts int
+}
+
+// runningJobs lists the RUNNING Jobs in creation order.
+func runningJobs(ctx context.Context, tx *sql.Tx) ([]runningRec, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, attempts FROM jobs WHERE state = ? ORDER BY created_at ASC`, StateRunning)
+	if err != nil {
+		return nil, fmt.Errorf("runningJobs: query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var recs []runningRec
+	for rows.Next() {
+		var r runningRec
+		if err := rows.Scan(&r.id, &r.attempts); err != nil {
+			return nil, fmt.Errorf("runningJobs: scan row: %w", err)
 		}
 		recs = append(recs, r)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
+	return recs, rowsErr(rows)
+}
 
-	now := time.Now().UnixNano()
-	for _, r := range recs {
-		attempts := r.attempts + 1
-		if attempts >= maxAttempts {
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE jobs SET state = ?, attempts = ?, error = ?, finished_at = ? WHERE id = ?`,
-				StateFailed, attempts, "exceeded attempts after restart", now, r.id); err != nil {
-				return 0, err
-			}
-			continue
-		}
-		// Front of the line, computed per-row so multiple recovered Jobs keep a
-		// stable created-order lead over already-queued work.
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE jobs SET state = ?, attempts = ?, started_at = NULL, position_hint = (
-				SELECT COALESCE(MIN(position_hint), 0) - 1 FROM jobs WHERE state = ?
-			) WHERE id = ?`,
-			StateQueued, attempts, StateQueued, r.id); err != nil {
-			return 0, err
-		}
+// recover counts a restart as an attempt, then fails or requeues the Job.
+func (r runningRec) recover(ctx context.Context, tx *sql.Tx, maxAttempts int, now int64) error {
+	attempts := r.attempts + 1
+	if attempts >= maxAttempts {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET state = ?, attempts = ?, error = ?, finished_at = ? WHERE id = ?`,
+			StateFailed, attempts, "exceeded attempts after restart", now, r.id)
+		return execErr("fail recovered job", err)
 	}
-	return len(recs), tx.Commit()
+	// Front of the line, computed per-row so multiple recovered Jobs keep a
+	// stable created-order lead over already-queued work.
+	_, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET state = ?, attempts = ?, started_at = NULL, position_hint = (
+			SELECT COALESCE(MIN(position_hint), 0) - 1 FROM jobs WHERE state = ?
+		) WHERE id = ?`,
+		StateQueued, attempts, StateQueued, r.id)
+	return execErr("requeue recovered job", err)
+}
+
+// execErr says which statement failed, or returns nil when err is nil.
+func execErr(what string, err error) error {
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) Cancel(ctx context.Context, id string) (*Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Cancel: begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	j, err := scanOne(tx.QueryRowContext(ctx, selectCols+` FROM jobs WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
 	if j.State.Terminal() {
-		return j, tx.Commit() // already done; cancel is a no-op
+		return j, commit(tx) // already done; cancel is a no-op
 	}
 	now := time.Now()
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET state = ?, finished_at = ? WHERE id = ?`, StateCanceled, now.UnixNano(), id); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Cancel: exec: %w", err)
 	}
 	j.State = StateCanceled
 	j.FinishedAt = &now
-	return j, tx.Commit()
+	return j, commit(tx)
 }
 
 func (s *SQLiteStore) Position(ctx context.Context, id string) (int, error) {
@@ -328,7 +355,7 @@ func (s *SQLiteStore) Position(ctx context.Context, id string) (int, error) {
 		`SELECT COUNT(*) FROM jobs WHERE state = ? AND (position_hint < ? OR (position_hint = ? AND created_at < ?))`,
 		StateQueued, j.PositionHint, j.PositionHint, j.CreatedAt.UnixNano()).Scan(&ahead)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("Position: scan row: %w", err)
 	}
 	return ahead + 1, nil
 }
@@ -339,7 +366,7 @@ func (s *SQLiteStore) StampFetched(ctx context.Context, id string) error {
 		`UPDATE jobs SET fetched_at = ? WHERE id = ? AND state = ? AND fetched_at IS NULL`,
 		time.Now().UnixNano(), id, StateSucceeded)
 	if err != nil {
-		return err
+		return fmt.Errorf("StampFetched: exec: %w", err)
 	}
 	_ = res // zero rows is fine: already stamped or not succeeded
 	return nil
@@ -353,7 +380,7 @@ func (s *SQLiteStore) Prune(ctx context.Context, fetchedGrace, hardCap time.Dura
 		StateSucceeded, now.Add(-fetchedGrace).UnixNano(),
 		StateSucceeded, StateFailed, StateCanceled, now.Add(-hardCap).UnixNano())
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("Prune: exec: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
@@ -362,15 +389,15 @@ func (s *SQLiteStore) Prune(ctx context.Context, fetchedGrace, hardCap time.Dura
 func (s *SQLiteStore) Counts(ctx context.Context) (Counts, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM jobs GROUP BY state`)
 	if err != nil {
-		return Counts{}, err
+		return Counts{}, fmt.Errorf("Counts: query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var c Counts
 	for rows.Next() {
 		var st State
 		var n int
 		if err := rows.Scan(&st, &n); err != nil {
-			return Counts{}, err
+			return Counts{}, fmt.Errorf("Counts: scan row: %w", err)
 		}
 		switch st {
 		case StateQueued:
@@ -385,7 +412,7 @@ func (s *SQLiteStore) Counts(ctx context.Context) (Counts, error) {
 			c.Canceled = n
 		}
 	}
-	return c, rows.Err()
+	return c, rowsErr(rows)
 }
 
 // --- row scanning ---
@@ -409,7 +436,7 @@ func scanRow(row scanner) (*Job, error) {
 	if err := row.Scan(&j.ID, &j.IdempotencyKey, &j.Source, &j.Owner, &j.State, &j.Attempts,
 		&j.Model, &j.ParamsJSON, &j.Prompt, &j.Result, &j.Error, &j.PositionHint,
 		&created, &started, &finished, &fetched); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scanRow: scan row: %w", err)
 	}
 	j.CreatedAt = time.Unix(0, created)
 	j.StartedAt = nanoPtr(started)
@@ -432,10 +459,26 @@ func mustAffect(res sql.Result, err error) error {
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("mustAffect: rows affected: %w", err)
 	}
 	if n == 0 {
 		return ErrNotFound // state guard didn't match: Job moved out from under us
+	}
+	return nil
+}
+
+// commit commits tx, saying so in the error.
+func commit(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// rowsErr reports the error that ended a rows iteration, if any.
+func rowsErr(rows *sql.Rows) error {
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
 	}
 	return nil
 }

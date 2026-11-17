@@ -44,34 +44,59 @@ type TdarrStatus struct {
 }
 
 // TdarrStatusFn returns the current Tdarr GPU worker count (nil = disabled).
-type TdarrStatusFn func() *TdarrStatus
+type TdarrStatusFn func(ctx context.Context) *TdarrStatus
 
-// Mux builds the control-plane handler. jobs is the durable Job API surface
-// (may be nil if disabled); jobStatus, if non-nil, contributes a "jobs" section
-// to /status; tdarrStatus, if non-nil, contributes a "tdarr" section;
-// routingStatus, if non-nil, contributes a "routing" section (per-model
+// Options carries everything Mux wires together. Jobs is the durable Job API
+// surface (nil if disabled). JobStatus, if non-nil, contributes a "jobs"
+// section to /status; TdarrStatus, if non-nil, contributes a "tdarr" section;
+// RoutingStatus, if non-nil, contributes a "routing" section (per-model
 // backend routing, docs/adr/0015-per-model-backend-routing.md) — nil (the
 // default, when no BROKER_ROUTE_<N>_* config is set) omits the key entirely,
-// preserving /status's pre-feature shape byte-for-byte; idleStatus, if non-nil,
+// preserving /status's pre-feature shape byte-for-byte; IdleStatus, if non-nil,
 // contributes an "idle" section (idle-unload state per yield.Controller) — nil
 // (the default, when no idle timeouts are configured) omits the key entirely.
-// health, if non-nil, backs /healthz with a real readiness check (ADR-0010);
+// Health, if non-nil, backs /healthz with a real readiness check (ADR-0010);
 // nil preserves the old always-200 behavior (used by tests that don't care).
 //
-// controlToken gates POST /control (ADR-0005): GET /metrics, /healthz,
+// ControlToken gates POST /control (ADR-0005): GET /metrics, /healthz,
 // /status, and GET /control stay open to any LAN caller (Grafana must scrape
 // /metrics, and that data is low-sensitivity). POST /control mutates broker
-// state, so it is gated: if controlToken is non-empty, the request must carry
-// a matching "Authorization: Bearer <token>" header; if controlToken is
+// state, so it is gated: if ControlToken is non-empty, the request must carry
+// a matching "Authorization: Bearer <token>" header; if ControlToken is
 // empty, mutations are accepted only from a loopback remote address. Either
 // way, an unauthorized POST /control gets 401.
-func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandler http.Handler, jobs http.Handler, jobStatus func() any, tdarrStatus TdarrStatusFn, routingStatus func() any, idleStatus func() any, controlToken string) http.Handler {
-	mux := http.NewServeMux()
+type Options struct {
+	Controller    Controller
+	Stats         StatsProvider
+	Health        HealthCheck
+	Metrics       http.Handler
+	Jobs          http.Handler
+	JobStatus     func(ctx context.Context) any
+	TdarrStatus   TdarrStatusFn
+	RoutingStatus func() any
+	IdleStatus    func() any
+	ControlToken  string
+}
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+// Mux builds the control-plane handler.
+func Mux(o Options) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthzHandler(o.Health))
+	mux.Handle("/metrics", o.Metrics)
+	if o.Jobs != nil {
+		mux.Handle("/jobs", o.Jobs)
+		mux.Handle("/jobs/", o.Jobs)
+	}
+	mux.HandleFunc("/control", controlHandler(o.Controller, o.ControlToken))
+	mux.HandleFunc("/status", statusHandler(o))
+	return mux
+}
+
+func healthzHandler(health HealthCheck) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if health == nil {
 			w.Header().Set("Content-Type", "text/plain")
-			w.Write([]byte("ok\n"))
+			_, _ = w.Write([]byte("ok\n"))
 			return
 		}
 		// Bounded independently of any caller timeout: a hung dependency check
@@ -86,51 +111,54 @@ func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandle
 			return
 		}
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-
-	mux.Handle("/metrics", metricsHandler)
-
-	if jobs != nil {
-		mux.Handle("/jobs", jobs)
-		mux.Handle("/jobs/", jobs)
 	}
+}
 
-	// GET  /control -> current state
-	// POST /control {"mode":"auto|yield|serve"} -> set override, return state
-	mux.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
+// controlHandler serves
+//
+//	GET  /control -> current state
+//	POST /control {"mode":"auto|yield|serve"} -> set override, return state
+func controlHandler(ctrl Controller, controlToken string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			httpx.WriteJSON(w, http.StatusOK, ctrl.Snapshot())
 		case http.MethodPost:
-			if !authorized(r, controlToken) {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="control"`)
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			var body struct {
-				Mode string `json:"mode"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
-				return
-			}
-			m, ok := yield.ParseMode(body.Mode)
-			if !ok {
-				http.Error(w, "mode must be one of: auto, yield, serve", http.StatusBadRequest)
-				return
-			}
-			ctrl.SetMode(m)
-			httpx.WriteJSON(w, http.StatusOK, ctrl.Snapshot())
+			setControlMode(w, r, ctrl, controlToken)
 		default:
 			w.Header().Set("Allow", "GET, POST")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
+	}
+}
 
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		st := stats.Stats()
+func setControlMode(w http.ResponseWriter, r *http.Request, ctrl Controller, controlToken string) {
+	if !authorized(r, controlToken) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="control"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	m, ok := yield.ParseMode(body.Mode)
+	if !ok {
+		http.Error(w, "mode must be one of: auto, yield, serve", http.StatusBadRequest)
+		return
+	}
+	ctrl.SetMode(m)
+	httpx.WriteJSON(w, http.StatusOK, ctrl.Snapshot())
+}
+
+func statusHandler(o Options) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		st := o.Stats.Stats()
 		out := map[string]any{
-			"yield": ctrl.Snapshot(),
+			"yield": o.Controller.Snapshot(),
 			"queue": map[string]any{
 				"busy":         st.Busy,
 				"inflight":     st.Inflight,
@@ -141,24 +169,25 @@ func Mux(ctrl Controller, stats StatsProvider, health HealthCheck, metricsHandle
 			},
 			"schedule": schedule.TakeSnapshot(time.Now()),
 		}
-		if jobStatus != nil {
-			out["jobs"] = jobStatus()
+		if o.JobStatus != nil {
+			out["jobs"] = o.JobStatus(r.Context())
 		}
-		if tdarrStatus != nil {
-			if ts := tdarrStatus(); ts != nil {
+		if o.TdarrStatus != nil {
+			if ts := o.TdarrStatus(r.Context()); ts != nil {
 				out["tdarr"] = ts
 			}
 		}
-		if routingStatus != nil {
-			out["routing"] = routingStatus()
-		}
-		if idleStatus != nil {
-			out["idle"] = idleStatus()
-		}
+		addOptionalSection(out, "routing", o.RoutingStatus)
+		addOptionalSection(out, "idle", o.IdleStatus)
 		httpx.WriteJSON(w, http.StatusOK, out)
-	})
+	}
+}
 
-	return mux
+// addOptionalSection adds fn's result under key. A nil fn omits the key.
+func addOptionalSection(out map[string]any, key string, fn func() any) {
+	if fn != nil {
+		out[key] = fn()
+	}
 }
 
 // authorized implements ADR-0005's POST /control gate: with a configured

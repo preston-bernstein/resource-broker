@@ -14,6 +14,7 @@
 package plex
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"net/http"
@@ -73,13 +74,13 @@ type mediaContainer struct {
 // The exclusion is deliberately narrow and fails toward reporting Contention.
 // Only a container whose sessions are ALL <Track>, and which listed as many
 // sessions as it declared, is treated as GPU-free. A video or photo session, a
-// mixed container, an element this code does not recognise, or a count that
+// mixed container, an element this code does not recognize, or a count that
 // does not match the listing all report Contention. The yield-to-gaming
 // invariant (ADR-0003, ADR-0004) is not weakened: a missed Yield can stutter
 // someone's game, a spurious one only delays batch work, so every
 // classification error resolves toward Yielding.
 func (c *Client) ActiveSession() (bool, error) {
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/status/sessions", nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, c.baseURL+"/status/sessions", nil)
 	if err != nil {
 		return false, fmt.Errorf("plex: new request: %w", err)
 	}
@@ -90,7 +91,7 @@ func (c *Client) ActiveSession() (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("plex: status/sessions: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("plex: status/sessions: status %d", resp.StatusCode)
 	}

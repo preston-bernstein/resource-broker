@@ -55,7 +55,7 @@ func TestNewOpenAIBackendReturnsNonNil(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/models" {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"data":[]}`))
+			_, _ = w.Write([]byte(`{"data":[]}`))
 		}
 	}))
 	defer mock.Close()
@@ -243,7 +243,7 @@ func TestOllamaBackendReachableViaFactory(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/ps" {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"models":[]}`))
+			_, _ = w.Write([]byte(`{"models":[]}`))
 		}
 	}))
 	defer mock.Close()
@@ -277,7 +277,7 @@ func TestOpenAIBackendReachableViaFactory(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/models" {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"data":[]}`))
+			_, _ = w.Write([]byte(`{"data":[]}`))
 		}
 	}))
 	defer mock.Close()

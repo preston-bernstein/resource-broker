@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/preston-bernstein/resource-broker/internal/httpx"
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
@@ -29,7 +30,7 @@ type fakeBackend struct {
 }
 
 func (f *fakeBackend) Proxy() http.Handler { return f.handler }
-func (f *fakeBackend) Generate(ctx context.Context, model, prompt string, options map[string]any, onTokens func(int)) (string, error) {
+func (f *fakeBackend) Generate(ctx context.Context, req inference.Request) (string, error) {
 	return "", nil
 }
 func (f *fakeBackend) Reachable(ctx context.Context) error { return nil }
@@ -52,7 +53,7 @@ func recordingBackend(name string, hit chan<- string, bodies chan<- []byte) *fak
 
 func newTestRequest(t *testing.T, body string) *http.Request {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/generate", strings.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/generate", strings.NewReader(body))
 	return req
 }
 
@@ -114,16 +115,10 @@ func TestRouterLargeBodyModelPeekNotFullyBuffered(t *testing.T) {
 	// to the resolved backend.
 	hit := make(chan string, 1)
 	bodies := make(chan []byte, 1)
-	def := recordingBackend("default", hit, bodies)
-	vision := recordingBackend("vision", hit, bodies)
+	r := NewRouter(recordingBackend("default", hit, bodies))
+	r.AddRoute("vision-model", "", recordingBackend("vision", hit, bodies))
 
-	r := NewRouter(def)
-	r.AddRoute("vision-model", "", vision)
-
-	handler := r.ProxyForLane("interactive")
-	req := newTestRequest(t, body)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
+	r.ProxyForLane("interactive").ServeHTTP(httptest.NewRecorder(), newTestRequest(t, body))
 
 	if got := <-hit; got != "vision" {
 		t.Fatalf("large vision request reached backend %q, want vision", got)
@@ -132,17 +127,22 @@ func TestRouterLargeBodyModelPeekNotFullyBuffered(t *testing.T) {
 	if !bytes.Equal(got, []byte(body)) {
 		t.Fatalf("forwarded body not byte-identical: got %d bytes, want %d bytes", len(got), len(body))
 	}
+	requireForwardedModel(t, got, "vision-model")
+}
 
-	// Sanity: the decoded model field really does round-trip byte-for-byte
-	// through the forwarded body (FR-6 requirement stated explicitly).
+// requireForwardedModel checks the decoded model field round-trips
+// byte-for-byte through the forwarded body (FR-6 requirement stated
+// explicitly).
+func requireForwardedModel(t *testing.T, forwarded []byte, want string) {
+	t.Helper()
 	var decoded struct {
 		Model string `json:"model"`
 	}
-	if err := json.Unmarshal(got, &decoded); err != nil {
+	if err := json.Unmarshal(forwarded, &decoded); err != nil {
 		t.Fatalf("forwarded body is not valid JSON: %v", err)
 	}
-	if decoded.Model != "vision-model" {
-		t.Fatalf("forwarded body model = %q, want %q", decoded.Model, "vision-model")
+	if decoded.Model != want {
+		t.Fatalf("forwarded body model = %q, want %q", decoded.Model, want)
 	}
 }
 
@@ -322,34 +322,21 @@ func TestRouterRoutingSummary(t *testing.T) {
 	if len(summaries) != 2 {
 		t.Fatalf("RoutingSummary() returned %d entries, want 2 (model-a/model-b grouped, model-c separate); got %+v", len(summaries), summaries)
 	}
+	// The grouped entry first, the solitary one second.
+	sort.Slice(summaries, func(i, j int) bool { return len(summaries[i].Models) > len(summaries[j].Models) })
+	requireSummary(t, summaries[0], "interactive", []string{"model-a", "model-b"})
+	requireSummary(t, summaries[1], "batch", []string{"model-c"})
+}
 
-	var grouped, solitary *RouteSummary
-	for i := range summaries {
-		s := &summaries[i]
-		switch len(s.Models) {
-		case 2:
-			grouped = s
-		case 1:
-			solitary = s
-		}
+// requireSummary checks one RouteSummary entry's lane and (sorted) models.
+func requireSummary(t *testing.T, got RouteSummary, lane string, models []string) {
+	t.Helper()
+	if got.Lane != lane {
+		t.Fatalf("entry %v lane = %q, want %q", got.Models, got.Lane, lane)
 	}
-	if grouped == nil {
-		t.Fatalf("no 2-model grouped entry found in %+v", summaries)
-	}
-	if grouped.Lane != "interactive" {
-		t.Fatalf("grouped entry lane = %q, want %q", grouped.Lane, "interactive")
-	}
-	wantModels := []string{"model-a", "model-b"}
-	sort.Strings(grouped.Models)
-	if !reflect.DeepEqual(grouped.Models, wantModels) {
-		t.Fatalf("grouped entry models = %v, want %v", grouped.Models, wantModels)
-	}
-
-	if solitary == nil {
-		t.Fatalf("no 1-model entry found in %+v", summaries)
-	}
-	if solitary.Models[0] != "model-c" || solitary.Lane != "batch" {
-		t.Fatalf("solitary entry = %+v, want models=[model-c] lane=batch", solitary)
+	sort.Strings(got.Models)
+	if !reflect.DeepEqual(got.Models, models) {
+		t.Fatalf("entry models = %v, want %v", got.Models, models)
 	}
 }
 
@@ -367,11 +354,11 @@ type genBackend struct {
 func (g *genBackend) Proxy() http.Handler {
 	return http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
 }
-func (g *genBackend) Generate(ctx context.Context, model, prompt string, options map[string]any, onTokens func(int)) (string, error) {
+func (g *genBackend) Generate(ctx context.Context, req inference.Request) (string, error) {
 	if g.generateErr != nil {
 		return "", g.generateErr
 	}
-	return g.name + ":" + model, nil
+	return g.name + ":" + req.Model, nil
 }
 func (g *genBackend) Reachable(ctx context.Context) error { return g.reachableErr }
 func (g *genBackend) Unloader() yield.Unloader            { return nil }
@@ -389,7 +376,7 @@ func TestRouterGenerateDispatchesByModel(t *testing.T) {
 	r := NewRouter(def)
 	r.AddRoute("qwen", "interactive", alt) // lane-scoped route: Generate must ignore the lane scoping
 
-	got, err := r.Generate(context.Background(), "qwen", "hi", nil, nil)
+	got, err := r.Generate(context.Background(), inference.Request{Model: "qwen", Prompt: "hi"})
 	if err != nil {
 		t.Fatalf("Generate(routed model) error = %v", err)
 	}
@@ -397,7 +384,7 @@ func TestRouterGenerateDispatchesByModel(t *testing.T) {
 		t.Fatalf("Generate(routed model) = %q, want %q", got, want)
 	}
 
-	got, err = r.Generate(context.Background(), "bert", "hi", nil, nil)
+	got, err = r.Generate(context.Background(), inference.Request{Model: "bert", Prompt: "hi"})
 	if err != nil {
 		t.Fatalf("Generate(unrouted model) error = %v", err)
 	}
@@ -550,112 +537,118 @@ func waitUntil(t *testing.T, cond func() bool) bool {
 // thing AC7 actually forbids: a Reload racing ahead of, or interleaved with,
 // either Unload (a genuinely conflicting/out-of-order pair).
 func TestRouterIdleThenContentionUnloadOrderingIsNeverConflicting(t *testing.T) {
-	det := &raceTestDetector{}
-	u := &orderedIdleUnloader{release: make(chan struct{})}
-
-	// Short poll interval and idle timeout so the real poll loop (not a
-	// direct internal call) fires idle-unload within the test's time budget.
-	const pollInterval = 5 * time.Millisecond
-	const idleTimeout = 20 * time.Millisecond
-
-	ctrl := yield.NewWithConfirmMulti(det, []yield.Unloader{u}, []string{"vllm-route"}, pollInterval, 1)
-	ctrl.ConfigureIdle([]time.Duration{idleTimeout})
-
-	raw := &fakeBackend{
-		name: "vllm",
-		handler: func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		},
-	}
-	tracked := WithActivityTracking(raw, ctrl, 0)
-
-	def := &fakeBackend{
-		name: "default",
-		handler: func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		},
-	}
-	r := NewRouter(def)
-	r.AddRoute("vllm-model", "", tracked)
-
-	// Dispatch a real request through the Router BEFORE starting ctrl.Run,
-	// so lastDispatch reflects real routed traffic via TrackActivity before
-	// the poll loop starts — this test's actual race setup begins from a
-	// known, freshly-dispatched baseline rather than construction time.
-	// (Controller construction itself initializes lastDispatch to "now",
-	// not the atomic.Int64 zero-value/Unix epoch — see
-	// TestNewControllerInitializesLastDispatchToNow in internal/yield — so
-	// this dispatch is about test-setup precision, not working around a
-	// bogus multi-decade "elapsed" on the first poll tick.)
-	req := newTestRequest(t, `{"model":"vllm-model"}`)
-	w := httptest.NewRecorder()
-	r.ProxyForLane("interactive").ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("initial dispatch status = %d, want 200", w.Code)
-	}
+	rig := newIdleRouterRig(t)
+	// Dispatch BEFORE starting ctrl.Run, so lastDispatch reflects real routed
+	// traffic and the race starts from a known, freshly-dispatched baseline.
+	rig.dispatch(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ctrl.Run(ctx)
+	go rig.ctrl.Run(ctx)
 
-	// Wait for the real poll loop to idle-fire: exactly one Unload call,
-	// currently blocked in flight (release not yet closed).
-	if !waitUntil(t, func() bool { return u.orderLen() == 1 }) {
-		t.Fatal("checkIdleLocked never fired an idle-triggered Unload through the real Router+Controller+activityBackend wiring")
-	}
+	// The real poll loop idle-fires: exactly one Unload, blocked in flight.
+	rig.requireOrderLen(t, 1, "checkIdleLocked never fired an idle-triggered Unload through the real Router+Controller+activityBackend wiring")
 
-	// Trigger a genuine gaming/Plex Contention transition on the SAME
-	// instance while the idle-triggered Unload is still in flight.
-	det.setContended(true)
-
-	// Give the real poll loop every chance to spawn Contention's own
-	// doUnload goroutine for this instance. actionDone's per-instance
-	// ordering chain (ADR-0014, extended to Idle in this feature) must
-	// prevent it from actually invoking Unload again until the still-
-	// in-flight idle-triggered call finishes — this is the core ordering
-	// guarantee AC7 exists to prove, not an incidental side effect.
+	// Contention begins on the SAME instance while that Unload is in flight.
+	// The actionDone chain (ADR-0014) must keep Contention's Unload queued
+	// behind it: the core guarantee AC7 exists to prove.
+	rig.det.setContended(true)
 	time.Sleep(50 * time.Millisecond)
-	if got := u.orderLen(); got != 1 {
-		t.Fatalf("a second Unload call ran before the idle-triggered Unload finished: order = %v, want [unload] (actionDone ordering violated)", u.snapshot())
+	if got := rig.u.orderLen(); got != 1 {
+		t.Fatalf("a second Unload call ran before the idle-triggered Unload finished: order = %v, want [unload] (actionDone ordering violated)", rig.u.snapshot())
 	}
 
-	// Release the idle-triggered Unload. Contention's chained second Unload
-	// call (queued behind it via actionDone) can now proceed.
-	close(u.release)
-
-	// Contention's own unconditional per-instance unload loop fires a
-	// second, strictly-ordered Unload call on this already-idle-unloaded
-	// instance. Per FR11/AC7, this is an ACCEPTABLE idempotent outcome —
-	// asserting it here is the PASS case, not a failure.
-	if !waitUntil(t, func() bool { return u.orderLen() == 2 }) {
-		t.Fatal("Contention's own unload never fired for the idle-unloaded instance")
-	}
-	if y, reason := ctrl.Yielding(); !y {
+	// Release it. Contention's chained second Unload now runs: an ACCEPTABLE
+	// idempotent outcome per FR11/AC7, so asserting it is the PASS case.
+	close(rig.u.release)
+	rig.requireOrderLen(t, 2, "Contention's own unload never fired for the idle-unloaded instance")
+	if y, reason := rig.ctrl.Yielding(); !y {
 		t.Fatalf("Yielding() = (%v,%q), want yielding=true once Contention is active", y, reason)
 	}
 
-	// Clear Contention: the instance was idle-unloaded before the Yield, so
-	// the clear must leave it unloaded (2026-10-20 change, ADR-0016
-	// amendment). The next routed request wakes it, and that Reload must
-	// still land strictly after both prior Unload calls.
-	det.setContended(false)
-	if !waitUntil(t, func() bool { y, _ := ctrl.Yielding(); return !y }) {
-		t.Fatal("Contention never cleared")
-	}
-	time.Sleep(50 * time.Millisecond)
-	if got := u.orderLen(); got != 2 {
-		t.Fatalf("Contention-clear reloaded an idle-unloaded instance: order = %v, want [unload unload]", u.snapshot())
-	}
-	w = httptest.NewRecorder()
-	r.ProxyForLane("interactive").ServeHTTP(w, newTestRequest(t, `{"model":"vllm-model"}`))
-	if !waitUntil(t, func() bool { return u.orderLen() == 3 }) {
-		t.Fatal("a routed request never woke the idle-unloaded instance after Contention cleared")
-	}
+	// Clearing Contention must leave the idle-unloaded instance unloaded
+	// (2026-10-20 change, ADR-0016 amendment); the next routed request wakes
+	// it, and that Reload must land strictly after both Unload calls.
+	rig.clearContention(t)
+	rig.dispatch(t)
+	rig.requireOrderLen(t, 3, "a routed request never woke the idle-unloaded instance after Contention cleared")
 
-	got := u.snapshot()
+	got := rig.u.snapshot()
 	want := []string{"unload", "unload", "reload"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("action order = %v, want %v — anything else (a Reload racing ahead of either Unload, or any other interleaving) would be the genuinely conflicting/out-of-order pair FR11/AC7 forbids; a second, later, strictly-ordered Unload (as seen here) is the documented, acceptable idempotent carve-out", got, want)
+	}
+}
+
+// idleRouterRig is the REAL Router -> *activityBackend
+// (backend.WithActivityTracking) -> *yield.Controller chain — the same
+// composition cmd/broker/main.go's buildBroker wires up (see
+// cmd/broker/main_test.go's TestBuildBrokerWiresActivityTrackingIntoRouter for
+// the construction-order proof this builds on) — with a short idle duration so
+// checkIdleLocked fires a real idle-triggered Unload via the controller's own
+// poll loop (never a direct call into unexported yield internals, which this
+// package cannot reach anyway).
+//
+// It reproduces plan.md's Architecture "case 2" exactly: Idle fires in an
+// earlier tick; Contention begins later and its own unconditional
+// per-instance unload loop (applyLocked) fires Unload again, idempotently, on
+// the already-idle-unloaded instance. FR11/AC7 carve this out as an
+// ACCEPTABLE outcome (order == [unload, unload, reload]), while still failing
+// hard on what AC7 forbids: a Reload racing ahead of, or interleaved with,
+// either Unload.
+type idleRouterRig struct {
+	det    *raceTestDetector
+	u      *orderedIdleUnloader
+	ctrl   *yield.Controller
+	router *Router
+}
+
+func newIdleRouterRig(t *testing.T) *idleRouterRig {
+	t.Helper()
+	det := &raceTestDetector{}
+	u := &orderedIdleUnloader{release: make(chan struct{})}
+
+	// Short poll interval and idle timeout so the real poll loop fires
+	// idle-unload within the test's time budget.
+	const pollInterval = 5 * time.Millisecond
+	const idleTimeout = 20 * time.Millisecond
+	ctrl := yield.NewWithConfirmMulti(det, []yield.Unloader{u}, []string{"vllm-route"}, yield.Polling{Interval: pollInterval, ConfirmPolls: 1})
+	ctrl.ConfigureIdle([]time.Duration{idleTimeout})
+
+	ok := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }
+	tracked := WithActivityTracking(&fakeBackend{name: "vllm", handler: ok}, ctrl, 0)
+	router := NewRouter(&fakeBackend{name: "default", handler: ok})
+	router.AddRoute("vllm-model", "", tracked)
+	return &idleRouterRig{det: det, u: u, ctrl: ctrl, router: router}
+}
+
+// dispatch sends one request for the routed model and expects a 200.
+func (g *idleRouterRig) dispatch(t *testing.T) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	g.router.ProxyForLane("interactive").ServeHTTP(w, newTestRequest(t, `{"model":"vllm-model"}`))
+	if w.Code != http.StatusOK {
+		t.Fatalf("dispatch status = %d, want 200", w.Code)
+	}
+}
+
+// clearContention ends Contention and checks the instance was not reloaded.
+func (g *idleRouterRig) clearContention(t *testing.T) {
+	t.Helper()
+	g.det.setContended(false)
+	if !waitUntil(t, func() bool { y, _ := g.ctrl.Yielding(); return !y }) {
+		t.Fatal("Contention never cleared")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := g.u.orderLen(); got != 2 {
+		t.Fatalf("Contention-clear reloaded an idle-unloaded instance: order = %v, want [unload unload]", g.u.snapshot())
+	}
+}
+
+func (g *idleRouterRig) requireOrderLen(t *testing.T, want int, failure string) {
+	t.Helper()
+	if !waitUntil(t, func() bool { return g.u.orderLen() == want }) {
+		t.Fatal(failure)
 	}
 }
 
@@ -674,7 +667,7 @@ func TestRouterRoutingSummaryDoesNotPanicWithActivityTrackedBackend(t *testing.T
 	u := &orderedIdleUnloader{release: make(chan struct{})}
 	close(u.release) // this test never drives an Unload/Reload call; avoid any accidental block
 
-	ctrl := yield.NewWithConfirmMulti(det, []yield.Unloader{u}, []string{"vllm-route"}, time.Hour, 1)
+	ctrl := yield.NewWithConfirmMulti(det, []yield.Unloader{u}, []string{"vllm-route"}, yield.Polling{Interval: time.Hour, ConfirmPolls: 1})
 	ctrl.ConfigureIdle([]time.Duration{5 * time.Minute})
 
 	raw := &fakeBackend{name: "vllm", handler: func(w http.ResponseWriter, r *http.Request) {}}

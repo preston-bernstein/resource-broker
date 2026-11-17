@@ -66,19 +66,10 @@ type parker struct {
 // remove() IS the decrement.
 func (s *Scheduler) parkFor(ctx context.Context) parkResult {
 	p := &s.park
-
-	// Fix: ceiling check + append happen atomically under p.mu — no window
-	// where two goroutines both observe "one slot free" and both enqueue,
-	// blowing the ceiling.
-	p.mu.Lock()
-	if p.maxQueue == 0 || len(p.q) >= p.maxQueue {
-		p.mu.Unlock()
+	pr, hold, ok := p.enqueue()
+	if !ok {
 		return parkRejected
 	}
-	hold := p.hold
-	pr := &parkedReq{enqueuedAt: time.Now(), release: make(chan struct{})}
-	p.q = append(p.q, pr)
-	p.mu.Unlock()
 
 	hctx, hcancel := context.WithTimeout(ctx, hold)
 	defer hcancel()
@@ -86,34 +77,52 @@ func (s *Scheduler) parkFor(ctx context.Context) parkResult {
 	select {
 	case <-pr.release:
 		return parkReleased // drainOneBurst already spliced pr out of p.q
-
 	case <-hctx.Done():
-		// Fix: hctx.Done() fires for BOTH "hold elapsed" and "ctx (client)
-		// cancelled" (WithTimeout wraps ctx). Before classifying either way,
-		// do a non-blocking check of pr.release first — release winning the
-		// race against the timeout must take priority.
-		select {
-		case <-pr.release:
-			return parkReleased
-		default:
-		}
-		if !p.remove(pr) {
-			// Already spliced out by a concurrent drainOneBurst between
-			// hctx.Done() firing and this check: release actually won, even
-			// though its channel-close hasn't been observed above yet.
-			return parkReleased
-		}
-		if ctx.Err() != nil {
-			return parkCanceled // the outer (client) ctx is what fired, not the hold timer
-		}
-		return parkExpired
-
+		return p.classifyTimeout(ctx, pr)
 	case <-s.shutdownDone():
 		if !p.remove(pr) {
 			return parkReleased
 		}
 		return parkShutdown
 	}
+}
+
+// enqueue adds a waiter, or reports false when parking is off or full. The
+// ceiling check and the append happen atomically under p.mu — no window where
+// two goroutines both observe "one slot free" and both enqueue, blowing the
+// ceiling. It also returns the hold bound read under the same lock.
+func (p *parker) enqueue() (*parkedReq, time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.maxQueue == 0 || len(p.q) >= p.maxQueue {
+		return nil, 0, false
+	}
+	pr := &parkedReq{enqueuedAt: time.Now(), release: make(chan struct{})}
+	p.q = append(p.q, pr)
+	return pr, p.hold, true
+}
+
+// classifyTimeout decides what ended pr's wait once the hold context fired.
+// hctx.Done() fires for BOTH "hold elapsed" and "ctx (client) cancelled"
+// (WithTimeout wraps ctx). Before classifying either way, a non-blocking check
+// of pr.release comes first — release winning the race against the timeout
+// must take priority.
+func (p *parker) classifyTimeout(ctx context.Context, pr *parkedReq) parkResult {
+	select {
+	case <-pr.release:
+		return parkReleased
+	default:
+	}
+	if !p.remove(pr) {
+		// Already spliced out by a concurrent drainOneBurst between
+		// hctx.Done() firing and this check: release actually won, even
+		// though its channel-close hasn't been observed yet.
+		return parkReleased
+	}
+	if ctx.Err() != nil {
+		return parkCanceled // the outer (client) ctx is what fired, not the hold timer
+	}
+	return parkExpired
 }
 
 // remove splices pr out of the park queue — linear scan under p.mu, the same

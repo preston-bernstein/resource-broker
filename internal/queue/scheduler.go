@@ -7,6 +7,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -45,7 +46,7 @@ func (c Class) String() string {
 // priority order. Preemption of a running batch request by interactive work is
 // not done here — the scheduler only *signals* that interactive work is waiting
 // (InteractiveWaiting); the batch holder (the Job worker) decides whether to
-// yield its slot, honouring the batch min-run quantum.
+// yield its slot, honoring the batch min-run quantum.
 type Scheduler struct {
 	mu          sync.Mutex
 	inflight    int
@@ -108,7 +109,7 @@ func (s *Scheduler) SetMaxInflight(n int) {
 }
 
 // SetCPUModels names the models that run on CPU only, so Gate serves them
-// without taking the GPU slot or honouring a GPU yield (ADR-0018). A name
+// without taking the GPU slot or honoring a GPU yield (ADR-0018). A name
 // matches with or without Ollama's ":latest" tag. Call before serving
 // traffic; nil or empty turns the bypass off.
 func (s *Scheduler) SetCPUModels(names []string) {
@@ -165,13 +166,13 @@ func (s *Scheduler) Acquire(ctx context.Context, class Class) error {
 		if s.removeWaiter(class, w) {
 			// Still queued: we were never granted the slot.
 			s.mu.Unlock()
-			return ctx.Err()
+			return fmt.Errorf("acquire %s slot: %w", class, ctx.Err())
 		}
 		// Not in queue: Release already granted (and closed w) under lock.
 		// We own the slot; hand it on so it is not leaked.
 		s.mu.Unlock()
 		s.Release()
-		return ctx.Err()
+		return fmt.Errorf("acquire %s slot: %w", class, ctx.Err())
 	}
 }
 

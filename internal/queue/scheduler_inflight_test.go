@@ -54,7 +54,7 @@ func TestInteractiveWaitingSignal(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	go s.Acquire(context.Background(), Interactive) // parks (no free slot)
+	go func() { _ = s.Acquire(context.Background(), Interactive) }() // parks (no free slot)
 
 	select {
 	case <-s.InteractiveWaiting():

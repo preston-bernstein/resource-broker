@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 // TestGateWaitBudgetExceeded: a request that cannot get the slot within its
@@ -21,28 +23,28 @@ func TestGateWaitBudgetExceeded(t *testing.T) {
 	})
 
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 100*time.Millisecond, 0, alwaysServe{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 100 * time.Millisecond, Admission: alwaysServe{}}, upstream))
 	defer srv.Close()
 
 	// Occupy the slot with a long-held request.
 	go func() {
-		resp, err := http.Get(srv.URL + "/hold")
+		resp, err := testhttp.Get(srv.URL + "/hold")
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}()
-	// Wait until the holder actually owns the slot (robust vs a fixed sleep).
+	// Wait until the holder actually owns the slot (more reliable than a fixed sleep).
 	deadline := time.Now().Add(2 * time.Second)
 	for !s.Stats().Busy && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 
 	// Second request cannot get in within 100ms.
-	resp, err := http.Get(srv.URL + "/second")
+	resp, err := testhttp.Get(srv.URL + "/second")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)

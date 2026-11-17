@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 // TestGateSerializes proves two gated requests do not hit the upstream
@@ -27,21 +29,21 @@ func TestGateSerializes(t *testing.T) {
 		}
 		time.Sleep(30 * time.Millisecond)
 		atomic.AddInt32(&inflight, -1)
-		io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok")
 	})
 
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 5*time.Second, 0, alwaysServe{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 5 * time.Second, Admission: alwaysServe{}}, upstream))
 	defer srv.Close()
 
 	const n = 5
 	done := make(chan struct{}, n)
 	for i := 0; i < n; i++ {
 		go func() {
-			resp, err := http.Get(srv.URL)
+			resp, err := testhttp.Get(srv.URL)
 			if err == nil {
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
 			}
 			done <- struct{}{}
 		}()
@@ -68,18 +70,16 @@ func TestGateRequestIDCorrelation(t *testing.T) {
 	defer slog.SetDefault(prevLogger)
 
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok")
 	})
-	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, alwaysServe{}, nil, upstream))
-	defer srv.Close()
+	srv := startGate(t, New(), GateConfig{Class: Batch, Wait: 2 * time.Second, Admission: alwaysServe{}}, upstream)
 
-	resp, err := http.Get(srv.URL + "/api/generate")
+	resp, err := testhttp.Get(srv.URL + "/api/generate")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	reqID := resp.Header.Get("X-Broker-Request-Id")
 	if reqID == "" {
@@ -88,23 +88,22 @@ func TestGateRequestIDCorrelation(t *testing.T) {
 	if len(reqID) != 16 { // 8 bytes, hex-encoded
 		t.Fatalf("X-Broker-Request-Id = %q, want 16 hex chars", reqID)
 	}
-
-	// The access log line must carry the same id, plus path/method — not just
-	// class/outcome/wait_ms as before.
-	found := false
-	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
-		var entry map[string]any
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
-		}
-		if entry["msg"] != "request" {
-			continue
-		}
-		if entry["req_id"] == reqID && entry["path"] == "/api/generate" && entry["method"] == "GET" {
-			found = true
-		}
-	}
-	if !found {
+	if !hasAccessLine(logBuf.String(), reqID, "/api/generate", "GET") {
 		t.Fatalf("no access log line correlates req_id=%q path=/api/generate method=GET\n--- log ---\n%s", reqID, logBuf.String())
 	}
+}
+
+// hasAccessLine reports whether the JSON log holds a "request" line carrying
+// reqID, path and method — not just class/outcome/wait_ms as before.
+func hasAccessLine(log, reqID, path, method string) bool {
+	for _, line := range strings.Split(strings.TrimSpace(log), "\n") {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil || entry["msg"] != "request" {
+			continue
+		}
+		if entry["req_id"] == reqID && entry["path"] == path && entry["method"] == method {
+			return true
+		}
+	}
+	return false
 }

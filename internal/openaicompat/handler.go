@@ -1,14 +1,12 @@
 package openaicompat
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 
+	"github.com/preston-bernstein/resource-broker/internal/httpx"
 	"github.com/preston-bernstein/resource-broker/internal/proxy"
 )
 
@@ -114,34 +112,39 @@ func (h *handler) serveChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stream := true
-	if req.Stream != nil {
-		stream = *req.Stream
+	if !req.streams() {
+		h.serveChatBuffered(w, r, req.upstreamRequest())
+		return
 	}
+	h.serveChatStreaming(w, r, req.upstreamRequest())
+}
 
-	// /api/chat's messages pass through as-is (plain-text case); /api/generate
-	// (and a /api/chat request that omitted messages) build a single
-	// user-role message from prompt, mirroring Client.Generate's own
-	// prompt->message translation.
-	messages := req.Messages
+// streams reports whether the Consumer wants NDJSON streaming. Ollama defaults
+// stream to true when the field is omitted entirely, and that default must be
+// preserved here (FR-25).
+func (r ollamaChatRequest) streams() bool {
+	return r.Stream == nil || *r.Stream
+}
+
+// upstreamRequest translates r into the upstream chat request. /api/chat's
+// messages pass through as-is (plain-text case); /api/generate (and a
+// /api/chat request that omitted messages) build a single user-role message
+// from prompt, mirroring Client.Generate's own prompt->message translation.
+func (r ollamaChatRequest) upstreamRequest() chatRequest {
+	messages := r.Messages
 	if len(messages) == 0 {
-		messages = []map[string]any{{"role": "user", "content": req.Prompt}}
+		messages = []map[string]any{{"role": "user", "content": r.Prompt}}
 		// System, when present, is an /api/generate-only field mapped to a
 		// system-role message prepended before the prompt-derived user
 		// message (FR-29, AC-23). Template and Context (declared on
 		// ollamaChatRequest above) are intentionally never consulted here:
 		// both are accepted without error but have no translated-request
 		// effect.
-		if req.System != "" {
-			messages = append([]map[string]any{{"role": "system", "content": req.System}}, messages...)
+		if r.System != "" {
+			messages = append([]map[string]any{{"role": "system", "content": r.System}}, messages...)
 		}
 	}
-
-	if !stream {
-		h.serveChatBuffered(w, r, req.Model, messages, req.Options)
-		return
-	}
-	h.serveChatStreaming(w, r, req.Model, messages, req.Options)
+	return chatRequest{Model: r.Model, Messages: messages, Options: r.Options}
 }
 
 // serveChatBuffered handles stream:false: the same underlying streaming
@@ -152,15 +155,14 @@ func (h *handler) serveChat(w http.ResponseWriter, r *http.Request) {
 // a non-2xx status, or an in-band SSE error partway through the upstream's
 // own stream — is a genuine pre-response failure from this client's point of
 // view, and goes through writeUpstreamErrorOrFallback.
-func (h *handler) serveChatBuffered(w http.ResponseWriter, r *http.Request, model string, messages []map[string]any, options map[string]any) {
-	text, tokens, err := h.client.chatCompletion(r.Context(), model, messages, options, nil)
+func (h *handler) serveChatBuffered(w http.ResponseWriter, r *http.Request, req chatRequest) {
+	text, tokens, err := h.client.chatCompletion(r.Context(), req, nil)
 	if err != nil {
 		writeUpstreamErrorOrFallback(w, r, err)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ollamaChatChunk{
-		Model:     model,
+	httpx.WriteJSON(w, http.StatusOK, ollamaChatChunk{
+		Model:     req.Model,
 		Response:  text,
 		Done:      true,
 		EvalCount: tokens,
@@ -179,7 +181,7 @@ func (h *handler) serveChatBuffered(w http.ResponseWriter, r *http.Request, mode
 // "response" plus done:true and eval_count, since the full text was already
 // relayed across the preceding lines; sending it again there would double
 // the content for any client that concatenates every line.
-func (h *handler) serveChatStreaming(w http.ResponseWriter, r *http.Request, model string, messages []map[string]any, options map[string]any) {
+func (h *handler) serveChatStreaming(w http.ResponseWriter, r *http.Request, req chatRequest) {
 	// Panic recovery (queue.Gate's outcome trailer is driven by context
 	// state, not by what this handler writes, so a recovered panic here
 	// leaves that composition intact — see plan.md's "Trailer correctness
@@ -187,13 +189,8 @@ func (h *handler) serveChatStreaming(w http.ResponseWriter, r *http.Request, mod
 	// not just the post-header write loop, also catches a panic from the
 	// initial w.WriteHeader/flusher.Flush() below on a bad/closed
 	// ResponseWriter, not only from writes deeper in the loop.
-	defer func() {
-		if rec := recover(); rec != nil {
-			slog.Error("panic in openai handler stream write", "recover", rec)
-		}
-	}()
+	defer logStreamPanic()
 
-	ctx := r.Context()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSONError(w, http.StatusInternalServerError, "streaming unsupported")
@@ -206,7 +203,7 @@ func (h *handler) serveChatStreaming(w http.ResponseWriter, r *http.Request, mod
 	// so it gets the same 503/deferred (or 502 fallback) shape every other
 	// pre-response error in this package uses, rather than the in-band NDJSON
 	// convention reserved for failures after streaming has actually begun.
-	resp, err := h.client.openChatStream(ctx, model, messages, options)
+	resp, err := h.client.openChatStream(r.Context(), req)
 	if err != nil {
 		writeUpstreamErrorOrFallback(w, r, err)
 		return
@@ -220,104 +217,53 @@ func (h *handler) serveChatStreaming(w http.ResponseWriter, r *http.Request, mod
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	enc := json.NewEncoder(w)
-	onChunk := func(delta string, _ int) {
-		enc.Encode(ollamaChatChunk{Model: model, Response: delta, Done: false})
-		flusher.Flush()
-	}
-
-	_, tokens, err := parseSSEStreamChunks(ctx, resp.Body, onChunk)
+	relay := &ndjsonRelay{enc: json.NewEncoder(w), flusher: flusher, model: req.Model}
+	_, tokens, err := parseSSEStreamChunks(r.Context(), resp.Body, relay.chunk)
 	if err != nil {
-		// Mid-stream failure: the 200 status is already committed, so a
-		// status-code change is impossible now. Mirror ollama.Client.
-		// Generate's in-band chunk.Error convention with one final
-		// Ollama-shaped NDJSON line and stop — never attempt w.WriteHeader
-		// again.
-		enc.Encode(map[string]string{"error": "openai: " + err.Error()})
-		flusher.Flush()
+		relay.fail(err)
 		return
 	}
-
-	// Response is intentionally omitted (zero value ""): the full text was
-	// already relayed across the preceding onChunk-driven lines above.
-	enc.Encode(ollamaChatChunk{
-		Model:     model,
-		Done:      true,
-		EvalCount: tokens,
-	})
-	flusher.Flush()
+	relay.finish(tokens)
 }
 
-// openChatStream builds and sends the outbound POST {base}/v1/chat/completions
-// request for an arbitrary messages array (unlike Client.Generate, which
-// always builds a single user-role message from a prompt) and validates the
-// upstream's response — a connection-level error or a non-2xx status — before
-// returning. Splitting this out from response-body consumption lets callers
-// (serveChatStreaming) distinguish a pre-response failure (nothing written to
-// the original client yet, so proxy.WriteUpstreamError's 503/502 shape
-// applies) from a genuine mid-stream failure, which can only be surfaced
-// in-band once bytes have already been relayed. It always requests
-// stream:true from the upstream regardless of the Consumer's own stream
-// preference — the caller decides whether to relay chunks incrementally or
-// buffer them (see serveChatStreaming/serveChatBuffered).
-//
-// On success, the caller owns the returned *http.Response and must eventually
-// drainClose it. On error the response (if any) has already been drained and
-// closed here.
-func (c *Client) openChatStream(ctx context.Context, model string, messages []map[string]any, options map[string]any) (*http.Response, error) {
-	body := map[string]any{
-		"model":          model,
-		"messages":       messages,
-		"stream":         true,
-		"stream_options": map[string]any{"include_usage": true},
+func logStreamPanic() {
+	if rec := recover(); rec != nil {
+		slog.Error("panic in openai handler stream write", "recover", rec)
 	}
-	for k, v := range options {
-		// Never let caller options override the fields this method controls.
-		if k == "model" || k == "messages" || k == "stream" || k == "stream_options" {
-			continue
-		}
-		body[k] = v
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("v1", "chat", "completions"), bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		drainClose(resp)
-		return nil, fmt.Errorf("openai upstream: status %d", resp.StatusCode)
-	}
-	return resp, nil
 }
 
-// chatCompletion runs the full stream:false (buffered) request/response
-// cycle: it opens and validates the upstream stream via openChatStream, then
-// delegates response-body SSE consumption to the shared parseSSEStream
-// helper (internal/openaicompat/stream.go) rather than a second, duplicate
-// implementation. Every error path here — connection-level, non-2xx, or an
-// in-band SSE error partway through the upstream's own stream — is reported
-// before serveChatBuffered has written anything to its client, so it is
-// always a pre-response failure from that caller's point of view.
-func (c *Client) chatCompletion(ctx context.Context, model string, messages []map[string]any, options map[string]any, onTokens func(int)) (string, int, error) {
-	resp, err := c.openChatStream(ctx, model, messages, options)
-	if err != nil {
-		return "", 0, err
-	}
-	defer drainClose(resp)
-	return parseSSEStream(ctx, resp.Body, onTokens)
+// ndjsonRelay writes Ollama-shaped NDJSON lines to a client and flushes after
+// each one.
+type ndjsonRelay struct {
+	enc     *json.Encoder
+	flusher http.Flusher
+	model   string
+}
+
+// send writes one line. An encode error means the client is gone and the 200
+// status is already committed, so there is nobody left to tell.
+func (n *ndjsonRelay) send(v any) {
+	_ = n.enc.Encode(v)
+	n.flusher.Flush()
+}
+
+// chunk relays one intermediate line carrying delta.
+func (n *ndjsonRelay) chunk(delta string, _ int) {
+	n.send(ollamaChatChunk{Model: n.model, Response: delta, Done: false})
+}
+
+// fail surfaces a mid-stream failure: the 200 status is already committed, so
+// a status-code change is impossible now. Mirror ollama.Client.Generate's
+// in-band chunk.Error convention with one final Ollama-shaped NDJSON line and
+// stop — never attempt w.WriteHeader again.
+func (n *ndjsonRelay) fail(err error) {
+	n.send(map[string]string{"error": "openai: " + err.Error()})
+}
+
+// finish writes the final line. Response is intentionally omitted (zero value
+// ""): the full text was already relayed across the preceding chunk lines.
+func (n *ndjsonRelay) finish(tokens int) {
+	n.send(ollamaChatChunk{Model: n.model, Done: true, EvalCount: tokens})
 }
 
 func (h *handler) serveEmbed(w http.ResponseWriter, r *http.Request) {
@@ -335,8 +281,7 @@ func (h *handler) serveEmbed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
 // writeUpstreamErrorOrFallback is the single call site every pre-response
@@ -392,7 +337,5 @@ func isEmptyFieldValue(v any) bool {
 // writeJSONError writes a minimal {"error": msg} JSON body with the given
 // status.
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	httpx.WriteJSON(w, status, map[string]string{"error": msg})
 }

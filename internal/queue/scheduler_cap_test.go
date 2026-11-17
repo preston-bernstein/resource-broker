@@ -18,7 +18,7 @@ func TestQueueFull(t *testing.T) {
 	defer cancel() // releases all parked waiters at test end
 
 	for i := 0; i < MaxWaitersPerClass; i++ {
-		go s.Acquire(ctx, Batch)
+		go func() { _ = s.Acquire(ctx, Batch) }()
 	}
 	waitFor(t, func() bool { return s.Stats().Batch == MaxWaitersPerClass })
 

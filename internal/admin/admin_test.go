@@ -35,23 +35,27 @@ func newMux(c Controller, token string) http.Handler {
 }
 
 func newMuxWithHealth(c Controller, health HealthCheck, token string) http.Handler {
-	return Mux(c, fakeStats{}, health, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "metrics")
-	}), nil, nil, nil, nil, nil, token)
+	return Mux(Options{Controller: c, Stats: fakeStats{}, Health: health, Metrics: metricsStub(), ControlToken: token})
+}
+
+func metricsStub() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "metrics")
+	})
 }
 
 // loopbackReq is httptest.NewRequest with RemoteAddr overridden to loopback
 // (the default, 192.0.2.1:1234, is not loopback) so tests of /control's
 // business logic aren't tripped up by the ADR-0005 auth gate.
 func loopbackReq(method, target string, body io.Reader) *http.Request {
-	req := httptest.NewRequest(method, target, body)
+	req := httptest.NewRequestWithContext(context.Background(), method, target, body)
 	req.RemoteAddr = "127.0.0.1:54321"
 	return req
 }
 
 func TestHealthz(t *testing.T) {
 	rec := httptest.NewRecorder()
-	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/healthz", nil))
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "ok") {
 		t.Fatalf("healthz: %d %q", rec.Code, rec.Body.String())
 	}
@@ -64,7 +68,7 @@ func TestHealthz(t *testing.T) {
 func TestHealthzWithCheckerHealthy(t *testing.T) {
 	rec := httptest.NewRecorder()
 	health := func(context.Context) error { return nil }
-	newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/healthz", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ok") {
 		t.Fatalf("healthz (healthy): %d %q", rec.Code, rec.Body.String())
 	}
@@ -80,7 +84,7 @@ func TestHealthzWithCheckerUnhealthy(t *testing.T) {
 	health := func(context.Context) error {
 		return errors.New("ollama upstream unreachable: dial tcp: connection refused")
 	}
-	newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/healthz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("healthz (unhealthy): status = %d, want 503", rec.Code)
 	}
@@ -102,7 +106,7 @@ func TestHealthzTimeoutBound(t *testing.T) {
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+		newMuxWithHealth(&fakeCtrl{}, health, "").ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/healthz", nil))
 		close(done)
 	}()
 	select {
@@ -152,7 +156,7 @@ func TestControlPostBadJSON(t *testing.T) {
 
 func TestControlMethodNotAllowed(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("PUT", "/control", nil)
+	req := httptest.NewRequestWithContext(context.Background(), "PUT", "/control", nil)
 	newMux(&fakeCtrl{}, "").ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status %d, want 405", rec.Code)
@@ -183,7 +187,39 @@ func TestStatusBaselineFixture(t *testing.T) {
 	if err := json.Unmarshal(fixtureBytes, &fixture); err != nil {
 		t.Fatalf("fixture is not valid JSON: %v", err)
 	}
+	requireBaselineKeys(t, fixture)
 
+	rec := httptest.NewRecorder()
+	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var live map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &live); err != nil {
+		t.Fatalf("live /status body is not valid JSON: %v", err)
+	}
+	requireScheduleShape(t, live)
+	delete(live, "schedule")
+	delete(fixture, "schedule")
+
+	// json.Marshal sorts map keys, so equal documents marshal to equal bytes.
+	liveJSON, err := json.Marshal(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureJSON, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(liveJSON) != string(fixtureJSON) {
+		t.Fatalf("live /status (minus schedule) does not match testdata/status_baseline.json:\nlive:    %s\nfixture: %s", liveJSON, fixtureJSON)
+	}
+}
+
+// requireBaselineKeys fails unless fixture has exactly the pre-feature
+// top-level keys.
+func requireBaselineKeys(t *testing.T, fixture map[string]any) {
+	t.Helper()
 	if _, ok := fixture["idle"]; ok {
 		t.Fatal(`fixture must not contain an "idle" key — it must represent the pre-feature /status shape`)
 	}
@@ -203,52 +239,26 @@ func TestStatusBaselineFixture(t *testing.T) {
 			t.Fatalf("fixture is missing expected top-level key %q", k)
 		}
 	}
+}
 
-	rec := httptest.NewRecorder()
-	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d", rec.Code)
-	}
-	var live map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &live); err != nil {
-		t.Fatalf("live /status body is not valid JSON: %v", err)
-	}
-
-	// "schedule" is time-dependent (see comment above); check shape only.
+// requireScheduleShape checks the time-dependent "schedule" section by shape
+// only (see TestStatusBaselineFixture).
+func requireScheduleShape(t *testing.T, live map[string]any) {
+	t.Helper()
 	sched, ok := live["schedule"].(map[string]any)
 	if !ok {
 		t.Fatal(`live "schedule" is not an object`)
 	}
-	if _, ok := sched["active_windows"]; !ok {
-		t.Fatal(`live "schedule" missing "active_windows"`)
-	}
-	if _, ok := sched["safe_for_tdarr"]; !ok {
-		t.Fatal(`live "schedule" missing "safe_for_tdarr"`)
-	}
-	delete(live, "schedule")
-	delete(fixture, "schedule")
-
-	liveNorm, err := json.Marshal(live)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixtureNorm, err := json.Marshal(fixture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var liveCanon, fixtureCanon map[string]any
-	json.Unmarshal(liveNorm, &liveCanon)
-	json.Unmarshal(fixtureNorm, &fixtureCanon)
-	liveCanonJSON, _ := json.Marshal(liveCanon)
-	fixtureCanonJSON, _ := json.Marshal(fixtureCanon)
-	if string(liveCanonJSON) != string(fixtureCanonJSON) {
-		t.Fatalf("live /status (minus schedule) does not match testdata/status_baseline.json:\nlive:    %s\nfixture: %s", liveCanonJSON, fixtureCanonJSON)
+	for _, key := range []string{"active_windows", "safe_for_tdarr"} {
+		if _, ok := sched[key]; !ok {
+			t.Fatalf("live \"schedule\" missing %q", key)
+		}
 	}
 }
 
 func TestStatus(t *testing.T) {
 	rec := httptest.NewRecorder()
-	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	newMux(&fakeCtrl{}, "").ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/status", nil))
 	body := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(body, `"queue"`) || !strings.Contains(body, `"yield"`) {
 		t.Fatalf("status: %d %q", rec.Code, body)
@@ -260,10 +270,8 @@ func TestStatus(t *testing.T) {
 func TestStatusWithIdleStatus(t *testing.T) {
 	rec := httptest.NewRecorder()
 	idleStatus := func() any { return []string{"fake"} }
-	mux := Mux(&fakeCtrl{}, fakeStats{}, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "metrics")
-	}), nil, nil, nil, nil, idleStatus, "")
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	mux := Mux(Options{Controller: &fakeCtrl{}, Stats: fakeStats{}, Metrics: metricsStub(), IdleStatus: idleStatus})
+	mux.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/status", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
 	}
@@ -280,10 +288,8 @@ func TestStatusWithIdleStatus(t *testing.T) {
 // "idle" key when idleStatus is nil.
 func TestStatusWithoutIdleStatus(t *testing.T) {
 	rec := httptest.NewRecorder()
-	mux := Mux(&fakeCtrl{}, fakeStats{}, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "metrics")
-	}), nil, nil, nil, nil, nil, "")
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	mux := Mux(Options{Controller: &fakeCtrl{}, Stats: fakeStats{}, Metrics: metricsStub()})
+	mux.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/status", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
 	}
@@ -302,7 +308,7 @@ func TestControlGetNeverRequiresAuth(t *testing.T) {
 	// GET /control (state read) stays open even with a token configured and a
 	// non-loopback, unauthenticated caller.
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/control", nil)
+	req := httptest.NewRequestWithContext(context.Background(), "GET", "/control", nil)
 	newMux(&fakeCtrl{}, "s3cret").ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("GET /control status %d, want 200", rec.Code)
@@ -314,7 +320,7 @@ func TestControlPostNoTokenNonLoopbackRejected(t *testing.T) {
 	// must be rejected (loopback-only fallback).
 	c := &fakeCtrl{}
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/control", strings.NewReader(`{"mode":"yield"}`))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/control", strings.NewReader(`{"mode":"yield"}`))
 	newMux(c, "").ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status %d, want 401", rec.Code)
@@ -357,7 +363,7 @@ func TestControlPostTokenConfiguredMissingHeaderRejected(t *testing.T) {
 func TestControlPostTokenMismatchRejected(t *testing.T) {
 	c := &fakeCtrl{}
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/control", strings.NewReader(`{"mode":"yield"}`))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/control", strings.NewReader(`{"mode":"yield"}`))
 	req.Header.Set("Authorization", "Bearer wrong-token")
 	newMux(c, "s3cret").ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
@@ -373,7 +379,7 @@ func TestControlPostTokenMatchAccepted(t *testing.T) {
 	// require loopback).
 	c := &fakeCtrl{}
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/control", strings.NewReader(`{"mode":"yield"}`))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/control", strings.NewReader(`{"mode":"yield"}`))
 	req.Header.Set("Authorization", "Bearer s3cret")
 	newMux(c, "s3cret").ServeHTTP(rec, req)
 	if rec.Code != 200 {

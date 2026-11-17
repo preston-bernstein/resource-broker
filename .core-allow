@@ -1,6 +1,0 @@
-# Existing findings accepted in the pack-compliance pass. One per line: <check> <path> <reason>
-size internal/acceptance_test.go existing large file; split by domain when next changed
-size internal/config/config_test.go existing large file; split by domain when next changed
-size internal/openaicompat/handler_test.go existing large file; split by domain when next changed
-size internal/yield/yield.go existing large file; split by domain when next changed
-size internal/yield/yield_test.go existing large file; split by domain when next changed

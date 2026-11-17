@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
@@ -29,7 +30,7 @@ func (f *countingFakeBackend) Proxy() http.Handler {
 	f.mu.Unlock()
 	return f.handler
 }
-func (f *countingFakeBackend) Generate(ctx context.Context, model, prompt string, options map[string]any, onTokens func(int)) (string, error) {
+func (f *countingFakeBackend) Generate(ctx context.Context, req inference.Request) (string, error) {
 	return "", nil
 }
 func (f *countingFakeBackend) Reachable(ctx context.Context) error { return nil }
@@ -60,7 +61,7 @@ func (fakeIdleDetector) Detect() (string, bool) { return "", false }
 // router_test.go's fakeBackend) use to construct test fixtures.
 func newTestIdleController(t *testing.T, idleTimeout time.Duration) *yield.Controller {
 	t.Helper()
-	ctrl := yield.NewWithConfirmMulti(fakeIdleDetector{}, []yield.Unloader{fakeIdleUnloader{}}, nil, time.Hour, 1)
+	ctrl := yield.NewWithConfirmMulti(fakeIdleDetector{}, []yield.Unloader{fakeIdleUnloader{}}, nil, yield.Polling{Interval: time.Hour, ConfirmPolls: 1})
 	ctrl.ConfigureIdle([]time.Duration{idleTimeout})
 	return ctrl
 }
@@ -79,7 +80,7 @@ func TestWithActivityTrackingDispatchUpdatesController(t *testing.T) {
 
 	tracked := WithActivityTracking(fb, ctrl, 0)
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 	tracked.Proxy().ServeHTTP(w, req)
 

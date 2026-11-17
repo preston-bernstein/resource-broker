@@ -35,11 +35,13 @@ if [ ! -d "$METRICS_DIR" ]; then
 fi
 
 # Count jobs
-# shellcheck disable=SC2012 # existing pattern; unchanged in the pack-compliance pass
-TOTAL_JOBS=$(ls -1 "$METRICS_DIR"/*.json 2>/dev/null | wc -l)
+metrics_files=()
+for metrics_file in "$METRICS_DIR"/*.json; do
+  [ -e "$metrics_file" ] && metrics_files+=("$metrics_file")
+done
+TOTAL_JOBS=${#metrics_files[@]}
 
-# shellcheck disable=SC2086 # existing pattern; unchanged in the pack-compliance pass
-if [ $TOTAL_JOBS -eq 0 ]; then
+if [ "$TOTAL_JOBS" -eq 0 ]; then
   echo "No job metrics found in $METRICS_DIR"
   exit 0
 fi
@@ -132,8 +134,7 @@ case "$FORMAT" in
     echo "By Status:"
     for status in completed failed queued running pending; do
       count=$(jq -r "select(.status == \"$status\") | .job_id" "$METRICS_DIR"/*.json 2>/dev/null | wc -l)
-      # shellcheck disable=SC2086 # existing pattern; unchanged in the pack-compliance pass
-      if [ $count -gt 0 ]; then
+      if [ "$count" -gt 0 ]; then
         echo "  $status: $count"
       fi
     done
