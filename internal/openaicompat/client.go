@@ -62,57 +62,44 @@ type GenerateRequest struct {
 // signature and error-handling shape (including ctx.Err() short-circuiting on
 // cancellation) for symmetry and testability.
 //
-// Response-body SSE parsing is implemented by parseSSEStream (internal/
-// openaicompat/stream.go, a separate task) — this method builds and sends the
-// request and maps a non-2xx response to an error; it delegates the success
-// path's body consumption to that helper.
+// Request building and the non-2xx check live in openChatStream; the response
+// body's SSE parsing lives in parseSSEStream (internal/openaicompat/stream.go).
 func (c *Client) Generate(ctx context.Context, req GenerateRequest, onTokens func(int)) (string, int, error) {
-	body := map[string]any{
-		"model": req.Model,
-		"messages": []map[string]string{
-			{"role": "user", "content": req.Prompt},
-		},
-		"stream":         true,
-		"stream_options": map[string]any{"include_usage": true},
-	}
-	for k, v := range req.Options {
-		// Never let caller options override the fields the client controls.
-		if k == "model" || k == "messages" || k == "stream" || k == "stream_options" {
-			continue
-		}
-		body[k] = v
-	}
+	return c.chatCompletion(ctx, chatRequest{
+		Model:    req.Model,
+		Messages: []map[string]any{{"role": "user", "content": req.Prompt}},
+		Options:  req.Options,
+	}, onTokens)
+}
+
+// postJSON POSTs body as JSON to the upstream path joined from elem, adding the
+// Authorization header when an API key is set. The caller owns the response
+// and its status check.
+func (c *Client) postJSON(ctx context.Context, body any, elem ...string) (*http.Response, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return "", 0, err
+		return nil, fmt.Errorf("encode upstream request: %w", err)
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("v1", "chat", "completions"), bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(elem...), bytes.NewReader(payload))
 	if err != nil {
-		return "", 0, err
+		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
-
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return "", 0, err
+		return nil, fmt.Errorf("openai upstream: %w", err)
 	}
-	defer drainClose(resp)
-	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("openai upstream: status %d", resp.StatusCode)
-	}
-
-	return parseSSEStream(ctx, resp.Body, onTokens)
+	return resp, nil
 }
 
 // drainClose reads any remaining body and closes it so the keep-alive
 // connection can be reused instead of leaking.
 func drainClose(resp *http.Response) {
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 }
 
 // url joins the client's base URL with elem using proper URL joining (never

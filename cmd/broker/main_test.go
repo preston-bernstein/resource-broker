@@ -31,6 +31,7 @@ import (
 
 	"github.com/preston-bernstein/resource-broker/internal/backend"
 	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
@@ -40,39 +41,64 @@ import (
 // test in this package.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("freePort: %v", err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// buildBrokerBinary installs the broker into a temp dir and returns the path.
+// `go install` with GOBIN keeps every argument constant.
 func buildBrokerBinary(t *testing.T) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "ollama-broker-test")
-	cmd := exec.Command("go", "build", "-o", bin, ".")
-	cmd.Dir = "."
+	dir := t.TempDir()
+	cmd := exec.CommandContext(t.Context(), "go", "install", ".")
+	cmd.Env = append(os.Environ(), "GOBIN="+dir)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
+		t.Fatalf("go install: %v\n%s", err, out)
 	}
-	return bin
+	return filepath.Join(dir, "broker")
+}
+
+// launchBroker starts the binary at bin with env added to the environment. It
+// returns the process, its combined output, and a channel that yields the exit
+// error once it ends. The Cmd is built from a path rather than a command name
+// and without a context: each test owns the process lifecycle (SIGTERM, then
+// Kill) so it can read the shutdown output.
+func launchBroker(t *testing.T, bin string, env []string) (*exec.Cmd, *syncBuffer, <-chan error) {
+	t.Helper()
+	buf := &syncBuffer{}
+	cmd := &exec.Cmd{Path: bin, Args: []string{bin}, Env: append(os.Environ(), env...), Stdout: buf, Stderr: buf}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	return cmd, buf, done
+}
+
+// stopBroker asks the process to exit, killing it if it takes over 3s. The
+// exit error is logged, not asserted: a signal exit is the expected outcome.
+func stopBroker(t *testing.T, cmd *exec.Cmd, done <-chan error) {
+	t.Helper()
+	// Signal fails only if the process already exited, which is the goal here.
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case werr := <-done:
+		t.Logf("broker exited: %v", werr)
+	case <-time.After(3 * time.Second):
+		// Kill fails only if the process already exited; done reports the outcome.
+		_ = cmd.Process.Kill()
+		t.Logf("broker killed after timeout; exit: %v", <-done)
+	}
 }
 
 func runBrokerBriefly(t *testing.T, bin string, env []string) (stdout string, err error) {
 	t.Helper()
-	cmd := exec.Command(bin)
-	cmd.Env = append(os.Environ(), env...)
-	var buf syncBuffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	if startErr := cmd.Start(); startErr != nil {
-		t.Fatalf("start broker: %v", startErr)
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	cmd, buf, done := launchBroker(t, bin, env)
 
 	// Poll for the startup log line rather than sleeping a fixed window —
 	// under -race, startup is measurably slower due to instrumentation
@@ -90,13 +116,7 @@ func runBrokerBriefly(t *testing.T, bin string, env []string) (stdout string, er
 		}
 	}
 
-	_ = cmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
-	}
+	stopBroker(t, cmd, done)
 	return buf.String(), nil
 }
 
@@ -111,7 +131,11 @@ type syncBuffer struct {
 func (b *syncBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.Write(p)
+	n, err := b.buf.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("buffer write: %w", err)
+	}
+	return n, nil
 }
 
 func (b *syncBuffer) String() string {
@@ -123,44 +147,24 @@ func (b *syncBuffer) String() string {
 func TestMainStartsWithoutPanic(t *testing.T) {
 	bin := buildBrokerBinary(t)
 
+	// Each case adds its backend settings to these listener addresses.
+	listeners := []string{
+		"BROKER_CONTROL_ADDR=:0",
+		"BROKER_INTERACTIVE_ADDR=:0",
+		"BROKER_BATCH_ADDR=:0",
+	}
 	cases := []struct {
 		name string
 		env  []string
 	}{
-		{
-			name: "default (UPSTREAM_BACKEND unset, ollama)",
-			env: []string{
-				"OLLAMA_URL=http://127.0.0.1:19999",
-				"BROKER_CONTROL_ADDR=:0",
-				"BROKER_INTERACTIVE_ADDR=:0",
-				"BROKER_BATCH_ADDR=:0",
-			},
-		},
-		{
-			name: "explicit ollama",
-			env: []string{
-				"UPSTREAM_BACKEND=ollama",
-				"OLLAMA_URL=http://127.0.0.1:19999",
-				"BROKER_CONTROL_ADDR=:0",
-				"BROKER_INTERACTIVE_ADDR=:0",
-				"BROKER_BATCH_ADDR=:0",
-			},
-		},
-		{
-			name: "openai backend",
-			env: []string{
-				"UPSTREAM_BACKEND=openai",
-				"UPSTREAM_URL=http://127.0.0.1:19999",
-				"BROKER_CONTROL_ADDR=:0",
-				"BROKER_INTERACTIVE_ADDR=:0",
-				"BROKER_BATCH_ADDR=:0",
-			},
-		},
+		{"default (UPSTREAM_BACKEND unset, ollama)", []string{"OLLAMA_URL=http://127.0.0.1:19999"}},
+		{"explicit ollama", []string{"UPSTREAM_BACKEND=ollama", "OLLAMA_URL=http://127.0.0.1:19999"}},
+		{"openai backend", []string{"UPSTREAM_BACKEND=openai", "UPSTREAM_URL=http://127.0.0.1:19999"}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := runBrokerBriefly(t, bin, tc.env)
+			out, err := runBrokerBriefly(t, bin, append(tc.env, listeners...))
 			if strings.Contains(out, "panic:") {
 				t.Fatalf("broker panicked on startup:\n%s", out)
 			}
@@ -199,14 +203,8 @@ func (stubDetector) Detect() (reason string, contended bool) { return "", false 
 // URL with nothing listening — that's fine, TrackActivity's bookkeeping
 // runs regardless of what the wrapped handler ultimately does or returns).
 func TestBuildBrokerWiresActivityTrackingIntoRouter(t *testing.T) {
-	defaultURL, err := url.Parse("http://127.0.0.1:19999")
-	if err != nil {
-		t.Fatalf("parse default url: %v", err)
-	}
-	routeURL, err := url.Parse("http://127.0.0.1:19998")
-	if err != nil {
-		t.Fatalf("parse route url: %v", err)
-	}
+	defaultURL := mustParseURL(t, "http://127.0.0.1:19999")
+	routeURL := mustParseURL(t, "http://127.0.0.1:19998")
 
 	cfg := &config.Config{
 		DetectInterval:      time.Minute,
@@ -232,18 +230,12 @@ func TestBuildBrokerWiresActivityTrackingIntoRouter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildBroker: %v", err)
 	}
-	if router == nil {
-		t.Fatal("buildBroker: router is nil, want a configured Router")
-	}
-	if activeBackend == nil {
-		t.Fatal("buildBroker: activeBackend is nil")
-	}
-	if ctrl == nil {
-		t.Fatal("buildBroker: ctrl is nil")
-	}
-	if idleStatus == nil {
-		t.Fatal("buildBroker: idleStatus is nil, want ctrl.IdleSummary (a route has a nonzero IdleTimeout)")
-	}
+	requireBuilt(t, map[string]bool{
+		"router is nil, want a configured Router": router == nil,
+		"activeBackend is nil":                    activeBackend == nil,
+		"ctrl is nil":                             ctrl == nil,
+		"idleStatus is nil, want ctrl.IdleSummary (a route has a nonzero IdleTimeout)": idleStatus == nil,
+	})
 
 	// Dispatch a request through the REAL Router returned by buildBroker,
 	// for the model routed to the idle-tracked route backend. This is the
@@ -251,10 +243,36 @@ func TestBuildBrokerWiresActivityTrackingIntoRouter(t *testing.T) {
 	// captured the undecorated backend (the ordering bug), this request
 	// would never reach ctrl.TrackActivity's bookkeeping.
 	handler := router.ProxyForLane("interactive")
-	req := httptest.NewRequest("POST", "/api/generate", strings.NewReader(`{"model":"test-model"}`))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/api/generate", strings.NewReader(`{"model":"test-model"}`))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
 
+	requireRouteTracked(t, idleStatus, routeURL.String())
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse url %q: %v", raw, err)
+	}
+	return u
+}
+
+// requireBuilt fails for each entry whose condition is true; the key is the
+// message.
+func requireBuilt(t *testing.T, missing map[string]bool) {
+	t.Helper()
+	for msg, isMissing := range missing {
+		if isMissing {
+			t.Fatalf("buildBroker: %s", msg)
+		}
+	}
+}
+
+// requireRouteTracked checks that idleStatus reports one entry, for label,
+// whose last dispatch was just now.
+func requireRouteTracked(t *testing.T, idleStatus func() any, label string) {
+	t.Helper()
 	summaryAny := idleStatus()
 	summary, ok := summaryAny.([]yield.IdleSummaryEntry)
 	if !ok {
@@ -264,8 +282,8 @@ func TestBuildBrokerWiresActivityTrackingIntoRouter(t *testing.T) {
 		t.Fatalf("idleStatus(): got %d entries, want 1 (only the route has IdleTimeout configured): %+v", len(summary), summary)
 	}
 	entry := summary[0]
-	if entry.Label != routeURL.String() {
-		t.Fatalf("idleStatus(): entry label = %q, want %q", entry.Label, routeURL.String())
+	if entry.Label != label {
+		t.Fatalf("idleStatus(): entry label = %q, want %q", entry.Label, label)
 	}
 	since, err := time.ParseDuration(entry.SinceLastDispatch)
 	if err != nil {
@@ -318,117 +336,47 @@ func TestMainInteractiveProxyTracksActivityOnNoRoutesPath(t *testing.T) {
 	defer upstream.Close()
 
 	interactivePort := freePort(t)
-	batchPort := freePort(t)
 	controlPort := freePort(t)
-
-	env := []string{
+	buf := startBroker(t, bin, []string{
 		"UPSTREAM_BACKEND=openai",
 		"UPSTREAM_URL=" + upstream.URL,
 		"UPSTREAM_UNIT_NAME=main-test-fake-unit.service",
 		"UPSTREAM_IDLE_TIMEOUT=200ms",
 		"BROKER_DETECT_INTERVAL=50ms",
 		fmt.Sprintf("BROKER_INTERACTIVE_ADDR=127.0.0.1:%d", interactivePort),
-		fmt.Sprintf("BROKER_BATCH_ADDR=127.0.0.1:%d", batchPort),
+		fmt.Sprintf("BROKER_BATCH_ADDR=127.0.0.1:%d", freePort(t)),
 		fmt.Sprintf("BROKER_CONTROL_ADDR=127.0.0.1:%d", controlPort),
-	}
-
-	cmd := exec.Command(bin)
-	cmd.Env = append(os.Environ(), env...)
-	var buf syncBuffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start broker: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	defer func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-	}()
-
-	// Wait for real startup.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) && !strings.Contains(buf.String(), `"msg":"broker up"`) {
-		if strings.Contains(buf.String(), "panic:") {
-			t.Fatalf("broker panicked on startup:\n%s", buf.String())
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !strings.Contains(buf.String(), `"msg":"broker up"`) {
-		t.Fatalf("broker did not log a clean startup within deadline:\n%s", buf.String())
-	}
+	})
+	waitForBrokerUp(t, buf)
 
 	statusURL := fmt.Sprintf("http://127.0.0.1:%d/status", controlPort)
-	fetchStatus := func() map[string]any {
-		t.Helper()
-		resp, err := http.Get(statusURL)
-		if err != nil {
-			t.Fatalf("GET /status: %v", err)
-		}
-		defer resp.Body.Close()
-		var out map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			t.Fatalf("decode /status: %v", err)
-		}
-		return out
-	}
-
-	// Wait for a real idle-unload to fire (200ms configured timeout, 50ms
-	// detect interval — should fire well within 3s). systemctl doesn't exist
-	// on every CI/dev host, so the underlying Unload call may itself fail —
-	// that's fine and expected (WARN-logged, not fatal, per ADR-0014's
-	// documented failure mode); what matters here is idle_unloaded flips to
-	// true, proving checkIdleLocked genuinely fired.
-	idleDeadline := time.Now().Add(3 * time.Second)
-	var sawIdleUnloaded bool
-	for time.Now().Before(idleDeadline) {
-		st := fetchStatus()
-		idle, _ := st["idle"].([]any)
-		if len(idle) == 1 {
-			entry, _ := idle[0].(map[string]any)
-			if b, _ := entry["idle_unloaded"].(bool); b {
-				sawIdleUnloaded = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !sawIdleUnloaded {
-		t.Fatalf("instance never reported idle_unloaded=true within 3s; last /status:\n%+v\nbroker output:\n%s", fetchStatus(), buf.String())
-	}
+	waitForIdleUnload(t, statusURL, buf)
 
 	// Widen the gap deliberately: wait well past the 200ms idle timeout
 	// before dispatching the test's own request, so "since_last_dispatch
 	// never reset" (the bug) and "since_last_dispatch reset to ~0 just now"
-	// (correct) are unambiguous by a wide margin — a loose comparison here
-	// (e.g. "< 2s") can pass in BOTH the buggy and fixed cases if the whole
-	// test runs faster than the threshold, which is exactly the false-
-	// negative shape this comment exists to rule out (caught in this
-	// feature's own verify pass: an earlier draft of this test used a loose
-	// 2s bound and passed unchanged with the bug reintroduced).
+	// (correct) are unambiguous by a wide margin. A loose bound can pass in
+	// BOTH cases if the whole test runs faster than the threshold.
 	time.Sleep(1200 * time.Millisecond)
 
-	// The regression check: dispatch one real request through the broker's
-	// actual interactive listener (main()'s real interactiveProxy, not a
-	// handler built directly by a unit test), then confirm /status shows
-	// activity tracking actually moved. Before the fix, this next request
-	// would never touch ctrl.TrackActivity — since_last_dispatch would keep
-	// climbing from the original idle-unload time (now >1.4s ago) instead of
-	// resetting to near-zero.
+	// Dispatch one real request through the broker's actual interactive
+	// listener (run()'s real interactiveProxy, not a handler built directly by
+	// a unit test). Before the fix it never touched ctrl.TrackActivity.
 	reqURL := fmt.Sprintf("http://127.0.0.1:%d/api/generate", interactivePort)
-	resp, err := http.Post(reqURL, "application/json", strings.NewReader(`{"model":"fake-model","prompt":"hi"}`))
+	resp, err := testhttp.Post(reqURL, "application/json", strings.NewReader(`{"model":"fake-model","prompt":"hi"}`))
 	if err != nil {
 		t.Fatalf("POST /api/generate: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
-	st := fetchStatus()
+	requireActivityTracked(t, statusURL, buf)
+}
+
+// requireActivityTracked checks that /status shows the request just sent
+// through the interactive listener moved activity tracking.
+func requireActivityTracked(t *testing.T, statusURL string, buf *syncBuffer) {
+	t.Helper()
+	st := fetchStatus(t, statusURL)
 	idle, _ := st["idle"].([]any)
 	if len(idle) != 1 {
 		t.Fatalf("/status \"idle\" section: got %d entries, want 1: %+v", len(idle), st)
@@ -449,6 +397,66 @@ func TestMainInteractiveProxyTracksActivityOnNoRoutesPath(t *testing.T) {
 			"(the bug: main() used the pre-buildBroker be instead of the returned activeBackend). Full /status: %+v\nbroker output:\n%s",
 			since, st, buf.String())
 	}
+}
+
+// startBroker starts the broker binary with env and stops it when the test
+// ends. The returned buffer holds its combined output.
+func startBroker(t *testing.T, bin string, env []string) *syncBuffer {
+	t.Helper()
+	cmd, buf, done := launchBroker(t, bin, env)
+	t.Cleanup(func() { stopBroker(t, cmd, done) })
+	return buf
+}
+
+// waitForBrokerUp waits for the real startup log line.
+func waitForBrokerUp(t *testing.T, buf *syncBuffer) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(buf.String(), `"msg":"broker up"`) {
+		if strings.Contains(buf.String(), "panic:") {
+			t.Fatalf("broker panicked on startup:\n%s", buf.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(buf.String(), `"msg":"broker up"`) {
+		t.Fatalf("broker did not log a clean startup within deadline:\n%s", buf.String())
+	}
+}
+
+func fetchStatus(t *testing.T, statusURL string) map[string]any {
+	t.Helper()
+	resp, err := testhttp.Get(statusURL)
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode /status: %v", err)
+	}
+	return out
+}
+
+// waitForIdleUnload waits for a real idle-unload to fire (200ms configured
+// timeout, 50ms detect interval — should fire well within 3s). systemctl
+// doesn't exist on every CI/dev host, so the underlying Unload call may itself
+// fail — that's fine and expected (WARN-logged, not fatal, per ADR-0014's
+// documented failure mode); what matters here is idle_unloaded flips to
+// true, proving checkIdleLocked genuinely fired.
+func waitForIdleUnload(t *testing.T, statusURL string, buf *syncBuffer) {
+	t.Helper()
+	idleDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(idleDeadline) {
+		idle, _ := fetchStatus(t, statusURL)["idle"].([]any)
+		if len(idle) == 1 {
+			entry, _ := idle[0].(map[string]any)
+			if b, _ := entry["idle_unloaded"].(bool); b {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("instance never reported idle_unloaded=true within 3s; last /status:\n%+v\nbroker output:\n%s", fetchStatus(t, statusURL), buf.String())
 }
 
 // recordingUnloader records each Unload/Reload as "stop <unit>"/"start <unit>".
@@ -557,7 +565,7 @@ func TestBuildBrokerWiresRouteDisplacement(t *testing.T) {
 	go ctrl.Run(ctx)
 	expectCall(t, calls, "start gpu-worker.service")
 
-	req := httptest.NewRequest("POST", "/api/chat", strings.NewReader(`{"model":"qwen2.5","messages":[]}`))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", "/api/chat", strings.NewReader(`{"model":"qwen2.5","messages":[]}`))
 	router.Proxy().ServeHTTP(httptest.NewRecorder(), req)
 	expectCall(t, calls, "stop gpu-worker.service")
 	expectCall(t, calls, "start vllm")

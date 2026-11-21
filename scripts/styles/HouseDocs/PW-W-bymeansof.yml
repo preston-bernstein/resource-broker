@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'by'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bby means of\\b": "by"

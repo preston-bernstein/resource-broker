@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Fundamentals are already basic. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bbasic fundamentals\\b": "fundamentals"

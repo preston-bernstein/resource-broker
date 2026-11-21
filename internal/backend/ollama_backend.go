@@ -2,9 +2,11 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/ollama"
 	"github.com/preston-bernstein/resource-broker/internal/proxy"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
@@ -34,15 +36,20 @@ func (b *ollamaBackend) Proxy() http.Handler {
 
 // Generate mirrors cmd/broker/main.go's genAdapter.Generate: bridges the
 // Ollama client's streaming Generate to the Job worker's Generator interface.
-func (b *ollamaBackend) Generate(ctx context.Context, model, prompt string, opts map[string]any, onTokens func(int)) (string, error) {
-	out, _, err := b.c.Generate(ctx, ollama.GenerateRequest{Model: model, Prompt: prompt, Options: opts}, onTokens)
-	return out, err
+func (b *ollamaBackend) Generate(ctx context.Context, req inference.Request) (string, error) {
+	out, _, err := b.c.Generate(ctx, ollama.GenerateRequest{Model: req.Model, Prompt: req.Prompt, Options: req.Options}, req.OnTokens)
+	if err != nil {
+		return "", fmt.Errorf("ollama generate: %w", err)
+	}
+	return out, nil
 }
 
 // Reachable mirrors main.go's healthCheck's Ollama-reachability check.
 func (b *ollamaBackend) Reachable(ctx context.Context) error {
-	_, err := b.c.LoadedModels(ctx)
-	return err
+	if _, err := b.c.LoadedModels(ctx); err != nil {
+		return fmt.Errorf("ollama reachable: %w", err)
+	}
+	return nil
 }
 
 // Unloader returns the *ollama.Client, which already implements

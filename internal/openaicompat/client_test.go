@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -164,43 +165,8 @@ func TestGenerate_OptionsFilterReservedKeys(t *testing.T) {
 // present on the final chunk.
 func TestGenerate_SSEStreaming_Progressive(t *testing.T) {
 	proceed := make(chan struct{})
-	contents := []string{"Hello", ", ", "world"}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			t.Fatal("test server ResponseWriter does not support flushing")
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		for i, c := range contents {
-			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", c)
-			flusher.Flush()
-			if i < len(contents)-1 {
-				// Bounded, not a bare <-proceed: if a client bug (or an
-				// injected mutant, under mutation testing) never reaches the
-				// onTokens callback that sends to proceed, this goroutine
-				// must still exit so the deferred srv.Close() below (which
-				// waits for in-flight handlers) doesn't hang the whole test
-				// binary until the outer `go test -timeout` kills it.
-				select {
-				case <-proceed:
-				case <-time.After(500 * time.Millisecond):
-				}
-			}
-		}
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"completion_tokens\":3}}\n\n")
-		flusher.Flush()
-		fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
-	}))
-	defer srv.Close()
-
-	base, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse test server URL: %v", err)
-	}
-	c := New(base, "")
+	srv := progressiveServer(t, proceed, []string{"Hello", ", ", "world"})
+	c := New(mustParseURL(t, srv.URL), "")
 
 	var gotCounts []int
 	onTokens := func(n int) {
@@ -222,15 +188,44 @@ func TestGenerate_SSEStreaming_Progressive(t *testing.T) {
 	if tokens != 3 {
 		t.Fatalf("tokens = %d, want 3 (from usage.completion_tokens)", tokens)
 	}
-	wantCounts := []int{1, 2, 3}
-	if len(gotCounts) != len(wantCounts) {
+	if wantCounts := []int{1, 2, 3}; !slices.Equal(gotCounts, wantCounts) {
 		t.Fatalf("onTokens calls = %v, want %v", gotCounts, wantCounts)
 	}
-	for i, want := range wantCounts {
-		if gotCounts[i] != want {
-			t.Fatalf("onTokens calls = %v, want %v", gotCounts, wantCounts)
+}
+
+// progressiveServer streams each of contents as its own SSE chunk, waiting for
+// a signal on proceed between chunks, then a usage chunk and [DONE].
+func progressiveServer(t *testing.T, proceed <-chan struct{}, contents []string) *httptest.Server {
+	t.Helper()
+	return startServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("test server ResponseWriter does not support flushing")
+			return
 		}
-	}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for i, c := range contents {
+			writeSSE(w, sseDelta(c))
+			flusher.Flush()
+			if i < len(contents)-1 {
+				// Bounded, not a bare <-proceed: if a client bug (or an
+				// injected mutant, under mutation testing) never reaches the
+				// onTokens callback that sends to proceed, this goroutine
+				// must still exit so the server's Close (which waits for
+				// in-flight handlers) doesn't hang the whole test binary
+				// until the outer `go test -timeout` kills it.
+				select {
+				case <-proceed:
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		}
+		writeSSE(w, "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"completion_tokens\":3}}\n\n")
+		flusher.Flush()
+		writeSSE(w, sseDone)
+		flusher.Flush()
+	}))
 }
 
 // TestGenerate_SSEStreaming_ErrorMidStream verifies that when the upstream
@@ -243,11 +238,11 @@ func TestGenerate_SSEStreaming_ErrorMidStream(t *testing.T) {
 		flusher := w.(http.Flusher)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"foo\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"foo\"}}]}\n\n")
 		flusher.Flush()
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"bar\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"bar\"}}]}\n\n")
 		flusher.Flush()
-		fmt.Fprint(w, "data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n")
 		flusher.Flush()
 	}))
 	defer srv.Close()
@@ -281,13 +276,13 @@ func TestGenerate_SSEStreaming_UsageOmitted(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		for _, c := range []string{"a", "b", "c", "d"} {
-			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", c)
+			_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", c)
 			flusher.Flush()
 		}
 		// Final chunk carries no usage field at all.
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{}}]}\n\n")
 		flusher.Flush()
-		fmt.Fprint(w, "data: [DONE]\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 	}))
 	defer srv.Close()
@@ -323,8 +318,8 @@ func TestGenerate_StreamOptionsIncludeUsageInRequestBody(t *testing.T) {
 			t.Errorf("decode outbound request body: %v", err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer srv.Close()
 
@@ -358,16 +353,15 @@ func TestGenerate_StreamOptionsIncludeUsageInRequestBody(t *testing.T) {
 // comment: "including ctx.Err() short-circuiting on cancellation."
 func TestGenerate_ContextCancellationMidStream(t *testing.T) {
 	proceed := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := startServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher := w.(http.Flusher)
-		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"foo\"}}]}\n\n")
+		writeSSE(w, sseDelta("foo"))
 		flusher.Flush()
 		// Bounded, not a bare <-proceed: onTokens (which closes proceed) only
 		// fires if the client actually parses this chunk. A client bug (or an
 		// injected mutant) that never gets there must not hang this goroutine
-		// forever, or defer srv.Close() below hangs the whole test binary.
+		// forever, or the server's Close hangs the whole test binary.
 		select {
 		case <-proceed:
 		case <-time.After(500 * time.Millisecond):
@@ -375,16 +369,10 @@ func TestGenerate_ContextCancellationMidStream(t *testing.T) {
 		// Write more after cancellation; since the request context is now
 		// canceled, the underlying connection is torn down and this write is
 		// expected to be a no-op/error, never a panic.
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"bar\"}}]}\n\n")
+		writeSSE(w, sseDelta("bar"))
 		flusher.Flush()
 	}))
-	defer srv.Close()
-
-	base, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse test server URL: %v", err)
-	}
-	c := New(base, "")
+	c := New(mustParseURL(t, srv.URL), "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	onTokens := func(n int) {

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -13,11 +14,11 @@ func TestHandlerRendersCountersAndGauges(t *testing.T) {
 	r.Record("batch", "served", 80*time.Millisecond)
 	r.Record("interactive", "deferred", 0)
 
-	h := r.Handler(func() Gauges {
+	h := r.Handler(func(context.Context) Gauges {
 		return Gauges{Yielding: true, Busy: true, Interactive: 2, Batch: 1}
 	})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/metrics", nil))
 	body := rec.Body.String()
 
 	want := []string{
@@ -47,9 +48,9 @@ func TestIncDetectError(t *testing.T) {
 	r.IncDetectError()
 	r.IncDetectError()
 
-	h := r.Handler(func() Gauges { return Gauges{} })
+	h := r.Handler(func(context.Context) Gauges { return Gauges{} })
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/metrics", nil))
 	body := rec.Body.String()
 
 	if !strings.Contains(body, "broker_detect_errors_total 3") {

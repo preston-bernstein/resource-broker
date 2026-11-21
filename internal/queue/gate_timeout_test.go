@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 // TestGateUpstreamTimeoutFreesSlot proves ADR-0013: a next.ServeHTTP call
@@ -22,15 +24,15 @@ func TestGateUpstreamTimeoutFreesSlot(t *testing.T) {
 	})
 	s := New()
 	rec := newCountRec()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 50*time.Millisecond, alwaysServe{}, rec, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 2 * time.Second, UpstreamTimeout: 50 * time.Millisecond, Admission: alwaysServe{}, Recorder: rec}, upstream))
 	defer srv.Close()
 
 	start := time.Now()
-	resp, err := http.Get(srv.URL)
+	resp, err := testhttp.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -56,20 +58,20 @@ func TestGateNoUpstreamTimeoutRunsUnbounded(t *testing.T) {
 	release := make(chan struct{})
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-release
-		io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok")
 	})
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, alwaysServe{}, nil, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 2 * time.Second, Admission: alwaysServe{}}, upstream))
 	defer srv.Close()
 
-	done := make(chan *http.Response, 1)
+	done := make(chan int, 1) // the response status
 	go func() {
-		resp, err := http.Get(srv.URL)
+		r, err := testhttp.GetReply(srv.URL)
 		if err != nil {
 			t.Errorf("get: %v", err)
 			return
 		}
-		done <- resp
+		done <- r.StatusCode
 	}()
 
 	// Outlive what would be a short upstreamTimeout, proving nothing fired.
@@ -82,10 +84,9 @@ func TestGateNoUpstreamTimeoutRunsUnbounded(t *testing.T) {
 	close(release)
 
 	select {
-	case resp := <-done:
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", status)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("request never completed after release")

@@ -1,0 +1,8 @@
+{
+  "name": "resource-broker-gate-tools",
+  "private": true,
+  "description": "Pinned Node tools for the core gate (duplication check). Not part of the Go build.",
+  "devDependencies": {
+    "jscpd": "5.4.3"
+  }
+}

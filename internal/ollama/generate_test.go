@@ -22,7 +22,7 @@ func TestGenerateStreamsAndAccumulates(t *testing.T) {
 			`{"response":"world","done":false}`,
 			`{"response":"","done":true,"eval_count":3}`,
 		} {
-			io.WriteString(w, chunk+"\n")
+			_, _ = io.WriteString(w, chunk+"\n")
 			if fl != nil {
 				fl.Flush()
 			}
@@ -53,7 +53,7 @@ func TestGenerateStreamsAndAccumulates(t *testing.T) {
 
 func TestGenerateUpstreamError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"error":"model not found"}`+"\n")
+		_, _ = io.WriteString(w, `{"error":"model not found"}`+"\n")
 	}))
 	defer srv.Close()
 	u, _ := url.Parse(srv.URL)
@@ -68,7 +68,7 @@ func TestGenerateUpstreamError(t *testing.T) {
 func TestGenerateContextCancel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fl, _ := w.(http.Flusher)
-		io.WriteString(w, `{"response":"partial","done":false}`+"\n")
+		_, _ = io.WriteString(w, `{"response":"partial","done":false}`+"\n")
 		if fl != nil {
 			fl.Flush()
 		}

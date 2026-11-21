@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 // TestSharedTransportConfig pins the shared Transport's tuned constants — the
@@ -80,7 +83,7 @@ func TestStreamingNotBuffered(t *testing.T) {
 			t.Error("upstream ResponseWriter is not a Flusher")
 			return
 		}
-		io.WriteString(w, "line1\n")
+		_, _ = io.WriteString(w, "line1\n")
 		fl.Flush()
 		// Bounded, not a bare <-release: if the test fails/returns before
 		// close(release) (e.g. line1 never arrives), an unbounded read here
@@ -93,7 +96,7 @@ func TestStreamingNotBuffered(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			return
 		}
-		io.WriteString(w, "line2\n")
+		_, _ = io.WriteString(w, "line2\n")
 		fl.Flush()
 	}))
 	defer upstream.Close()
@@ -102,28 +105,28 @@ func TestStreamingNotBuffered(t *testing.T) {
 	front := httptest.NewServer(New(target))
 	defer front.Close()
 
-	resp, err := http.Get(front.URL + "/api/generate")
+	resp, err := testhttp.Get(front.URL + "/api/generate")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	br := bufio.NewReader(resp.Body)
-	got1, err := readLineWithin(br, 2*time.Second)
-	if err != nil {
-		t.Fatalf("reading line1 (proxy likely buffered): %v", err)
-	}
-	if strings.TrimSpace(got1) != "line1" {
-		t.Fatalf("line1 = %q, want line1", got1)
-	}
-
+	requireLine(t, br, "line1", "proxy likely buffered")
 	close(release) // now allow line2
-	got2, err := readLineWithin(br, 2*time.Second)
+	requireLine(t, br, "line2", "")
+}
+
+// requireLine reads the next line within 2s and checks it equals want. hint is
+// added to the failure message when set.
+func requireLine(t *testing.T, br *bufio.Reader, want, hint string) {
+	t.Helper()
+	got, err := readLineWithin(br, 2*time.Second)
 	if err != nil {
-		t.Fatalf("reading line2: %v", err)
+		t.Fatalf("reading %s (%s): %v", want, hint, err)
 	}
-	if strings.TrimSpace(got2) != "line2" {
-		t.Fatalf("line2 = %q, want line2", got2)
+	if strings.TrimSpace(got) != want {
+		t.Fatalf("%s = %q, want %s", want, got, want)
 	}
 }
 
@@ -144,11 +147,11 @@ func TestForwardsRequest(t *testing.T) {
 	front := httptest.NewServer(New(target))
 	defer front.Close()
 
-	resp, err := http.Post(front.URL+"/api/generate?stream=true", "application/json", strings.NewReader(`{"model":"x"}`))
+	resp, err := testhttp.Post(front.URL+"/api/generate?stream=true", "application/json", strings.NewReader(`{"model":"x"}`))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %q, want POST", gotMethod)
@@ -188,11 +191,11 @@ func TestEmbedRewritesEmbeddingsPath(t *testing.T) {
 		{"/models", "/models"},
 	}
 	for _, c := range cases {
-		resp, err := http.Post(front.URL+c.in, "application/json", strings.NewReader(`{"input":["x"]}`))
+		resp, err := testhttp.Post(front.URL+c.in, "application/json", strings.NewReader(`{"input":["x"]}`))
 		if err != nil {
 			t.Fatalf("post %s: %v", c.in, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if gotPath != c.want {
 			t.Errorf("%s -> upstream path %q, want %q", c.in, gotPath, c.want)
 		}
@@ -235,7 +238,7 @@ func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 // rather than a broker-side bound.
 func TestErrorHandlerDeadlineExceededMatches503Shape(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/embeddings", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/embeddings", nil)
 
 	errorHandler(rec, req, context.DeadlineExceeded)
 
@@ -255,7 +258,7 @@ func TestErrorHandlerDeadlineExceededMatches503Shape(t *testing.T) {
 // DeadlineExceeded branch alongside it.
 func TestErrorHandlerCanceledMatches503Shape(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/generate", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/generate", nil)
 
 	errorHandler(rec, req, context.Canceled)
 
@@ -277,7 +280,7 @@ func TestErrorHandlerCanceledMatches503Shape(t *testing.T) {
 // actually down" in the response status alone.
 func TestErrorHandlerOtherErrorStays502(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/generate", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/generate", nil)
 
 	errorHandler(rec, req, errors.New("dial tcp: connection refused"))
 
@@ -290,12 +293,12 @@ func TestRetryTransportRetriesOnConnError(t *testing.T) {
 	fake := &fakeRoundTripper{failUntil: 2, err: errors.New("server disconnected without sending a response")}
 	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{"input":["a","b"]}`))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/embed", strings.NewReader(`{"input":["a","b"]}`))
 	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("RoundTrip returned error after successful retry: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
@@ -309,13 +312,25 @@ func TestRetryTransportRetriesOnConnError(t *testing.T) {
 	}
 }
 
+// roundTripError sends req and returns the error, closing any response.
+func roundTripError(rt http.RoundTripper, req *http.Request) error {
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		return fmt.Errorf("round trip: %w", err)
+	}
+	return nil
+}
+
 func TestRetryTransportGivesUpAfterMaxRetries(t *testing.T) {
 	wantErr := errors.New("server disconnected without sending a response")
 	fake := &fakeRoundTripper{failUntil: 99, err: wantErr}
 	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`))
-	_, err := rt.RoundTrip(req)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/embed", strings.NewReader(`{}`))
+	err := roundTripError(rt, req)
 	if err == nil {
 		t.Fatal("expected error after exhausting retries, got nil")
 	}
@@ -328,8 +343,8 @@ func TestRetryTransportDoesNotRetryNonConnError(t *testing.T) {
 	fake := &fakeRoundTripper{failUntil: 99, err: errors.New("some unrelated application error")}
 	rt := &retryTransport{base: fake, retries: 2, backoff: time.Millisecond}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`))
-	_, err := rt.RoundTrip(req)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/embed", strings.NewReader(`{}`))
+	err := roundTripError(rt, req)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -344,8 +359,8 @@ func TestRetryTransportDoesNotRetryAfterCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	req := httptest.NewRequest(http.MethodPost, "/api/embed", strings.NewReader(`{}`)).WithContext(ctx)
-	_, err := rt.RoundTrip(req)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/embed", strings.NewReader(`{}`)).WithContext(ctx)
+	err := roundTripError(rt, req)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

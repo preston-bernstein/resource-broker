@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # batch-job-wrapper-v3.sh
 # Queue-aware batch job wrapper
 # Checks system state before running, queues if resources contested
@@ -66,7 +67,7 @@ if [[ "$SYSTEM_STATE" == high-resource:* ]]; then
 
   # Add to queue (priority 2 = new job)
   QUEUE_FILE="${QUEUE_DIR}/2-${JOB_ID}.job"
-  cat > "$QUEUE_FILE" <<EOF
+  cat >"$QUEUE_FILE" <<EOF
 {
   "job_id": "$JOB_ID",
   "priority": 2,
@@ -80,7 +81,7 @@ EOF
 
   echo "Job queued. Will run when resources available."
   log "Job queued: $JOB_ID"
-  exit 0  # Success (queued)
+  exit 0 # Success (queued)
 fi
 
 # Resources available - run the job

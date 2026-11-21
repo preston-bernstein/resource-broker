@@ -16,10 +16,12 @@ package config
 // it, the same way ollama-client's TestHostIsEnvDriven does for that repo.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -58,41 +60,14 @@ func TestNoRFC1918AddressInModuleSource(t *testing.T) {
 			return err
 		}
 		if info.IsDir() {
-			switch info.Name() {
-			// .git: not source. legacy/: pre-scrubbed historical Bash-era
-			// docs, already audited clean, and contains no .go files.
-			// .claude/worktrees: a *separate* git worktree checkout (its
-			// own branch, its own history) living under this repo's
-			// working directory — not this module's source tree.
-			case ".git", "legacy":
-				return filepath.SkipDir
-			}
-			if strings.HasSuffix(path, filepath.Join(".claude", "worktrees")) {
-				return filepath.SkipDir
-			}
+			return skipNonSourceDir(path, info.Name())
+		}
+		if !strings.HasSuffix(path, ".go") || isSelf(path) {
 			return nil
 		}
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-		if abs, absErr := filepath.Abs(path); absErr == nil && abs == selfPath {
-			// This file itself: exempt, see selfPath's doc comment above.
-			return nil
-		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			rel = path
-		}
-		for i, line := range strings.Split(string(data), "\n") {
-			if rfc1918Address.MatchString(line) {
-				offenders = append(offenders, rel+":"+itoa(i+1)+": "+strings.TrimSpace(line))
-			}
-		}
-		return nil
+		found, scanErr := rfc1918Lines(root, path)
+		offenders = append(offenders, found...)
+		return scanErr
 	})
 	if err != nil {
 		t.Fatalf("walking module source: %v", err)
@@ -103,6 +78,49 @@ func TestNoRFC1918AddressInModuleSource(t *testing.T) {
 			"192.0.2.10, or loopback 127.0.0.1, instead):\n%s",
 			strings.Join(offenders, "\n"))
 	}
+}
+
+// skipNonSourceDir returns filepath.SkipDir for directories that are not this
+// module's source. .git: not source. legacy/: pre-scrubbed historical Bash-era
+// docs, already audited clean, and contains no .go files. .claude/worktrees: a
+// *separate* git worktree checkout (its own branch, its own history) living
+// under this repo's working directory.
+func skipNonSourceDir(path, name string) error {
+	switch name {
+	case ".git", "legacy", "vendor":
+		return filepath.SkipDir
+	}
+	if strings.HasSuffix(path, filepath.Join(".claude", "worktrees")) {
+		return filepath.SkipDir
+	}
+	return nil
+}
+
+// isSelf reports whether path is this file, which is exempt: see selfPath's
+// doc comment above.
+func isSelf(path string) bool {
+	abs, err := filepath.Abs(path)
+	return err == nil && abs == selfPath
+}
+
+// rfc1918Lines returns "file:line: text" for each line of path that holds an
+// RFC1918 address, with file relative to root.
+func rfc1918Lines(root, path string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("rfc1918Lines: read file: %w", err)
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		rel = path
+	}
+	var found []string
+	for i, line := range strings.Split(string(data), "\n") {
+		if rfc1918Address.MatchString(line) {
+			found = append(found, rel+":"+strconv.Itoa(i+1)+": "+strings.TrimSpace(line))
+		}
+	}
+	return found, nil
 }
 
 // moduleRoot locates the repo root (the directory containing go.mod) by
@@ -124,27 +142,4 @@ func moduleRoot(t *testing.T) string {
 		}
 		dir = parent
 	}
-}
-
-// itoa avoids pulling in strconv just for this; kept tiny and local.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

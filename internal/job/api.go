@@ -151,7 +151,7 @@ func (s *Service) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-keepalive.C:
-			fmt.Fprint(w, ": keepalive\n\n")
+			_, _ = fmt.Fprint(w, ": keepalive\n\n")
 			flusher.Flush()
 		}
 	}
@@ -162,7 +162,7 @@ func sendEvent(w http.ResponseWriter, f http.Flusher, ev Event) {
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, b)
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, b)
 	f.Flush()
 }
 

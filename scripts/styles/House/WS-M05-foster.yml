@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'foster'. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\bfoster(?:s|ed|ing)?\\b": "build / support"

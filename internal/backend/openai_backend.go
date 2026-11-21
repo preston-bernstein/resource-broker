@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/openaicompat"
 	"github.com/preston-bernstein/resource-broker/internal/proxy"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
@@ -58,9 +59,12 @@ func (b *openaiBackend) Proxy() http.Handler {
 
 // Generate bridges the openaicompat client's streaming Generate to the Job
 // worker's Generator interface, mirroring ollamaBackend.Generate.
-func (b *openaiBackend) Generate(ctx context.Context, model, prompt string, options map[string]any, onTokens func(int)) (string, error) {
-	out, _, err := b.c.Generate(ctx, openaicompat.GenerateRequest{Model: model, Prompt: prompt, Options: options}, onTokens)
-	return out, err
+func (b *openaiBackend) Generate(ctx context.Context, req inference.Request) (string, error) {
+	out, _, err := b.c.Generate(ctx, openaicompat.GenerateRequest{Model: req.Model, Prompt: req.Prompt, Options: req.Options}, req.OnTokens)
+	if err != nil {
+		return "", fmt.Errorf("openai generate: %w", err)
+	}
+	return out, nil
 }
 
 // Reachable probes the upstream with GET {UPSTREAM_URL}/v1/models, the
@@ -72,16 +76,16 @@ func (b *openaiBackend) Reachable(ctx context.Context) error {
 	target := b.upstreamURL.JoinPath("v1", "models").String()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("Reachable: build request: %w", err)
 	}
 	if b.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+b.apiKey)
 	}
 	resp, err := b.http.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("Reachable: send request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("openai upstream: status %d", resp.StatusCode)
 	}
@@ -136,7 +140,7 @@ func newSystemdUnitController(unit string) *systemdUnitController {
 	return &systemdUnitController{
 		unit: unit,
 		run: func(ctx context.Context, verb string) error {
-			return exec.CommandContext(ctx, "systemctl", verb, unit).Run()
+			return exec.CommandContext(ctx, "systemctl", verb, unit).Run() //nolint:gosec // verb is stop or start, unit is operator config validated at load; systemctl has no non-exec API here
 		},
 	}
 }

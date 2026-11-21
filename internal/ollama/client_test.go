@@ -16,13 +16,13 @@ func TestLoadedModelsAndUnload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/ps":
-			io.WriteString(w, `{"models":[{"name":"a:latest"},{"name":"b:7b"}]}`)
+			_, _ = io.WriteString(w, `{"models":[{"name":"a:latest"},{"name":"b:7b"}]}`)
 		case "/api/generate":
 			var body struct {
 				Model     string `json:"model"`
 				KeepAlive int    `json:"keep_alive"`
 			}
-			json.NewDecoder(r.Body).Decode(&body)
+			_ = json.NewDecoder(r.Body).Decode(&body)
 			if body.KeepAlive != 0 {
 				t.Errorf("keep_alive = %d, want 0", body.KeepAlive)
 			}
@@ -56,7 +56,7 @@ func TestLoadedModelsAndUnload(t *testing.T) {
 
 func TestUnloadNoModels(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"models":[]}`)
+		_, _ = io.WriteString(w, `{"models":[]}`)
 	}))
 	defer srv.Close()
 	base, _ := url.Parse(srv.URL)

@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # email-summarizer.sh
 # Email summarization service - uses medium model for quality/speed balance
 #

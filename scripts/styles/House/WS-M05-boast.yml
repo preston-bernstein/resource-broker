@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'boast'. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\bboast(?:s|ed|ing)?\\b": "has"

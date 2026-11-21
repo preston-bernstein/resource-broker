@@ -13,6 +13,7 @@ import (
 
 	"github.com/preston-bernstein/resource-broker/internal/backend"
 	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/queue"
 )
 
@@ -47,18 +48,18 @@ func (f *fakeYield) startYield() {
 }
 
 type fakeGen struct {
-	fn func(ctx context.Context, model, prompt string, opts map[string]any, onTokens func(int)) (string, error)
+	fn func(ctx context.Context, req inference.Request) (string, error)
 }
 
-func (g fakeGen) Generate(ctx context.Context, model, prompt string, opts map[string]any, onTokens func(int)) (string, error) {
-	return g.fn(ctx, model, prompt, opts, onTokens)
+func (g fakeGen) Generate(ctx context.Context, req inference.Request) (string, error) {
+	return g.fn(ctx, req)
 }
 
 // blockGen blocks until its context is cancelled, then reports ctx.Err().
 func blockGen() fakeGen {
-	return fakeGen{fn: func(ctx context.Context, _, _ string, _ map[string]any, onTokens func(int)) (string, error) {
-		if onTokens != nil {
-			onTokens(1)
+	return fakeGen{fn: func(ctx context.Context, req inference.Request) (string, error) {
+		if req.OnTokens != nil {
+			req.OnTokens(1)
 		}
 		<-ctx.Done()
 		return "", ctx.Err()
@@ -82,7 +83,7 @@ func openaiBlockGen(t *testing.T) Generator {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
 		flusher.Flush()
 		<-r.Context().Done() // hold the stream open until preemption cancels it
 	}))
@@ -118,7 +119,7 @@ func newRig(t *testing.T, gen Generator, maxAttempts int, quantum time.Duration)
 	svc := NewService(store, maxAttempts)
 	sched := queue.New()
 	yld := newFakeYield()
-	w := NewWorker(svc, sched, yld, gen, quantum, 10*time.Millisecond)
+	w := NewWorker(WorkerConfig{Service: svc, Gate: sched, Yielder: yld, Generator: gen, Quantum: quantum, Poll: 10 * time.Millisecond})
 	return svc, sched, yld, w
 }
 
@@ -150,8 +151,8 @@ func submitJob(t *testing.T, svc *Service, key string) string {
 // --- tests ---
 
 func TestWorkerSuccess(t *testing.T) {
-	gen := fakeGen{fn: func(_ context.Context, _, _ string, _ map[string]any, onTokens func(int)) (string, error) {
-		onTokens(5)
+	gen := fakeGen{fn: func(_ context.Context, req inference.Request) (string, error) {
+		req.OnTokens(5)
 		return "the answer", nil
 	}}
 	svc, _, _, w := newRig(t, gen, 3, 10*time.Millisecond)
@@ -174,7 +175,7 @@ func TestWorkerSuccess(t *testing.T) {
 func TestWorkerRetryThenFail(t *testing.T) {
 	var calls int
 	var mu sync.Mutex
-	gen := fakeGen{fn: func(_ context.Context, _, _ string, _ map[string]any, _ func(int)) (string, error) {
+	gen := fakeGen{fn: func(_ context.Context, _ inference.Request) (string, error) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
@@ -281,44 +282,10 @@ func TestWorkerInteractivePreemptPastQuantum(t *testing.T) {
 			waitState(t, svc, id, StateRunning)
 			start := time.Now()
 
-			// An interactive request parks on the busy gate; the holder keeps the
-			// slot until we have asserted, so the worker cannot re-claim the
-			// requeued Job and race the check.
-			acquired := make(chan struct{})
-			release := make(chan struct{})
-			go func() {
-				_ = sched.Acquire(context.Background(), queue.Interactive)
-				close(acquired)
-				<-release
-				sched.Release()
-			}()
-
-			// Must NOT preempt before the quantum elapses (AC-8's "not before").
-			// Checked at a third of the quantum, well short of both the quantum
-			// itself and the monitor's 200ms re-check ticker, so ticker/store
-			// jitter can't produce a false positive here.
-			select {
-			case <-acquired:
-				t.Fatalf("interactive request preempted the batch Job after only %v, before quantum %v elapsed", time.Since(start), quantum)
-			case <-time.After(quantum / 3):
-			}
-
-			// Past the quantum the worker must preempt so the interactive caller
-			// proceeds.
-			select {
-			case <-acquired: // implies the worker preempted and released the batch slot
-			case <-time.After(3 * time.Second):
-				t.Fatal("interactive request never acquired the slot")
-			}
-			// tolerance absorbs the small, expected skew between this
-			// externally-observed start (captured after waitState's polling
-			// detects RUNNING) and the worker's internal start (captured before
-			// Generate begins, inside runJob) — not a loosening of AC-8's "not
-			// before" guarantee, which the earlier select already pins.
-			const tolerance = 60 * time.Millisecond
-			if elapsed := time.Since(start); elapsed < quantum-tolerance {
-				t.Fatalf("interactive preempted after %v, want >= ~quantum %v (preempted before its trigger time)", elapsed, quantum)
-			}
+			acquired, release := holdInteractiveSlot(sched)
+			defer close(release)
+			requireNoPreemptBeforeQuantum(t, acquired, start, quantum)
+			requireAcquiredPastQuantum(t, acquired, start, quantum)
 
 			// The Job was requeued (resume-first), not failed, with no attempt
 			// burned (AC-8) — identical for both backends.
@@ -329,7 +296,53 @@ func TestWorkerInteractivePreemptPastQuantum(t *testing.T) {
 			if st.Attempts != 0 {
 				t.Fatalf("interactive preempt burned an attempt: %d", st.Attempts)
 			}
-			close(release)
 		})
+	}
+}
+
+// holdInteractiveSlot parks an interactive request on the busy gate. The
+// holder keeps the slot until release is closed, so the worker cannot re-claim
+// the requeued Job and race the test's checks.
+func holdInteractiveSlot(sched *queue.Scheduler) (acquired <-chan struct{}, release chan struct{}) {
+	got := make(chan struct{})
+	release = make(chan struct{})
+	go func() {
+		_ = sched.Acquire(context.Background(), queue.Interactive)
+		close(got)
+		<-release
+		sched.Release()
+	}()
+	return got, release
+}
+
+// requireNoPreemptBeforeQuantum checks AC-8's "not before": it looks at a third
+// of the quantum, well short of both the quantum itself and the monitor's 200ms
+// re-check ticker, so ticker/store jitter can't produce a false positive.
+func requireNoPreemptBeforeQuantum(t *testing.T, acquired <-chan struct{}, start time.Time, quantum time.Duration) {
+	t.Helper()
+	select {
+	case <-acquired:
+		t.Fatalf("interactive request preempted the batch Job after only %v, before quantum %v elapsed", time.Since(start), quantum)
+	case <-time.After(quantum / 3):
+	}
+}
+
+// requireAcquiredPastQuantum checks that past the quantum the worker preempts
+// so the interactive caller proceeds.
+func requireAcquiredPastQuantum(t *testing.T, acquired <-chan struct{}, start time.Time, quantum time.Duration) {
+	t.Helper()
+	select {
+	case <-acquired: // implies the worker preempted and released the batch slot
+	case <-time.After(3 * time.Second):
+		t.Fatal("interactive request never acquired the slot")
+	}
+	// tolerance absorbs the small, expected skew between this externally-
+	// observed start (captured after waitState's polling detects RUNNING) and
+	// the worker's internal start (captured before Generate begins, inside
+	// runJob) — not a loosening of AC-8's "not before" guarantee, which the
+	// earlier check already pins.
+	const tolerance = 60 * time.Millisecond
+	if elapsed := time.Since(start); elapsed < quantum-tolerance {
+		t.Fatalf("interactive preempted after %v, want >= ~quantum %v (preempted before its trigger time)", elapsed, quantum)
 	}
 }

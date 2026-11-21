@@ -1,4 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: eval runs a command string that our own scripts pass in
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # batch-job-wrapper-v4.sh
 # Generic command wrapper with queue support
 # Calling applications decide what to run (model selection is their business logic)
@@ -62,7 +64,7 @@ if [[ "$SYSTEM_STATE" == high-resource:* ]]; then
 
   # Add to queue (priority 2 = new job)
   QUEUE_FILE="${QUEUE_DIR}/2-${JOB_ID}.job"
-  cat > "$QUEUE_FILE" <<EOF
+  cat >"$QUEUE_FILE" <<EOF
 {
   "job_id": "$JOB_ID",
   "priority": 2,
@@ -75,7 +77,7 @@ EOF
 
   echo "Job queued. Will run when resources available."
   log "Job queued: $JOB_ID (will run when $REASON ends)"
-  exit 0  # Success (queued)
+  exit 0 # Success (queued)
 fi
 
 # Resources available - run the command

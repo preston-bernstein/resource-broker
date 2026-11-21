@@ -79,7 +79,7 @@ func newDisplaceRig(t *testing.T, confirmPolls int, vllmGate chan struct{}) (*Co
 	tl := &timeline{}
 	vllm := &gatedUnloader{name: "vllm", tl: tl, gate: vllmGate}
 	gpu := &gatedUnloader{name: "gpu", tl: tl}
-	c := NewWithConfirmMulti(d, []Unloader{nil, vllm, gpu}, []string{"default", "route", "unit:gpu"}, time.Hour, confirmPolls)
+	c := NewWithConfirmMulti(d, []Unloader{nil, vllm, gpu}, []string{"default", "route", "unit:gpu"}, Polling{Interval: time.Hour, ConfirmPolls: confirmPolls})
 	c.ConfigureIdle([]time.Duration{0, time.Hour, 0})
 	c.ConfigureDisplace(map[int][]int{1: {2}})
 	h := c.TrackActivity(1, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
@@ -92,7 +92,7 @@ func TestDisplaceStopsDisplacerAtStartThenStartsUnitAfterIt(t *testing.T) {
 	if !eventually(t, func() bool { return tl.index("vllm stop") >= 0 }) {
 		t.Fatal("ConfigureDisplace did not stop the displacer once")
 	}
-	c.refresh()
+	c.refresh(context.Background())
 	time.Sleep(50 * time.Millisecond)
 	if tl.index("gpu start") >= 0 {
 		t.Fatalf("unit started while the displacer was still stopping: %v", tl.snapshot())
@@ -108,12 +108,12 @@ func TestDisplaceStopsDisplacerAtStartThenStartsUnitAfterIt(t *testing.T) {
 
 func TestDisplaceWaitsForConfirmPollsBeforeStartingUnit(t *testing.T) {
 	c, _, tl, _ := newDisplaceRig(t, 2, nil)
-	c.refresh()
+	c.refresh(context.Background())
 	time.Sleep(50 * time.Millisecond)
 	if tl.index("gpu start") >= 0 {
 		t.Fatal("unit started before confirmPolls ticks; a broker started mid-game would start then stop it")
 	}
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.index("gpu start") >= 0 }) {
 		t.Fatal("unit never started after confirmPolls ticks")
 	}
@@ -121,11 +121,11 @@ func TestDisplaceWaitsForConfirmPollsBeforeStartingUnit(t *testing.T) {
 
 func TestDisplaceWakeStopsUnitBeforeDisplacerStarts(t *testing.T) {
 	c, _, tl, h := newDisplaceRig(t, 1, nil)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.index("gpu start") >= 0 }) {
 		t.Fatal("unit never started")
 	}
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/chat", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), "POST", "/api/chat", nil))
 	if !eventually(t, func() bool { return tl.index("vllm start") >= 0 }) {
 		t.Fatalf("displacer never woke: %v", tl.snapshot())
 	}
@@ -133,8 +133,8 @@ func TestDisplaceWakeStopsUnitBeforeDisplacerStarts(t *testing.T) {
 		t.Fatalf("displacer started before the unit finished stopping: %v", tl.snapshot())
 	}
 	// While the displacer is loaded, later ticks must not restart the unit.
-	c.refresh()
-	c.refresh()
+	c.refresh(context.Background())
+	c.refresh(context.Background())
 	time.Sleep(50 * time.Millisecond)
 	if n := tl.count("gpu start"); n != 1 {
 		t.Fatalf("unit restarted while the displacer held the GPU (%d starts): %v", n, tl.snapshot())
@@ -143,15 +143,15 @@ func TestDisplaceWakeStopsUnitBeforeDisplacerStarts(t *testing.T) {
 
 func TestDisplaceIdleUnloadHandsGPUBackToUnit(t *testing.T) {
 	c, _, tl, h := newDisplaceRig(t, 1, nil)
-	c.refresh()
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/chat", nil))
+	c.refresh(context.Background())
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), "POST", "/api/chat", nil))
 	if !eventually(t, func() bool { return tl.index("vllm start") >= 0 }) {
 		t.Fatal("displacer never woke")
 	}
 	c.mu.Lock()
 	c.lastDispatch[c.origToFiltered[1]].Store(time.Now().Add(-2 * time.Hour).UnixNano())
 	c.mu.Unlock()
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu start") == 2 }) {
 		t.Fatalf("unit not restarted after the displacer idle-unloaded: %v", tl.snapshot())
 	}
@@ -169,30 +169,30 @@ func TestDisplaceIdleUnloadHandsGPUBackToUnit(t *testing.T) {
 
 func TestDisplaceYieldStopsUnitAndClearRestartsItOnlyIfDisplacerIdle(t *testing.T) {
 	c, d, tl, h := newDisplaceRig(t, 1, nil)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu start") == 1 }) {
 		t.Fatal("unit never started")
 	}
 	d.set("gaming-steam", true)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu stopped") == 1 }) {
 		t.Fatalf("yield did not stop the unit: %v", tl.snapshot())
 	}
 	d.set("", false)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu start") == 2 }) {
 		t.Fatalf("clear did not restart the unit while the displacer was idle: %v", tl.snapshot())
 	}
 
 	// Now with the displacer loaded: a yield and its clear must leave the unit off.
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/chat", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), "POST", "/api/chat", nil))
 	if !eventually(t, func() bool { return tl.count("vllm start") == 1 }) {
 		t.Fatal("displacer never woke")
 	}
 	d.set("plex-transcode", true)
-	c.refresh()
+	c.refresh(context.Background())
 	d.set("", false)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("vllm start") == 2 }) {
 		t.Fatalf("clear did not reload the in-use displacer: %v", tl.snapshot())
 	}
@@ -209,7 +209,7 @@ func TestConfigureDisplacePanicsWithoutIdleTimeout(t *testing.T) {
 		}
 	}()
 	tl := &timeline{}
-	c := NewWithConfirmMulti(&fakeDet{}, []Unloader{nil, &gatedUnloader{name: "v", tl: tl}, &gatedUnloader{name: "g", tl: tl}}, nil, time.Hour, 1)
+	c := NewWithConfirmMulti(&fakeDet{}, []Unloader{nil, &gatedUnloader{name: "v", tl: tl}, &gatedUnloader{name: "g", tl: tl}}, nil, Polling{Interval: time.Hour, ConfirmPolls: 1})
 	c.ConfigureIdle([]time.Duration{0, 0, 0})
 	c.ConfigureDisplace(map[int][]int{1: {2}})
 }
@@ -218,18 +218,18 @@ func TestNoDisplaceKeepsOldBehaviour(t *testing.T) {
 	d := &fakeDet{}
 	tl := &timeline{}
 	gpu := &gatedUnloader{name: "gpu", tl: tl}
-	c := NewWithConfirmMulti(d, []Unloader{nil, gpu}, nil, time.Hour, 1)
+	c := NewWithConfirmMulti(d, []Unloader{nil, gpu}, nil, Polling{Interval: time.Hour, ConfirmPolls: 1})
 	c.ConfigureIdle([]time.Duration{0, 0})
 	c.ConfigureDisplace(nil)
-	c.refresh()
+	c.refresh(context.Background())
 	time.Sleep(50 * time.Millisecond)
 	if len(tl.snapshot()) != 0 {
 		t.Fatalf("a plain yield unit was touched outside a yield: %v", tl.snapshot())
 	}
 	d.set("gaming-steam", true)
-	c.refresh()
+	c.refresh(context.Background())
 	d.set("", false)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu start") == 1 && tl.count("gpu stopped") == 1 }) {
 		t.Fatalf("yield/clear did not stop and start the unit: %v", tl.snapshot())
 	}
@@ -248,26 +248,26 @@ func backdateFree(c *Controller, d time.Duration) {
 func TestDisplaceHoldoffDelaysRestartAfterClear(t *testing.T) {
 	c, d, tl, _ := newDisplaceRig(t, 1, nil)
 	c.SetUnitResumeHoldoff(5 * time.Minute)
-	c.refresh()
+	c.refresh(context.Background())
 	backdateFree(c, 5*time.Minute)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu start") == 1 }) {
 		t.Fatalf("unit never started once its GPU had been free for the hold-off: %v", tl.snapshot())
 	}
 	d.set("plex", true)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu stopped") == 1 }) {
 		t.Fatalf("hold-off delayed the yield's stop: %v", tl.snapshot())
 	}
 	d.set("", false)
-	c.refresh()
-	c.refresh()
+	c.refresh(context.Background())
+	c.refresh(context.Background())
 	time.Sleep(50 * time.Millisecond)
 	if n := tl.count("gpu start"); n != 1 {
 		t.Fatalf("unit restarted inside the hold-off (%d starts): %v", n, tl.snapshot())
 	}
 	backdateFree(c, 5*time.Minute)
-	c.refresh()
+	c.refresh(context.Background())
 	if !eventually(t, func() bool { return tl.count("gpu start") == 2 }) {
 		t.Fatalf("unit not restarted after the hold-off: %v", tl.snapshot())
 	}
@@ -276,14 +276,14 @@ func TestDisplaceHoldoffDelaysRestartAfterClear(t *testing.T) {
 func TestDisplaceHoldoffRestartsTheClockOnAFlap(t *testing.T) {
 	c, d, tl, _ := newDisplaceRig(t, 1, nil)
 	c.SetUnitResumeHoldoff(5 * time.Minute)
-	c.refresh()
+	c.refresh(context.Background())
 	backdateFree(c, 4*time.Minute) // 4 of 5 minutes free
 	d.set("plex", true)
-	c.refresh() // a yield resets the clock
+	c.refresh(context.Background()) // a yield resets the clock
 	d.set("", false)
-	c.refresh()
+	c.refresh(context.Background())
 	backdateFree(c, 4*time.Minute) // 4 minutes since the clear, 8 in total
-	c.refresh()
+	c.refresh(context.Background())
 	time.Sleep(50 * time.Millisecond)
 	if n := tl.count("gpu start"); n != 0 {
 		t.Fatalf("free time before the yield counted toward the hold-off (%d starts): %v", n, tl.snapshot())

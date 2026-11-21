@@ -13,6 +13,7 @@ import (
 	"net/url"
 
 	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
@@ -24,9 +25,9 @@ type Backend interface {
 	// Synchronous path (wired into both the Interactive and Batch Gates).
 	Proxy() http.Handler
 	// Generate runs a single non-streamed-to-the-caller generation for the
-	// durable Job path, invoking onTokens as tokens are produced. Signature
+	// durable Job path, invoking req.OnTokens as tokens are produced. Signature
 	// mirrors the existing Generator interface job.NewWorker accepts.
-	Generate(ctx context.Context, model, prompt string, options map[string]any, onTokens func(int)) (string, error)
+	Generate(ctx context.Context, req inference.Request) (string, error)
 	// Reachable reports whether the upstream is reachable, for /healthz.
 	Reachable(ctx context.Context) error
 	// Unloader returns the yield.Unloader this backend uses to free upstream

@@ -1,0 +1,6 @@
+extends: "existence"
+message: "Signposting sentence announcing what comes next. Cut it and say the thing. (Naming a framework you then reuse twice is the allowed exception \u2014 the aliveness lane adjudicates that.)"
+level: "warning"
+nonword: true
+tokens:
+  - "(?:^|[.!?]\\s+)(?:Here'?s (?:the|how|what|why)[^.:\\n]{0,50}[.:]|The (?:useful|key|real|part|catch|takeaway|upshot|point|lesson)\\b[^.:\\n]{0,40}:|One thing[^.:\\n]{0,30}:)"

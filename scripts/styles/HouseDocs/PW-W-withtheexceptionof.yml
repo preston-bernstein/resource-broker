@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'except'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bwith the exception of\\b": "except"

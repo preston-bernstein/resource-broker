@@ -1,0 +1,10 @@
+# Save as .github/dependabot.yml. Pack: github-actions, rule gha-dependabot-pins.
+# Dependabot opens PRs that move pinned action SHAs forward and keep the version comment current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

@@ -29,7 +29,7 @@ git -C "$CHECKOUT" fetch origin --quiet || fetch_ok=0
 
 behind=0
 if [ "$fetch_ok" -eq 1 ]; then
-	behind=$(git -C "$CHECKOUT" rev-list --count HEAD..origin/main 2>/dev/null || echo -1)
+  behind=$(git -C "$CHECKOUT" rev-list --count HEAD..origin/main 2>/dev/null || echo -1)
 fi
 
 # Dirty means uncommitted changes to TRACKED files only — untracked files
@@ -37,27 +37,27 @@ fi
 # and never in git) are expected and not drift.
 dirty=0
 if [ -n "$(git -C "$CHECKOUT" diff --name-only HEAD 2>/dev/null)" ]; then
-	dirty=1
+  dirty=1
 fi
 
 now=$(date +%s)
 
 {
-	echo "# HELP resource_broker_deploy_git_fetch_success Whether the last git fetch against origin succeeded (1) or failed (0)."
-	echo "# TYPE resource_broker_deploy_git_fetch_success gauge"
-	echo "resource_broker_deploy_git_fetch_success $fetch_ok"
+  echo "# HELP resource_broker_deploy_git_fetch_success Whether the last git fetch against origin succeeded (1) or failed (0)."
+  echo "# TYPE resource_broker_deploy_git_fetch_success gauge"
+  echo "resource_broker_deploy_git_fetch_success $fetch_ok"
 
-	echo "# HELP resource_broker_deploy_checkout_behind_commits How many commits the deploy checkout is behind origin/main."
-	echo "# TYPE resource_broker_deploy_checkout_behind_commits gauge"
-	echo "resource_broker_deploy_checkout_behind_commits $behind"
+  echo "# HELP resource_broker_deploy_checkout_behind_commits How many commits the deploy checkout is behind origin/main."
+  echo "# TYPE resource_broker_deploy_checkout_behind_commits gauge"
+  echo "resource_broker_deploy_checkout_behind_commits $behind"
 
-	echo "# HELP resource_broker_deploy_checkout_dirty Whether the deploy checkout has uncommitted changes to tracked files (1) or is clean (0)."
-	echo "# TYPE resource_broker_deploy_checkout_dirty gauge"
-	echo "resource_broker_deploy_checkout_dirty $dirty"
+  echo "# HELP resource_broker_deploy_checkout_dirty Whether the deploy checkout has uncommitted changes to tracked files (1) or is clean (0)."
+  echo "# TYPE resource_broker_deploy_checkout_dirty gauge"
+  echo "resource_broker_deploy_checkout_dirty $dirty"
 
-	echo "# HELP resource_broker_deploy_drift_check_timestamp_seconds Unix timestamp of the last drift check."
-	echo "# TYPE resource_broker_deploy_drift_check_timestamp_seconds gauge"
-	echo "resource_broker_deploy_drift_check_timestamp_seconds $now"
+  echo "# HELP resource_broker_deploy_drift_check_timestamp_seconds Unix timestamp of the last drift check."
+  echo "# TYPE resource_broker_deploy_drift_check_timestamp_seconds gauge"
+  echo "resource_broker_deploy_drift_check_timestamp_seconds $now"
 } >"$TMP"
 
 mv "$TMP" "$OUT"

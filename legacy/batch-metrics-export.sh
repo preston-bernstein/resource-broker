@@ -1,9 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # batch-metrics-export.sh
 # Export batch job metrics in various formats
 
 METRICS_DIR="/var/lib/batch-jobs/metrics"
-FORMAT="${1:-json}"  # json, csv, prometheus, summary
+FORMAT="${1:-json}" # json, csv, prometheus, summary
 
 usage() {
   echo "Usage: $0 [format]"
@@ -34,9 +35,13 @@ if [ ! -d "$METRICS_DIR" ]; then
 fi
 
 # Count jobs
-TOTAL_JOBS=$(ls -1 "$METRICS_DIR"/*.json 2>/dev/null | wc -l)
+metrics_files=()
+for metrics_file in "$METRICS_DIR"/*.json; do
+  [ -e "$metrics_file" ] && metrics_files+=("$metrics_file")
+done
+TOTAL_JOBS=${#metrics_files[@]}
 
-if [ $TOTAL_JOBS -eq 0 ]; then
+if [ "$TOTAL_JOBS" -eq 0 ]; then
   echo "No job metrics found in $METRICS_DIR"
   exit 0
 fi
@@ -129,7 +134,7 @@ case "$FORMAT" in
     echo "By Status:"
     for status in completed failed queued running pending; do
       count=$(jq -r "select(.status == \"$status\") | .job_id" "$METRICS_DIR"/*.json 2>/dev/null | wc -l)
-      if [ $count -gt 0 ]; then
+      if [ "$count" -gt 0 ]; then
         echo "  $status: $count"
       fi
     done

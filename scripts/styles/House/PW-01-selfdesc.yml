@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Marketing self-description. Say what it does instead."
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:comprehensive|powerful|cutting-edge|state-of-the-art|best-in-class|world-class|blazing[- ]fast)\\b"

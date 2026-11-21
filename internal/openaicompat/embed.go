@@ -1,7 +1,6 @@
 package openaicompat
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -96,27 +95,13 @@ func decodeEmbedInput(raw json.RawMessage) ([]string, error) {
 // matches req.Input's order even if the upstream returns data out of order
 // (FR-7, AC-22).
 func (c *Client) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, error) {
-	payload, err := json.Marshal(openaiEmbedRequest(req))
+	resp, err := c.postJSON(ctx, openaiEmbedRequest(req), "v1", "embeddings")
 	if err != nil {
 		return EmbedResponse{}, err
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("v1", "embeddings"), bytes.NewReader(payload))
-	if err != nil {
-		return EmbedResponse{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return EmbedResponse{}, err
-	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return EmbedResponse{}, fmt.Errorf("openai upstream: status %d", resp.StatusCode)
 	}
 
@@ -124,19 +109,26 @@ func (c *Client) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, er
 	if err := json.NewDecoder(resp.Body).Decode(&oaiResp); err != nil {
 		return EmbedResponse{}, fmt.Errorf("decode embeddings response: %w", err)
 	}
-
-	embeddings := make([][]float64, len(oaiResp.Data))
-	for _, item := range oaiResp.Data {
-		if item.Index < 0 || item.Index >= len(embeddings) {
-			return EmbedResponse{}, fmt.Errorf("openai upstream: embedding index %d out of range for %d inputs", item.Index, len(embeddings))
-		}
-		embeddings[item.Index] = item.Embedding
+	embeddings, err := orderEmbeddings(oaiResp)
+	if err != nil {
+		return EmbedResponse{}, err
 	}
 
 	model := oaiResp.Model
 	if model == "" {
 		model = req.Model
 	}
-
 	return EmbedResponse{Model: model, Embeddings: embeddings}, nil
+}
+
+// orderEmbeddings places each embedding at its Index.
+func orderEmbeddings(resp openaiEmbedResponse) ([][]float64, error) {
+	embeddings := make([][]float64, len(resp.Data))
+	for _, item := range resp.Data {
+		if item.Index < 0 || item.Index >= len(embeddings) {
+			return nil, fmt.Errorf("openai upstream: embedding index %d out of range for %d inputs", item.Index, len(embeddings))
+		}
+		embeddings[item.Index] = item.Embedding
+	}
+	return embeddings, nil
 }

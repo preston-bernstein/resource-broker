@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'can'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\b(?:is|are|was|were) able to\\b": "can"

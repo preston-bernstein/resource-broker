@@ -1,4 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: eval runs a command string that our own scripts pass in
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # batch-job-wrapper-v5.sh
 # Generic command wrapper with queue support + metadata tracking
 
@@ -102,7 +104,7 @@ fi
 SUBMIT_TIME=$(date -Iseconds)
 SUBMIT_TIMESTAMP=$(date +%s)
 
-cat > "$METRICS_DIR/${JOB_ID}.json" <<EOF
+cat >"$METRICS_DIR/${JOB_ID}.json" <<EOF
 {
   "job_id": "$JOB_ID",
   "caller": "$CALLER",
@@ -133,14 +135,14 @@ if [[ "$SYSTEM_STATE" == high-resource:* ]]; then
 
   # Update metadata
   jq --arg reason "$REASON" \
-     --arg queued_at "$(date -Iseconds)" \
-     '. + {status: "queued", queue_reason: $reason, queued_at: $queued_at}' \
-     "$METRICS_DIR/${JOB_ID}.json" > "$METRICS_DIR/${JOB_ID}.json.tmp" && \
-     mv "$METRICS_DIR/${JOB_ID}.json.tmp" "$METRICS_DIR/${JOB_ID}.json"
+    --arg queued_at "$(date -Iseconds)" \
+    '. + {status: "queued", queue_reason: $reason, queued_at: $queued_at}' \
+    "$METRICS_DIR/${JOB_ID}.json" >"$METRICS_DIR/${JOB_ID}.json.tmp" \
+    && mv "$METRICS_DIR/${JOB_ID}.json.tmp" "$METRICS_DIR/${JOB_ID}.json"
 
   # Add to queue (priority 2 = new job)
   QUEUE_FILE="${QUEUE_DIR}/2-${JOB_ID}.job"
-  cat > "$QUEUE_FILE" <<EOF
+  cat >"$QUEUE_FILE" <<EOF
 {
   "job_id": "$JOB_ID",
   "priority": 2,
@@ -155,7 +157,7 @@ EOF
 
   echo "Job queued. Will run when resources available."
   log "Job queued: $JOB_ID (will run when $REASON ends)"
-  exit 0  # Success (queued)
+  exit 0 # Success (queued)
 fi
 
 # Resources available - run the command
@@ -166,21 +168,21 @@ START_TIME=$(date -Iseconds)
 START_TIMESTAMP=$(date +%s)
 
 jq --arg start "$START_TIME" \
-   --argjson start_ts $START_TIMESTAMP \
-   '. + {status: "running", started_at: $start, started_timestamp: $start_ts}' \
-   "$METRICS_DIR/${JOB_ID}.json" > "$METRICS_DIR/${JOB_ID}.json.tmp" && \
-   mv "$METRICS_DIR/${JOB_ID}.json.tmp" "$METRICS_DIR/${JOB_ID}.json"
+  --argjson start_ts "$START_TIMESTAMP" \
+  '. + {status: "running", started_at: $start, started_timestamp: $start_ts}' \
+  "$METRICS_DIR/${JOB_ID}.json" >"$METRICS_DIR/${JOB_ID}.json.tmp" \
+  && mv "$METRICS_DIR/${JOB_ID}.json.tmp" "$METRICS_DIR/${JOB_ID}.json"
 
 # Execute the command and capture output
 OUTPUT_FILE="$METRICS_DIR/${JOB_ID}.output"
-eval "$COMMAND" > "$OUTPUT_FILE" 2>&1
+eval "$COMMAND" >"$OUTPUT_FILE" 2>&1
 EXIT_CODE=$?
 
 # Record completion
 END_TIME=$(date -Iseconds)
 END_TIMESTAMP=$(date +%s)
 DURATION=$((END_TIMESTAMP - START_TIMESTAMP))
-OUTPUT_SIZE=$(wc -c < "$OUTPUT_FILE" 2>/dev/null || echo 0)
+OUTPUT_SIZE=$(wc -c <"$OUTPUT_FILE" 2>/dev/null || echo 0)
 
 # Determine final status
 if [ $EXIT_CODE -eq 0 ]; then
@@ -193,12 +195,12 @@ fi
 
 # Update metadata (final)
 jq --arg end "$END_TIME" \
-   --argjson end_ts $END_TIMESTAMP \
-   --argjson duration $DURATION \
-   --argjson exit_code $EXIT_CODE \
-   --argjson output_size $OUTPUT_SIZE \
-   --arg status "$FINAL_STATUS" \
-   '. + {
+  --argjson end_ts "$END_TIMESTAMP" \
+  --argjson duration "$DURATION" \
+  --argjson exit_code "$EXIT_CODE" \
+  --argjson output_size "$OUTPUT_SIZE" \
+  --arg status "$FINAL_STATUS" \
+  '. + {
      status: $status,
      completed_at: $end,
      completed_timestamp: $end_ts,
@@ -206,7 +208,7 @@ jq --arg end "$END_TIME" \
      exit_code: $exit_code,
      output_size_bytes: $output_size
    }' \
-   "$METRICS_DIR/${JOB_ID}.json" > "$METRICS_DIR/${JOB_ID}.json.tmp" && \
-   mv "$METRICS_DIR/${JOB_ID}.json.tmp" "$METRICS_DIR/${JOB_ID}.json"
+  "$METRICS_DIR/${JOB_ID}.json" >"$METRICS_DIR/${JOB_ID}.json.tmp" \
+  && mv "$METRICS_DIR/${JOB_ID}.json.tmp" "$METRICS_DIR/${JOB_ID}.json"
 
 exit $EXIT_CODE

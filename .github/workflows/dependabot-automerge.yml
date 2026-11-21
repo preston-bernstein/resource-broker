@@ -1,0 +1,16 @@
+name: Dependabot auto-merge
+
+# Merges a Dependabot pull request once every other check has passed. The logic lives in ci-workflows.
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  automerge:
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+    uses: preston-bernstein/ci-workflows/.github/workflows/dependabot-automerge.yml@0b83b7459405a56a89539768652183e33b200f7e # v1.1

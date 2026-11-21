@@ -141,7 +141,7 @@ func (c *Client) post(ctx context.Context, path string, body any) ([]byte, error
 	if err != nil {
 		return nil, fmt.Errorf("tdarr: %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("tdarr: %s: status %d: %s", path, resp.StatusCode, raw)

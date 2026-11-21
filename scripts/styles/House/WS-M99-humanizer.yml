@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Names an AI-humanizer / detector-bypass tool. That whole category is banned."
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:BypassGPT|HIX Bypass|Uncheck\\.ai|AI humanizer|detector bypass)\\b"

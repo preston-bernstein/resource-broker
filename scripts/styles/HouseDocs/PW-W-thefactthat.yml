@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Usually just 'that'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bthe fact that\\b": "that"

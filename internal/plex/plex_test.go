@@ -11,7 +11,7 @@ func TestActiveSessionTrue(t *testing.T) {
 		if got := r.Header.Get("X-Plex-Token"); got != "tok" {
 			t.Errorf("token header = %q, want %q", got, "tok")
 		}
-		w.Write([]byte(`<MediaContainer size="1"></MediaContainer>`))
+		_, _ = w.Write([]byte(`<MediaContainer size="1"></MediaContainer>`))
 	}))
 	defer srv.Close()
 
@@ -27,7 +27,7 @@ func TestActiveSessionTrue(t *testing.T) {
 
 func TestActiveSessionFalseWhenEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<MediaContainer size="0"></MediaContainer>`))
+		_, _ = w.Write([]byte(`<MediaContainer size="0"></MediaContainer>`))
 	}))
 	defer srv.Close()
 

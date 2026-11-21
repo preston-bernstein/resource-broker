@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'because'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bdue to the fact that\\b": "because"

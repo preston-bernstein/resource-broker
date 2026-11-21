@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # research-analyzer.sh
 # Research paper analysis - uses largest model for maximum quality
 #

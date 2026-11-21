@@ -16,7 +16,65 @@ permissions:
 
 jobs:
   ci:
-    uses: preston-bernstein/ci-workflows/.github/workflows/go.yml@v1
+    uses: preston-bernstein/ci-workflows/.github/workflows/go.yml@980585f4e9c3c1ef982cb934e153f925121fe0c0 # v1
 
   workflows:
-    uses: preston-bernstein/ci-workflows/.github/workflows/actions-lint.yml@v1
+    uses: preston-bernstein/ci-workflows/.github/workflows/actions-lint.yml@980585f4e9c3c1ef982cb934e153f925121fe0c0 # v1
+
+  # Each gate runs once, here. The same scripts run in .githooks/pre-commit.
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The writing gate diffs against main, so it needs full history.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install gate tools
+        env:
+          TOOL_DIR: ${{ runner.temp }}/gate-tools
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          bash ci/install-gate-tools.sh "$TOOL_DIR"
+          {
+            echo "$TOOL_DIR/bin"
+            echo "$TOOL_DIR/venv/bin"
+            echo "$WORKSPACE/ci/node_modules/.bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Core gate
+        run: bash scripts/core-validate.sh
+
+      - name: GitHub Actions gate
+        run: bash scripts/gha-validate.sh
+
+      - name: Shell gate
+        run: bash scripts/shell-validate.sh
+
+      - name: Go gate
+        run: bash scripts/go-validate.sh
+
+      - name: Writing gate
+        run: bash scripts/writing-validate.sh
+
+      - name: Logging gate
+        run: python3 scripts/logging-check.py .

@@ -1,0 +1,54 @@
+# golangci-lint v2 config. Pack: go, rules go-golangci-v2, go-errors-wrap, go-context, go-goroutines,
+# go-slog, go-security, go-no-blanket-nolint. Save as .golangci.yml and pin the golangci-lint version in CI.
+# v1 configs fail or misplace formatters under v2: run `golangci-lint migrate` on an old file.
+# There are no blanket exclusions on purpose: an exception is a //nolint:<linter> // <reason> comment at the line.
+version: "2"
+run:
+  tests: true
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - errorlint
+    - wrapcheck
+    - contextcheck
+    - noctx
+    - bodyclose
+    - gosec
+    - gochecknoinits
+    - gocritic
+    - revive
+    - nolintlint
+    - sloglint
+    - forbidigo
+    - nilerr
+  settings:
+    revive:
+      rules:
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    forbidigo:
+      forbid:
+        - pattern: '^fmt\.Print.*$'
+          msg: use log/slog
+        - pattern: '^print(ln)?$'
+          msg: use log/slog
+        - pattern: '^log\.(Print|Fatal|Panic).*$'
+          msg: use log/slog
+    sloglint:
+      no-mixed-args: true
+      kv-only: true
+formatters:
+  enable:
+    - gofmt
+    - goimports
+

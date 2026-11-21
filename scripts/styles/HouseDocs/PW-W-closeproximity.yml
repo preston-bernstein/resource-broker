@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Say 'near'. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bclose proximity\\b": "near"

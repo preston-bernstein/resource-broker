@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/preston-bernstein/resource-broker/internal/testhttp"
 )
 
 // manualAdm is a controllable Admission for tests.
@@ -59,14 +61,14 @@ func TestGateCancelsInFlightOnYield(t *testing.T) {
 
 	adm := newManualAdm()
 	s := New()
-	srv := httptest.NewServer(s.Gate(Batch, 2*time.Second, 0, adm, nil, upstream))
+	srv := httptest.NewServer(s.Gate(GateConfig{Class: Batch, Wait: 2 * time.Second, Admission: adm}, upstream))
 	defer srv.Close()
 
 	done := make(chan struct{})
 	go func() {
-		resp, err := http.Get(srv.URL)
+		resp, err := testhttp.Get(srv.URL)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		close(done)
 	}()

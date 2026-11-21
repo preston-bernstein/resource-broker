@@ -1,0 +1,6 @@
+# Save as .shellcheckrc. Pack: shell, rule sh-shellcheck. Do not raise the severity (-S warning hides SC2086). Pin the ShellCheck version in CI: rule sets change
+# between releases (v0.11.0 added SC2329 for never-invoked functions and turned SC2002 off).
+shell=bash
+external-sources=true
+enable=avoid-nullary-conditions
+enable=deprecate-which

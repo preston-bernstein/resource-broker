@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Runs every gate that CI runs. Enable once per clone: git config core.hooksPath .githooks
+# Tool setup is in ci/install-gate-tools.sh. Never commit with --no-verify.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+bash scripts/core-validate.sh
+bash scripts/gha-validate.sh
+bash scripts/shell-validate.sh
+bash scripts/go-validate.sh
+bash scripts/writing-validate.sh
+python3 scripts/logging-check.py .

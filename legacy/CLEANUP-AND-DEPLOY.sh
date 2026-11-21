@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # CLEANUP-AND-DEPLOY.sh
 # Cleanup deprecated files and deploy V3 system
 
@@ -23,11 +24,11 @@ mv -v /home/user/Documents/System-Architecture/Ollama-Plex-Gaming/batch-job-wrap
 
 echo ""
 echo "Step 3: Installing dependencies (jq for JSON parsing)..."
-if ! command -v jq &> /dev/null; then
-    echo "jq not found, installing..."
-    sudo apt update && sudo apt install -y jq
+if ! command -v jq &>/dev/null; then
+  echo "jq not found, installing..."
+  sudo apt update && sudo apt install -y jq
 else
-    echo "jq already installed"
+  echo "jq already installed"
 fi
 
 echo ""

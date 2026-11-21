@@ -3,6 +3,7 @@ package job
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -77,7 +78,7 @@ func (s *Service) Submit(ctx context.Context, req SubmitRequest) (*Job, bool, er
 	if len(req.Options) > 0 {
 		b, err := json.Marshal(req.Options)
 		if err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("Submit: encode: %w", err)
 		}
 		paramsJSON = string(b)
 	}
@@ -93,7 +94,7 @@ func (s *Service) Submit(ctx context.Context, req SubmitRequest) (*Job, bool, er
 	}
 	stored, created, err := s.store.Submit(ctx, j)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("Submit: submit: %w", err)
 	}
 	if created {
 		s.bus.publish(stored.ID, Event{Type: EventState, State: StateQueued})
@@ -105,7 +106,7 @@ func (s *Service) Submit(ctx context.Context, req SubmitRequest) (*Job, bool, er
 func (s *Service) Get(ctx context.Context, id string) (*Status, error) {
 	j, err := s.store.Get(ctx, id)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Get: get: %w", err)
 	}
 	st := &Status{
 		ID:        j.ID,
@@ -133,7 +134,7 @@ func (s *Service) Get(ctx context.Context, id string) (*Status, error) {
 func (s *Service) Result(ctx context.Context, id string) (string, error) {
 	j, err := s.store.Get(ctx, id)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("Result: get: %w", err)
 	}
 	if j.State != StateSucceeded {
 		return "", ErrNotReady
@@ -146,14 +147,18 @@ func (s *Service) Result(ctx context.Context, id string) (string, error) {
 
 // List returns Jobs matching the filter.
 func (s *Service) List(ctx context.Context, f Filter) ([]*Job, error) {
-	return s.store.List(ctx, f)
+	jobs, err := s.store.List(ctx, f)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs: %w", err)
+	}
+	return jobs, nil
 }
 
-// Cancel marks a Job CANCELED and aborts its upstream call if it is running.
+// Cancel sets a Job to CANCELED and aborts its upstream call if it is running.
 func (s *Service) Cancel(ctx context.Context, id string) (*Job, error) {
 	j, err := s.store.Cancel(ctx, id)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Cancel: cancel: %w", err)
 	}
 	if j.State == StateCanceled {
 		// Abort the in-flight generation, if any; the worker sees the CANCELED
@@ -172,14 +177,20 @@ func (s *Service) Cancel(ctx context.Context, id string) (*Job, error) {
 }
 
 // Counts returns Job counts by state.
-func (s *Service) Counts(ctx context.Context) (Counts, error) { return s.store.Counts(ctx) }
+func (s *Service) Counts(ctx context.Context) (Counts, error) {
+	c, err := s.store.Counts(ctx)
+	if err != nil {
+		return Counts{}, fmt.Errorf("count jobs: %w", err)
+	}
+	return c, nil
+}
 
 // Recover runs the startup sweep: RUNNING Jobs (interrupted by a crash/restart)
 // go back to QUEUED@front, capped by maxAttempts.
 func (s *Service) Recover(ctx context.Context) error {
 	n, err := s.store.RecoverRunning(ctx, s.maxAttempts)
 	if err != nil {
-		return err
+		return fmt.Errorf("Recover: recover jobs: %w", err)
 	}
 	if n > 0 {
 		slog.Info("job recovery sweep", "running_reset", n)

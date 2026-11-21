@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # resource-manager-v3.sh
 # Process-based detection with job queue system
 # Gaming/Plex detection via process names (not GPU %)
@@ -7,7 +8,6 @@
 LOG="/var/log/resource-manager.log"
 STATE_FILE="/tmp/resource-manager-state"
 QUEUE_DIR="/var/lib/batch-jobs/queue"
-OLLAMA_API="http://localhost:11434/api"
 
 # Create queue directory if it doesn't exist
 mkdir -p "$QUEUE_DIR"
@@ -20,31 +20,31 @@ log() {
 # Detect if resources are contested by high-priority processes
 detect_resource_contention() {
   # 1. Plex Transcoding (highest priority)
-  if pgrep -f "Plex Transcoder" > /dev/null 2>&1; then
+  if pgrep -f "Plex Transcoder" >/dev/null 2>&1; then
     echo "plex"
     return 0
   fi
 
   # 2. Steam games (most reliable: SteamLaunch only present when game running)
-  if pgrep -f "SteamLaunch AppId=" > /dev/null 2>&1; then
+  if pgrep -f "SteamLaunch AppId=" >/dev/null 2>&1; then
     echo "gaming-steam"
     return 0
   fi
 
   # 3. Lutris games
-  if pgrep -f "lutris.*runner" > /dev/null 2>&1; then
+  if pgrep -f "lutris.*runner" >/dev/null 2>&1; then
     echo "gaming-lutris"
     return 0
   fi
 
   # 4. Heroic Games Launcher
-  if pgrep -f "heroic.*game" > /dev/null 2>&1; then
+  if pgrep -f "heroic.*game" >/dev/null 2>&1; then
     echo "gaming-heroic"
     return 0
   fi
 
   # 5. Wine/Proton games (non-Steam)
-  if pgrep -f "wine.*\.exe" | grep -v "protonmail\|protonvpn" > /dev/null 2>&1; then
+  if pgrep -f "wine.*\.exe" | grep -v "protonmail\|protonvpn" >/dev/null 2>&1; then
     echo "gaming-wine"
     return 0
   fi
@@ -56,7 +56,7 @@ detect_resource_contention() {
 # Add job to queue
 add_to_queue() {
   local JOB_ID="$1"
-  local PRIORITY="$2"  # 1=interrupted, 2=new
+  local PRIORITY="$2" # 1=interrupted, 2=new
   local COMMAND="$3"
   local REASON="$4"
 
@@ -64,9 +64,10 @@ add_to_queue() {
   local QUEUE_FILE="${QUEUE_DIR}/${PRIORITY}-${JOB_ID}.job"
 
   # Create job metadata (command needs to be JSON-escaped)
-  local COMMAND_JSON=$(echo "$COMMAND" | jq -Rs .)
+  local COMMAND_JSON
+  COMMAND_JSON=$(echo "$COMMAND" | jq -Rs .)
 
-  cat > "$QUEUE_FILE" <<EOF
+  cat >"$QUEUE_FILE" <<EOF
 {
   "job_id": "$JOB_ID",
   "priority": $PRIORITY,
@@ -89,13 +90,16 @@ get_job_info() {
   local PID=$1
 
   # Read command line to extract job details
-  local CMDLINE=$(cat /proc/$PID/cmdline 2>/dev/null | tr '\0' ' ')
+  local CMDLINE
+  CMDLINE=$(cat /proc/"$PID"/cmdline 2>/dev/null | tr '\0' ' ')
 
   # Try to extract job ID from command line
-  local JOB_ID=$(echo "$CMDLINE" | grep -o '\--job-id [^ ]*' | awk '{print $2}')
+  local JOB_ID
+  JOB_ID=$(echo "$CMDLINE" | grep -o '\--job-id [^ ]*' | awk '{print $2}')
 
   # Try to extract full command (everything after --command)
-  local COMMAND=$(echo "$CMDLINE" | sed -n 's/.*--command \(.*\)/\1/p')
+  local COMMAND
+  COMMAND=$(echo "$CMDLINE" | sed -n 's/.*--command \(.*\)/\1/p')
 
   # If we can't extract details, generate generic ones
   if [ -z "$JOB_ID" ]; then
@@ -113,7 +117,12 @@ process_queue() {
   log "=== Processing job queue ==="
 
   # Count jobs
-  local JOB_COUNT=$(ls "$QUEUE_DIR"/*.job 2>/dev/null | wc -l)
+  local job_files=()
+  local queued_file
+  for queued_file in "$QUEUE_DIR"/*.job; do
+    [ -e "$queued_file" ] && job_files+=("$queued_file")
+  done
+  local JOB_COUNT=${#job_files[@]}
 
   if [ "$JOB_COUNT" -eq 0 ]; then
     log "Queue empty, nothing to process"
@@ -123,15 +132,15 @@ process_queue() {
   log "Found $JOB_COUNT queued jobs"
 
   # Process jobs in priority order (1-* comes before 2-*)
-  for job_file in $(ls "$QUEUE_DIR"/*.job 2>/dev/null | sort); do
+  for job_file in "${job_files[@]}"; do
     # Check if resources still available (could have changed)
-    if detect_resource_contention > /dev/null; then
+    if detect_resource_contention >/dev/null; then
       log "Resources contested again, stopping queue processing"
       return
     fi
 
     # Extract job details (requires jq)
-    if ! command -v jq &> /dev/null; then
+    if ! command -v jq &>/dev/null; then
       log "ERROR: jq not installed, cannot process queue"
       log "Install with: sudo apt install jq"
       return
@@ -177,12 +186,13 @@ enter_high_resource_state() {
   log "Gaming/Plex gets 100% resources - queueing all Ollama requests"
 
   # Find and interrupt all running batch jobs
-  local BATCH_PIDS=$(pgrep -f "batch-job-wrapper")
+  local BATCH_PIDS
+  BATCH_PIDS=$(pgrep -f "batch-job-wrapper")
 
   if [ -n "$BATCH_PIDS" ]; then
     for pid in $BATCH_PIDS; do
       # Get job info before killing
-      JOB_INFO=$(get_job_info $pid)
+      JOB_INFO=$(get_job_info "$pid")
       JOB_ID=$(echo "$JOB_INFO" | cut -d'|' -f1)
       COMMAND=$(echo "$JOB_INFO" | cut -d'|' -f2-)
 
@@ -190,7 +200,7 @@ enter_high_resource_state() {
       add_to_queue "$JOB_ID" 1 "$COMMAND" "$REASON"
 
       # Kill the job
-      kill $pid 2>/dev/null
+      kill "$pid" 2>/dev/null
       log "Killed batch job PID $pid, added to queue: $JOB_ID"
     done
   else
@@ -202,18 +212,19 @@ enter_high_resource_state() {
   log "All new Ollama requests will be queued until resources free"
 
   CURRENT_STATE="high-resource"
-  echo "$CURRENT_STATE:$REASON" > "$STATE_FILE"
+  echo "$CURRENT_STATE:$REASON" >"$STATE_FILE"
 }
 
 # Exit high-resource state (resources freed)
 exit_high_resource_state() {
-  local PREVIOUS_REASON=$(cat "$STATE_FILE" 2>/dev/null | cut -d':' -f2)
+  local PREVIOUS_REASON
+  PREVIOUS_REASON=$(cat "$STATE_FILE" 2>/dev/null | cut -d':' -f2)
 
   log "=== RESOURCES FREED (was: $PREVIOUS_REASON) ==="
   log "Ollama now has full access: 16 cores, 30GB RAM, full GPU"
 
   CURRENT_STATE="idle"
-  echo "$CURRENT_STATE" > "$STATE_FILE"
+  echo "$CURRENT_STATE" >"$STATE_FILE"
 
   # Process any queued jobs
   process_queue
@@ -228,7 +239,7 @@ main() {
 
   # Initialize state
   CURRENT_STATE="unknown"
-  echo "idle" > "$STATE_FILE"
+  echo "idle" >"$STATE_FILE"
 
   while true; do
     # Detect resource contention

@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "History is already past. Use '%s' instead of '%s'."
+level: "warning"
+nonword: true
+ignorecase: true
+swap:
+  "\\bpast history\\b": "history"

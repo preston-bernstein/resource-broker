@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sh-allow: nostrict legacy script with no bats test yet; strict mode would change its error handling
 # resource-manager-v2.sh
 # GPU-based detection with hysteresis to prevent state flapping
 # Choice B: Throttle-Only (Always Available)
@@ -11,10 +12,10 @@ SMALL_MODEL="llama3.2:3b"
 
 # GPU detection settings
 GPU_DEVICE="/sys/class/drm/card1/device/gpu_busy_percent"
-GAMING_ENTER_THRESHOLD=50      # GPU > 50% to enter gaming
-GAMING_EXIT_THRESHOLD=20       # GPU < 20% to exit gaming
-GAMING_ENTER_DURATION=30       # Sustained for 30 seconds
-GAMING_EXIT_DURATION=300       # Sustained for 5 minutes (300s)
+GAMING_ENTER_THRESHOLD=50 # GPU > 50% to enter gaming
+GAMING_EXIT_THRESHOLD=20  # GPU < 20% to exit gaming
+GAMING_ENTER_DURATION=30  # Sustained for 30 seconds
+GAMING_EXIT_DURATION=300  # Sustained for 5 minutes (300s)
 
 # State counters
 high_gpu_counter=0
@@ -37,11 +38,9 @@ get_gpu_usage() {
 # Force load small model (evicts large models from memory)
 load_small_model() {
   log "Loading small model: $SMALL_MODEL (evicting any large models)"
-  curl -s -X POST "$OLLAMA_API/generate" \
+  if curl -s -X POST "$OLLAMA_API/generate" \
     -d "{\"model\":\"$SMALL_MODEL\",\"prompt\":\"ready\"}" \
-    > /dev/null 2>&1
-
-  if [ $? -eq 0 ]; then
+    >/dev/null 2>&1; then
     log "Small model loaded successfully"
   else
     log "WARNING: Failed to load small model"
@@ -63,9 +62,9 @@ enter_gaming_state() {
   log "=== GAMING DETECTED (GPU sustained >$GAMING_ENTER_THRESHOLD% for ${GAMING_ENTER_DURATION}s) ==="
 
   # Step 1: Kill batch job processes
-  if pgrep -f "ollama run llama3.1" > /dev/null || \
-     pgrep -f "ollama run codellama" > /dev/null || \
-     pgrep -f "ollama run mistral" > /dev/null; then
+  if pgrep -f "ollama run llama3.1" >/dev/null \
+    || pgrep -f "ollama run codellama" >/dev/null \
+    || pgrep -f "ollama run mistral" >/dev/null; then
     log "Killing batch jobs..."
     pkill -f "ollama run llama3.1"
     pkill -f "ollama run codellama"
@@ -90,7 +89,7 @@ enter_gaming_state() {
 
   log "Ollama throttled: 1 thread, 3GB RAM (small model only)"
   CURRENT_STATE="gaming"
-  echo "$CURRENT_STATE" > "$STATE_FILE"
+  echo "$CURRENT_STATE" >"$STATE_FILE"
 }
 
 # Exit gaming state
@@ -105,7 +104,7 @@ exit_gaming_state() {
 
   log "Ollama full power restored: 16 threads, 30GB RAM (on-demand loading)"
   CURRENT_STATE="idle"
-  echo "$CURRENT_STATE" > "$STATE_FILE"
+  echo "$CURRENT_STATE" >"$STATE_FILE"
 }
 
 # Initialize state
@@ -123,7 +122,7 @@ while true; do
   GPU_USAGE=$(get_gpu_usage)
 
   # Detect Plex transcoding (takes priority over GPU gaming detection)
-  if pgrep -f "Plex Transcoder" > /dev/null; then
+  if pgrep -f "Plex Transcoder" >/dev/null; then
 
     if [ "$CURRENT_STATE" != "plex" ]; then
       log "=== PLEX TRANSCODING DETECTED ==="
@@ -144,14 +143,14 @@ while true; do
       LOADED=$(check_loaded_models)
       log "Ollama throttled: 4 threads, 8GB RAM. Models: $LOADED"
       CURRENT_STATE="plex"
-      echo "$CURRENT_STATE" > "$STATE_FILE"
+      echo "$CURRENT_STATE" >"$STATE_FILE"
     fi
 
   # GPU-based gaming detection with hysteresis
   elif [ "$CURRENT_STATE" = "idle" ] || [ "$CURRENT_STATE" = "unknown" ]; then
     # Trying to enter gaming state
     if [ "$GPU_USAGE" -gt "$GAMING_ENTER_THRESHOLD" ]; then
-      high_gpu_counter=$((high_gpu_counter + 20))  # +20 seconds per check
+      high_gpu_counter=$((high_gpu_counter + 20)) # +20 seconds per check
       log "GPU high: ${GPU_USAGE}% (counter: ${high_gpu_counter}s / ${GAMING_ENTER_DURATION}s)"
 
       if [ "$high_gpu_counter" -ge "$GAMING_ENTER_DURATION" ]; then
@@ -164,13 +163,13 @@ while true; do
       if [ "$high_gpu_counter" -gt 0 ]; then
         log "GPU dropped to ${GPU_USAGE}%, resetting enter counter"
       fi
-      high_gpu_counter=0  # Reset counter on dip below threshold
+      high_gpu_counter=0 # Reset counter on dip below threshold
     fi
 
   elif [ "$CURRENT_STATE" = "gaming" ]; then
     # Trying to exit gaming state
     if [ "$GPU_USAGE" -lt "$GAMING_EXIT_THRESHOLD" ]; then
-      low_gpu_counter=$((low_gpu_counter + 20))  # +20 seconds per check
+      low_gpu_counter=$((low_gpu_counter + 20)) # +20 seconds per check
 
       # Log every minute to avoid spam
       if [ $((low_gpu_counter % 60)) -eq 0 ]; then
@@ -187,7 +186,7 @@ while true; do
       if [ "$low_gpu_counter" -gt 0 ]; then
         log "GPU active: ${GPU_USAGE}%, resetting exit counter (game still running)"
       fi
-      low_gpu_counter=0  # Reset counter - game still active
+      low_gpu_counter=0 # Reset counter - game still active
     fi
   fi
 

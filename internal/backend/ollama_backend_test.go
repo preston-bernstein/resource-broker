@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/preston-bernstein/resource-broker/internal/config"
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/ollama"
 )
 
@@ -39,13 +40,13 @@ func TestOllamaBackendProxyPassesThrough(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer mock.Close()
 
 	ob := newTestOllamaBackend(t, mock.URL)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/tags", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/tags", nil)
 	rec := httptest.NewRecorder()
 	ob.Proxy().ServeHTTP(rec, req)
 
@@ -72,7 +73,7 @@ func mockGenerateServer(t *testing.T, chunks []string) *httptest.Server {
 		}
 		w.WriteHeader(http.StatusOK)
 		for _, c := range chunks {
-			w.Write([]byte(c + "\n"))
+			_, _ = w.Write([]byte(c + "\n"))
 		}
 	}))
 }
@@ -90,9 +91,9 @@ func TestOllamaBackendGenerateConcatenatesResponse(t *testing.T) {
 	ob := newTestOllamaBackend(t, mock.URL)
 
 	var tokenCounts []int
-	out, err := ob.Generate(context.Background(), "llama3", "hi", nil, func(n int) {
+	out, err := ob.Generate(context.Background(), inference.Request{Model: "llama3", Prompt: "hi", OnTokens: func(n int) {
 		tokenCounts = append(tokenCounts, n)
-	})
+	}})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestOllamaBackendReachable(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"models": []map[string]string{{"name": "llama3"}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"models": []map[string]string{{"name": "llama3"}}})
 	}))
 	defer mock.Close()
 

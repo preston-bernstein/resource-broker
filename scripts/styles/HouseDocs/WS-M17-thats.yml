@@ -1,0 +1,33 @@
+extends: "script"
+message: "Sentence-initial \"That's\" more than once. Preston's own corpus has zero."
+level: "warning"
+scope: "raw"
+script: |
+  text := import("text")
+  matches := []
+  strip := func(s) {
+    s = text.re_replace(`(?s)\A---\r?\n.*?\r?\n---\r?\n`, s, "")
+    s = text.re_replace(`(?s)\x60\x60\x60.*?\x60\x60\x60`, s, " ")
+    s = text.re_replace(`(?s)~~~.*?~~~`, s, " ")
+    s = text.re_replace(`\x60[^\x60\n]*\x60`, s, " ")
+    s = text.re_replace(`(?s)<!--.*?-->`, s, " ")
+    s = text.re_replace(`(?m)^\s*\|.*$`, s, " ")
+    s = text.re_replace(`(?m)^\s*>.*$`, s, " ")
+    s = text.re_replace(`\]\([^)]*\)`, s, "]")
+    return s
+  }
+  body := strip(scope)
+  words := text.re_find(`\w+`, body, -1)
+  report := func(snippet) {
+    b := text.index(scope, snippet)
+    if b < 0 {
+      b = 0
+    }
+    return {begin: b, end: b + len(snippet)}
+  }
+  found := text.re_find(`(?:^|[.!?]\s+)That'?s\b`, body, -1)
+  if found != undefined && words != undefined && len(words) >= 0 {
+    if len(found) > 1 {
+      matches = append(matches, report(found[0][0].text))
+    }
+  }

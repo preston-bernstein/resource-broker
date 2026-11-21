@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'leverage' as a verb. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\bleverag(?:e|es|ed|ing)\\b": "use"

@@ -1,0 +1,9 @@
+# Only GitHub's own actions may be used. Adding any other action fails the gate until a human adds it here.
+rules:
+  forbidden-uses:
+    config:
+      allow:
+        - actions/checkout
+        - actions/setup-go
+        - actions/setup-node
+        - actions/setup-python

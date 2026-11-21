@@ -1,0 +1,7 @@
+extends: "substitution"
+message: "Banned vocabulary: 'underscore' as a verb. Use '%s' instead of '%s'."
+level: "error"
+nonword: true
+ignorecase: true
+swap:
+  "\\bunderscor(?:e|es|ed|ing)\\b": "show / highlight"

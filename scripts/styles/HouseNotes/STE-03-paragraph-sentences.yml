@@ -1,0 +1,6 @@
+message: "Paragraph over 6 sentences. STE rule 3. Notes only: 0.3%% of real commit bodies exceed six against 10.7%% of paragraphs in real docs, so on a doc this stops being a signal."
+level: "error"
+extends: "occurrence"
+scope: "paragraph"
+max: 6
+token: "[.!?](?:\\s|$)"

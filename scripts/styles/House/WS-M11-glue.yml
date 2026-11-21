@@ -1,0 +1,6 @@
+extends: "existence"
+message: "Glue transition doing coherence work the sentences should do themselves."
+level: "warning"
+nonword: true
+tokens:
+  - "(?:^|[.!?]\\s+)(?:Moreover|Furthermore|Additionally|That said|With that in place|This means that|Here'?s why)\\b"

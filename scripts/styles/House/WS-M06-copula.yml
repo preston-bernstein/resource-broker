@@ -1,0 +1,7 @@
+extends: "existence"
+message: "Inflated copula where 'is' or 'has' would do. Deliberately article-anchored: bare 'marks'/'represents'/'features' are ordinary verbs far more often than they are copula inflation, so matching them bare would bury real hits in noise."
+level: "error"
+nonword: true
+ignorecase: true
+tokens:
+  - "\\b(?:serves as|stands as|marks (?:a|the)|represents (?:a|the)|features (?:a|the)|boasts)\\b"

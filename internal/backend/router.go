@@ -2,10 +2,12 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sort"
 
 	"github.com/preston-bernstein/resource-broker/internal/httpx"
+	"github.com/preston-bernstein/resource-broker/internal/inference"
 	"github.com/preston-bernstein/resource-broker/internal/yield"
 )
 
@@ -126,11 +128,16 @@ func (r *Router) resolve(req *http.Request, lane string) Backend {
 // Jobs have no lane at all (queue.Class doesn't apply to the Job worker), so
 // a configured route applies to Generate regardless of what lane (if any) it
 // was scoped to for the proxy path.
-func (r *Router) Generate(ctx context.Context, model, prompt string, options map[string]any, onTokens func(int)) (string, error) {
-	if entry, ok := r.routes[model]; ok {
-		return entry.backend.Generate(ctx, model, prompt, options, onTokens)
+func (r *Router) Generate(ctx context.Context, req inference.Request) (string, error) {
+	target := r.def
+	if entry, ok := r.routes[req.Model]; ok {
+		target = entry.backend
 	}
-	return r.def.Generate(ctx, model, prompt, options, onTokens)
+	out, err := target.Generate(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("generate %q: %w", req.Model, err)
+	}
+	return out, nil
 }
 
 // Reachable reports whether the default backend is reachable. It
@@ -140,7 +147,10 @@ func (r *Router) Generate(ctx context.Context, model, prompt string, options map
 // /healthz calling Reachable on a Router only ever reflects the default
 // backend's health, exactly as if no routes were configured at all.
 func (r *Router) Reachable(ctx context.Context) error {
-	return r.def.Reachable(ctx)
+	if err := r.def.Reachable(ctx); err != nil {
+		return fmt.Errorf("default backend: %w", err)
+	}
+	return nil
 }
 
 // Unloader returns a literal nil — Router's own unload/reload responsibility
@@ -210,7 +220,7 @@ func (r *Router) RoutingSummary() any {
 	}
 	grouped := make(map[key][]string)
 	for model, entry := range r.routes {
-		k := key{backend: entry.backend, lane: entry.lane}
+		k := key(entry)
 		grouped[k] = append(grouped[k], model)
 	}
 
