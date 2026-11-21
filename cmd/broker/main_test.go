@@ -80,14 +80,19 @@ func launchBroker(t *testing.T, bin string, env []string) (*exec.Cmd, *syncBuffe
 	return cmd, buf, done
 }
 
-// stopBroker asks the process to exit, killing it if it takes over 3s.
-func stopBroker(cmd *exec.Cmd, done <-chan error) {
+// stopBroker asks the process to exit, killing it if it takes over 3s. The
+// exit error is logged, not asserted: a signal exit is the expected outcome.
+func stopBroker(t *testing.T, cmd *exec.Cmd, done <-chan error) {
+	t.Helper()
+	// Signal fails only if the process already exited, which is the goal here.
 	_ = cmd.Process.Signal(syscall.SIGTERM)
 	select {
-	case <-done:
+	case werr := <-done:
+		t.Logf("broker exited: %v", werr)
 	case <-time.After(3 * time.Second):
+		// Kill fails only if the process already exited; done reports the outcome.
 		_ = cmd.Process.Kill()
-		<-done
+		t.Logf("broker killed after timeout; exit: %v", <-done)
 	}
 }
 
@@ -111,7 +116,7 @@ func runBrokerBriefly(t *testing.T, bin string, env []string) (stdout string, er
 		}
 	}
 
-	stopBroker(cmd, done)
+	stopBroker(t, cmd, done)
 	return buf.String(), nil
 }
 
@@ -399,7 +404,7 @@ func requireActivityTracked(t *testing.T, statusURL string, buf *syncBuffer) {
 func startBroker(t *testing.T, bin string, env []string) *syncBuffer {
 	t.Helper()
 	cmd, buf, done := launchBroker(t, bin, env)
-	t.Cleanup(func() { stopBroker(cmd, done) })
+	t.Cleanup(func() { stopBroker(t, cmd, done) })
 	return buf
 }
 
