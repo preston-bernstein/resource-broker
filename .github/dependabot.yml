@@ -3,6 +3,8 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
+    commit-message:
+      prefix: "chore(deps)"
     directory: /
     schedule:
       interval: weekly
