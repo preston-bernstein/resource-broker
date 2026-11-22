@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -33,5 +34,34 @@ func TestDeployedUnitRaisesBatchConcurrency(t *testing.T) {
 	}
 	if got < 2 {
 		t.Errorf("BROKER_MAX_INFLIGHT=%d still serializes the batch lane; want >= 2", got)
+	}
+}
+
+// systemd reads StartLimitIntervalSec and StartLimitBurst only in [Unit].
+// Placed in [Service] they are silently ignored and the restart limit never
+// applies (found 2026-10-17 on the installed unit).
+func TestDeployedUnitStartLimitIsInUnitSection(t *testing.T) {
+	unit, err := os.ReadFile("../../deploy/broker.service")
+	if err != nil {
+		t.Fatalf("reading deploy/broker.service: %v", err)
+	}
+	section := ""
+	found := map[string]string{}
+	for _, line := range strings.Split(string(unit), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = line
+			continue
+		}
+		for _, key := range []string{"StartLimitIntervalSec", "StartLimitBurst"} {
+			if strings.HasPrefix(line, key+"=") {
+				found[key] = section
+			}
+		}
+	}
+	for _, key := range []string{"StartLimitIntervalSec", "StartLimitBurst"} {
+		if found[key] != "[Unit]" {
+			t.Errorf("%s is in %q, want [Unit]: systemd ignores it elsewhere", key, found[key])
+		}
 	}
 }
