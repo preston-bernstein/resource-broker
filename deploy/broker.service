@@ -2,6 +2,9 @@
 Description=Resource Broker (HTTP-fronting GPU arbiter)
 After=network-online.target ollama.service
 Wants=network-online.target
+# systemd reads StartLimit* only in [Unit]; in [Service] they are ignored.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,8 +13,6 @@ Group=ollama-broker
 ExecStart=/usr/local/bin/resource-broker
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # Upstream Ollama and listener ports (defaults shown).
 Environment=OLLAMA_URL=http://127.0.0.1:11434
